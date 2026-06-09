@@ -51,15 +51,21 @@ app.post("/endpoint", (req, res) => {
     payload: req.body
   };
 
-  fs.appendFileSync(logFile, JSON.stringify(entry) + "\n");
+fs.appendFileSync(logFile, JSON.stringify(entry) + "\n");
 
-  res.status(200).json({
-    status: "ok",
-    message: "Device data received",
-    received_at: chileTime
-  });
-});
+console.log("================================");
+console.log("NEW DEVICE MESSAGE");
+console.log(JSON.stringify(entry, null, 2));
+console.log("================================");
+
+res.status(200).json({
+  status: "ok",
+  message: "Device data received",
+  received_at: chileTime
+});  
 
 app.listen(PORT, () => {
   console.log(`VS&TI Device Middleware running on port ${PORT}`);
-});  
+});
+
+  
