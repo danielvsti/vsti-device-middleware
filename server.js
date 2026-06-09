@@ -63,7 +63,7 @@ res.status(200).json({
   message: "Device data received",
   received_at: chileTime
 });  
-
+});
 app.listen(PORT, () => {
   console.log(`VS&TI Device Middleware running on port ${PORT}`);
 });
