@@ -31,19 +31,28 @@ function getRemoteIp(req) {
     .trim();
 }
 
+
 function normalizeMessage(msg, receivedAt) {
   const lat = msg["position.latitude"] ?? msg["latitude"] ?? null;
   const lon = msg["position.longitude"] ?? msg["longitude"] ?? null;
   const battery = msg["battery.level"] ?? msg["battery"] ?? null;
   const type = msg["message.type"] || "UNKNOWN";
 
+  const isSos =
+    msg["sos.alarm"] === true ||
+    type === "AL_LTE" ||
+    type === "SOS" ||
+    type === "ALARM";
+
+  const hasPosition = lat !== null && lon !== null;
+
   let eventType = null;
 
-  if (type === "LK") {
-    eventType = "KEEP_ALIVE";
-  } else if (type === "SOS" || type === "ALARM") {
+  if (isSos) {
     eventType = "SOS";
-  } else if (lat !== null && lon !== null) {
+  } else if (type === "LK") {
+    eventType = "KEEP_ALIVE";
+  } else if (hasPosition) {
     eventType = "LOCATION";
   } else if (battery !== null && Number(battery) <= 20) {
     eventType = "LOW_BATTERY";
@@ -62,20 +71,38 @@ function normalizeMessage(msg, receivedAt) {
       id: msg["ident"] || msg["device.id"] || null,
       platform_id: msg["device.id"] || null,
       name: msg["device.name"] || null,
-      battery: battery
+      battery: battery,
+      gsm_signal: msg["gsm.signal.level"] ?? null,
+      operator_mcc: msg["gsm.mcc"] ?? null,
+      operator_mnc: msg["gsm.mnc"] ?? null
     },
     position: {
       latitude: lat,
       longitude: lon,
+      valid: msg["position.valid"] ?? null,
+      satellites: msg["position.satellites"] ?? null,
       speed: msg["position.speed"] ?? msg["speed"] ?? null,
       direction: msg["position.direction"] ?? null,
+      altitude: msg["position.altitude"] ?? null,
       accuracy: msg["position.accuracy"] ?? null
+    },
+    alarm: {
+      sos: msg["sos.alarm"] ?? false,
+      battery_low: msg["battery.low.status"] ?? false,
+      wristband_connected: msg["wristband.connected.status"] ?? null
+    },
+    network: {
+      peer: msg["peer"] ?? null,
+      vendor_code: msg["vendor.code"] ?? null,
+      cellid: msg["gsm.cellid"] ?? null,
+      lac: msg["gsm.lac"] ?? null
     },
     raw_type: type,
     timestamp: msg["timestamp"] || null,
     received_at: receivedAt
   };
 }
+
 
 function updateDeviceState(normalized) {
   const id = normalized.device.id;
