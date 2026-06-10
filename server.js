@@ -1,12 +1,20 @@
 const express = require("express");
-const app = express();
 
+const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.VSTI_TOKEN || "VSTI_MIDDLEWARE_2026_Q7xF92Lp_4MNd8Rk_91AB";
 
+const SAYVU_API_URL = process.env.SAYVU_API_URL || "";
+const SAYVU_TOKEN = process.env.SAYVU_TOKEN || "";
+
+const devices = {};
 const sirenStates = {};
+
+function nowChile() {
+  return new Date().toLocaleString("sv-SE", { timeZone: "America/Santiago" });
+}
 
 function checkToken(req, res) {
   const token = req.query.token || req.headers["x-vsti-token"];
@@ -17,28 +25,188 @@ function checkToken(req, res) {
   return true;
 }
 
-function nowChile() {
-  return new Date().toLocaleString("sv-SE", { timeZone: "America/Santiago" });
+function getRemoteIp(req) {
+  return (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
+    .split(",")[0]
+    .trim();
+}
+
+function normalizeMessage(msg, receivedAt) {
+  const lat = msg["position.latitude"] ?? msg["latitude"] ?? null;
+  const lon = msg["position.longitude"] ?? msg["longitude"] ?? null;
+  const battery = msg["battery.level"] ?? msg["battery"] ?? null;
+  const type = msg["message.type"] || "UNKNOWN";
+
+  let eventType = null;
+
+  if (type === "LK") {
+    eventType = "KEEP_ALIVE";
+  } else if (type === "SOS" || type === "ALARM") {
+    eventType = "SOS";
+  } else if (lat !== null && lon !== null) {
+    eventType = "LOCATION";
+  } else if (battery !== null && Number(battery) <= 20) {
+    eventType = "LOW_BATTERY";
+  } else {
+    eventType = type;
+  }
+
+  return {
+    source: "VSTI",
+    version: "1.0",
+    event_id: `VSTI-${msg["ident"] || msg["device.id"] || "UNKNOWN"}-${Math.floor(
+      msg["timestamp"] || Date.now() / 1000
+    )}`,
+    event_type: eventType,
+    device: {
+      id: msg["ident"] || msg["device.id"] || null,
+      platform_id: msg["device.id"] || null,
+      name: msg["device.name"] || null,
+      battery: battery
+    },
+    position: {
+      latitude: lat,
+      longitude: lon,
+      speed: msg["position.speed"] ?? msg["speed"] ?? null,
+      direction: msg["position.direction"] ?? null,
+      accuracy: msg["position.accuracy"] ?? null
+    },
+    raw_type: type,
+    timestamp: msg["timestamp"] || null,
+    received_at: receivedAt
+  };
+}
+
+function updateDeviceState(normalized) {
+  const id = normalized.device.id;
+  if (!id) return;
+
+  devices[id] = {
+    id,
+    platform_id: normalized.device.platform_id,
+    name: normalized.device.name,
+    battery: normalized.device.battery,
+    last_event_type: normalized.event_type,
+    last_seen: normalized.received_at,
+    last_position: normalized.position.latitude && normalized.position.longitude
+      ? normalized.position
+      : devices[id]?.last_position || null,
+    status: "ONLINE"
+  };
+}
+
+async function sendToSayVU(payload) {
+  console.log("PREPARED FOR SAYVU");
+  console.log(JSON.stringify(payload, null, 2));
+
+  if (!SAYVU_API_URL) {
+    console.log("SAYVU_API_URL not configured. Payload not sent.");
+    return { sent: false, reason: "SAYVU_API_URL not configured" };
+  }
+
+  try {
+    const response = await fetch(SAYVU_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(SAYVU_TOKEN ? { Authorization: `Bearer ${SAYVU_TOKEN}` } : {})
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await response.text();
+
+    console.log("SAYVU RESPONSE:", response.status, text);
+
+    return {
+      sent: response.ok,
+      status: response.status,
+      response: text
+    };
+  } catch (error) {
+    console.error("ERROR SENDING TO SAYVU:", error.message);
+    return {
+      sent: false,
+      error: error.message
+    };
+  }
+}
+
+async function processIncomingMessage(msg, receivedAt) {
+  const normalized = normalizeMessage(msg, receivedAt);
+
+  updateDeviceState(normalized);
+
+  const shouldSendToSayVU =
+    normalized.event_type === "SOS" ||
+    normalized.event_type === "LOCATION" ||
+    normalized.event_type === "LOW_BATTERY";
+
+  if (normalized.event_type === "KEEP_ALIVE") {
+    console.log("KEEP_ALIVE received. Internal monitoring only.");
+    return { normalized, forwarded: false };
+  }
+
+  if (shouldSendToSayVU) {
+    const result = await sendToSayVU(normalized);
+    return { normalized, forwarded: true, result };
+  }
+
+  console.log("Message received but not forwarded.");
+  console.log(JSON.stringify(normalized, null, 2));
+
+  return { normalized, forwarded: false };
 }
 
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "VS&TI Device Middleware",
-    endpoints: ["/endpoint", "/sirens/command", "/sirens/status", "/sirens"]
+    version: "2.0",
+    endpoints: [
+      "POST /endpoint",
+      "GET /devices",
+      "POST /sirens/command",
+      "POST /sirens/status",
+      "GET /sirens"
+    ]
   });
 });
 
-app.post("/endpoint", (req, res) => {
+app.post("/endpoint", async (req, res) => {
   if (!checkToken(req, res)) return;
 
-  console.log("NEW DEVICE MESSAGE");
+  const receivedAt = nowChile();
+  const messages = Array.isArray(req.body) ? req.body : [req.body];
+
+  console.log("INCOMING DEVICE DATA");
   console.log(JSON.stringify(req.body, null, 2));
+
+  const results = [];
+
+  for (const msg of messages) {
+    const result = await processIncomingMessage(msg, receivedAt);
+    results.push(result);
+  }
 
   res.json({
     status: "ok",
-    message: "Device data received",
-    received_at: nowChile()
+    message: "Device data processed",
+    received_at: receivedAt,
+    remote_ip: getRemoteIp(req),
+    messages_received: messages.length,
+    messages_forwarded: results.filter(r => r.forwarded).length,
+    results
+  });
+});
+
+app.get("/devices", (req, res) => {
+  if (!checkToken(req, res)) return;
+
+  res.json({
+    status: "ok",
+    total: Object.keys(devices).length,
+    devices
   });
 });
 
@@ -142,8 +310,7 @@ app.get("/sirens", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`VS&TI Device Middleware running on port ${PORT}`);
+  console.log(`VS&TI Device Middleware v2.0 running on port ${PORT}`);
 });
-
 
 
