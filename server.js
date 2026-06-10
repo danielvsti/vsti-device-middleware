@@ -1,3 +1,29 @@
+/*
+=========================================================
+VSTI DEVICE MIDDLEWARE
+=========================================================
+
+Arquitectura:
+
+RF-V51
+   ↓
+Plataforma de comunicaciones
+   ↓
+VSTI Middleware
+   ↓
+SayVU
+
+Funciones:
+
+- Recepción de eventos dispositivos
+- Normalización de datos
+- Inventario de dispositivos
+- Gestión de sirenas
+- Integración con SayVU
+
+=========================================================
+*/
+
 const express = require("express");
 
 const app = express();
@@ -122,6 +148,25 @@ function updateDeviceState(normalized) {
   };
 }
 
+/*
+=========================================================
+SAYVU FORWARDING - PILOT MODE
+=========================================================
+
+Durante la fase piloto se envían TODOS los eventos a SayVU:
+- SOS
+- LOCATION
+- KEEP_ALIVE / LK
+- LOW_BATTERY
+- Cualquier otro evento futuro
+
+Más adelante VSTI podrá filtrar el tráfico desde este middleware
+sin requerir cambios en SayVU.
+
+=========================================================
+*/
+
+
 async function sendToSayVU(payload) {
   console.log("PREPARED FOR SAYVU");
   console.log(JSON.stringify(payload, null, 2));
@@ -164,6 +209,9 @@ async function processIncomingMessage(msg, receivedAt) {
 
   updateDeviceState(normalized);
 
+  const shouldSendToSayVU = true;
+ 
+/*
   const shouldSendToSayVU =
     normalized.event_type === "SOS" ||
     normalized.event_type === "LOCATION" ||
@@ -173,6 +221,8 @@ async function processIncomingMessage(msg, receivedAt) {
     console.log("KEEP_ALIVE received. Internal monitoring only.");
     return { normalized, forwarded: false };
   }
+*/
+
 
   if (shouldSendToSayVU) {
     const result = await sendToSayVU(normalized);
