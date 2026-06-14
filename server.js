@@ -44,6 +44,8 @@ const gpsDevices = {};
 
 const devices = {};
 const sirenStates = {};
+const SOS_ACTIVE_MS = 60 * 1000;
+const SOS_RECENT_MS = 10 * 60 * 1000;
 
 function nowChile() {
   return new Date().toLocaleString("sv-SE", { timeZone: "America/Santiago" });
@@ -181,7 +183,9 @@ function updateGpsDeviceFromNormalized(normalized) {
     last_event_type: normalized.event_type,
     sos_active: isSos ? true : (existing.sos_active || false),
     sos_started_at: isSos ? normalized.received_at : existing.sos_started_at,
-    sos_event_id: isSos ? normalized.event_id : existing.sos_event_id
+    sos_event_id: isSos ? normalized.event_id : existing.sos_event_id;
+    sos_acknowledged: isSos ? false : existing.sos_acknowledged || false,
+    sos_acknowledged_at: isSos ? null : existing.sos_acknowledged_at || null
   };
 }
 
@@ -532,10 +536,25 @@ const publicSirens = [
 
 app.get("/public/map-state", (req, res) => {
   const now = Date.now();
+  
 
-  const devicesForMap = Object.values(gpsDevices).map((d) => ({
+const devicesForMap = Object.values(gpsDevices).map((d) => {
+  let sosState = "NORMAL";
+
+  if (d.sos_started_at && !d.sos_acknowledged) {
+    const sosTime = new Date(d.sos_started_at).getTime();
+    const elapsed = Date.now() - sosTime;
+
+    if (elapsed <= SOS_ACTIVE_MS) {
+      sosState = "ACTIVE";
+    } else if (elapsed <= SOS_RECENT_MS) {
+      sosState = "RECENT";
+    }
+  }
+
+  return {
     id: d.id,
-    name: d.id === "8322560" ? "Botón SOS Piloto" : `Botón SOS ${d.id}`,
+    name: d.name || (d.id === "8322560" ? "Botón SOS Piloto" : `Botón SOS ${d.id}`),
     latitude: d.latitude,
     longitude: d.longitude,
     speed: d.speed,
@@ -544,13 +563,24 @@ app.get("/public/map-state", (req, res) => {
     valid: d.valid,
     last_seen: d.last_seen,
     online: true,
-    sos_active: d.sos_active === true,
+    sos_state: sosState,
+    sos_active: sosState === "ACTIVE",
+    sos_recent: sosState === "RECENT",
     sos_started_at: d.sos_started_at || null,
     sos_event_id: d.sos_event_id || null,
+    sos_acknowledged: d.sos_acknowledged === true,
+    sos_acknowledged_at: d.sos_acknowledged_at || null,
     last_event_type: d.last_event_type || null
-  }));
+  };
+}); 
 
-  const sirensForMap = publicSirens.map((s) => {
+
+
+
+
+
+
+const sirensForMap = publicSirens.map((s) => {
     const state = sirenStates[s.id] || {
       state: "OFF",
       relay: false,
@@ -658,6 +688,40 @@ app.post("/public/sirens/deactivate", (req, res) => {
   });
 });
 
+app.post("/public/devices/ack-sos", (req, res) => {
+  const { device_id } = req.body;
+
+  if (!device_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "device_id is required"
+    });
+  }
+
+  const id = String(device_id);
+  const device = gpsDevices[id];
+
+  if (!device) {
+    return res.status(404).json({
+      status: "error",
+      message: "Unknown device_id"
+    });
+  }
+
+  device.sos_active = false;
+  device.sos_acknowledged = true;
+  device.sos_acknowledged_at = nowChile();
+  device.sos_started_at = null;
+  device.sos_event_id = null;
+  device.last_event_type = "SOS_ACKNOWLEDGED";
+
+  res.json({
+    status: "ok",
+    message: "SOS acknowledged",
+    device_id: id,
+    acknowledged_at: device.sos_acknowledged_at
+  });
+});
 
 startFlespiMqtt();
 
@@ -665,5 +729,4 @@ startFlespiMqtt();
 app.listen(PORT, () => {
   console.log(`VS&TI Device Middleware v2.0 running on port ${PORT}`);
 });
-
 
