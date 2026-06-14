@@ -26,8 +26,10 @@ Funciones:
 
 const express = require("express");
 const mqtt = require("mqtt");
-
+const cors = require("cors");
 const app = express();
+
+app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
