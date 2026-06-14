@@ -182,8 +182,12 @@ function updateGpsDeviceFromNormalized(normalized) {
     updated_at_ms: Date.now(),
     last_event_type: normalized.event_type,
     sos_active: isSos ? true : (existing.sos_active || false),
-    sos_started_at: isSos ? normalized.received_at : existing.sos_started_at,
-    sos_event_id: isSos ? normalized.event_id : existing.sos_event_id,
+    
+sos_started_at: isSos ? normalized.received_at : existing.sos_started_at,
+sos_started_at_ms: isSos ? Date.now() : existing.sos_started_at_ms,
+sos_event_id: isSos ? normalized.event_id : existing.sos_event_id,
+
+
     sos_acknowledged: isSos ? false : existing.sos_acknowledged || false,
     sos_acknowledged_at: isSos ? null : existing.sos_acknowledged_at || null
   };
@@ -542,8 +546,8 @@ const devicesForMap = Object.values(gpsDevices).map((d) => {
   let sosState = "NORMAL";
 
   if (d.sos_started_at && !d.sos_acknowledged) {
-    const sosTime = new Date(d.sos_started_at).getTime();
-    const elapsed = Date.now() - sosTime;
+const sosTime = d.sos_started_at_ms || 0;
+const elapsed = Date.now() - sosTime;
 
     if (elapsed <= SOS_ACTIVE_MS) {
       sosState = "ACTIVE";
@@ -567,6 +571,7 @@ const devicesForMap = Object.values(gpsDevices).map((d) => {
     sos_active: sosState === "ACTIVE",
     sos_recent: sosState === "RECENT",
     sos_started_at: d.sos_started_at || null,
+    sos_started_at_ms: d.sos_started_at_ms || null,
     sos_event_id: d.sos_event_id || null,
     sos_acknowledged: d.sos_acknowledged === true,
     sos_acknowledged_at: d.sos_acknowledged_at || null,
@@ -712,6 +717,7 @@ app.post("/public/devices/ack-sos", (req, res) => {
   device.sos_acknowledged = true;
   device.sos_acknowledged_at = nowChile();
   device.sos_started_at = null;
+  device.sos_started_at_ms = null;
   device.sos_event_id = null;
   device.last_event_type = "SOS_ACKNOWLEDGED";
 
