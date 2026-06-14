@@ -155,6 +155,41 @@ function updateDeviceState(normalized) {
   };
 }
 
+function updateGpsDeviceFromNormalized(normalized) {
+  const platformId = normalized.device.platform_id;
+  if (!platformId) return;
+
+  const id = String(platformId);
+  const existing = gpsDevices[id] || {};
+
+  const isSos =
+    normalized.event_type === "SOS" ||
+    normalized.alarm?.sos === true;
+
+  gpsDevices[id] = {
+    ...existing,
+    id,
+    name: normalized.device.name || existing.name || `Botón SOS ${id}`,
+    latitude: normalized.position.latitude ?? existing.latitude,
+    longitude: normalized.position.longitude ?? existing.longitude,
+    speed: normalized.position.speed ?? existing.speed,
+    direction: normalized.position.direction ?? existing.direction,
+    satellites: normalized.position.satellites ?? existing.satellites,
+    valid: normalized.position.valid ?? existing.valid,
+    last_seen: normalized.received_at,
+    updated_at_ms: Date.now(),
+    last_event_type: normalized.event_type,
+    sos_active: isSos ? true : (existing.sos_active || false),
+    sos_started_at: isSos ? normalized.received_at : existing.sos_started_at,
+    sos_event_id: isSos ? normalized.event_id : existing.sos_event_id
+  };
+}
+
+
+
+
+
+
 /*
 =========================================================
 SAYVU FORWARDING - PILOT MODE
@@ -175,46 +210,49 @@ sin requerir cambios en SayVU.
 
 
 async function sendToSayVU(payload) {
-  console.log("PREPARED FOR SAYVU");
-  console.log(JSON.stringify(payload, null, 2));
+console.log("PREPARED FOR SAYVU");
+console.log(JSON.stringify(payload, null, 2));
 
-  if (!SAYVU_API_URL) {
-    console.log("SAYVU_API_URL not configured. Payload not sent.");
-    return { sent: false, reason: "SAYVU_API_URL not configured" };
-  }
+if (!SAYVU_API_URL) {
+console.log("SAYVU_API_URL not configured. Payload not sent.");
+return { sent: false, reason: "SAYVU_API_URL not configured" };
+}
 
-  try {
-    const response = await fetch(SAYVU_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(SAYVU_TOKEN ? { Authorization: `Bearer ${SAYVU_TOKEN}` } : {})
-      },
-      body: JSON.stringify(payload)
-    });
+try {
+const response = await fetch(SAYVU_API_URL, {
+method: "POST",
+headers: {
+"Content-Type": "application/json",
+...(SAYVU_TOKEN ? { Authorization: `Bearer ${SAYVU_TOKEN}` } : {})
+},
+body: JSON.stringify(payload)
+});
 
-    const text = await response.text();
+const text = await response.text();
 
-    console.log("SAYVU RESPONSE:", response.status, text);
+console.log("SAYVU RESPONSE:", response.status, text);
 
-    return {
-      sent: response.ok,
-      status: response.status,
-      response: text
-    };
-  } catch (error) {
-    console.error("ERROR SENDING TO SAYVU:", error.message);
-    return {
-      sent: false,
-      error: error.message
-    };
-  }
+return {
+sent: response.ok,
+status: response.status,
+response: text
+};
+} catch (error) {
+console.error("ERROR SENDING TO SAYVU:", error.message);
+return {
+sent: false,
+error: error.message
+};
+}
 }
 
 async function processIncomingMessage(msg, receivedAt) {
-  const normalized = normalizeMessage(msg, receivedAt);
+const normalized = normalizeMessage(msg, receivedAt);
 
-  updateDeviceState(normalized);
+updateDeviceState(normalized);
+
+updateGpsDeviceFromNormalized(normalized);
+
 
   const shouldSendToSayVU = true;
  
@@ -500,7 +538,11 @@ app.get("/public/map-state", (req, res) => {
     satellites: d.satellites,
     valid: d.valid,
     last_seen: d.last_seen,
-    online: true
+    online: true,
+    sos_active: d.sos_active === true,
+    sos_started_at: d.sos_started_at || null,
+    sos_event_id: d.sos_event_id || null,
+    last_event_type: d.last_event_type || null
   }));
 
   const sirensForMap = publicSirens.map((s) => {
