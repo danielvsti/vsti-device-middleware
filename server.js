@@ -25,6 +25,7 @@ Funciones:
 */
 
 const express = require("express");
+const mqtt = require("mqtt");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -34,6 +35,10 @@ const TOKEN = process.env.VSTI_TOKEN || "VSTI_MIDDLEWARE_2026_Q7xF92Lp_4MNd8Rk_9
 
 const SAYVU_API_URL = process.env.SAYVU_API_URL || "";
 const SAYVU_TOKEN = process.env.SAYVU_TOKEN || "";
+const FLESPI_TOKEN = process.env.FLESPI_TOKEN || "";
+const FLESPI_MQTT_URL = "mqtts://mqtt.flespi.io:8883";
+
+const gpsDevices = {};
 
 const devices = {};
 const sirenStates = {};
@@ -235,6 +240,72 @@ async function processIncomingMessage(msg, receivedAt) {
   return { normalized, forwarded: false };
 }
 
+function startFlespiMqtt() {
+  if (!FLESPI_TOKEN) {
+    console.log("FLESPI_TOKEN not configured. MQTT disabled.");
+    return;
+  }
+
+  const client = mqtt.connect(FLESPI_MQTT_URL, {
+    username: FLESPI_TOKEN,
+    password: "",
+    reconnectPeriod: 5000,
+    connectTimeout: 10000
+  });
+
+  client.on("connect", () => {
+    console.log("Connected to Flespi MQTT");
+
+    client.subscribe(
+      "flespi/state/gw/devices/+/telemetry/position",
+      { qos: 0 },
+      (err) => {
+        if (err) {
+          console.error("Flespi subscribe error:", err.message);
+        } else {
+          console.log("Subscribed to Flespi position telemetry");
+        }
+      }
+    );
+  });
+
+  client.on("message", (topic, message) => {
+    try {
+      const payload = JSON.parse(message.toString());
+      const parts = topic.split("/");
+      const deviceId = parts[4];
+
+      if (!payload.latitude || !payload.longitude) return;
+
+      gpsDevices[deviceId] = {
+        id: deviceId,
+        latitude: payload.latitude,
+        longitude: payload.longitude,
+        speed: payload.speed ?? null,
+        direction: payload.direction ?? null,
+        satellites: payload.satellites ?? null,
+        valid: payload.valid ?? null,
+        last_seen: nowChile(),
+        updated_at_ms: Date.now()
+      };
+
+      console.log("GPS POSITION", gpsDevices[deviceId]);
+    } catch (error) {
+      console.error("Error processing Flespi MQTT message:", error.message);
+    }
+  });
+
+  client.on("error", (err) => {
+    console.error("Flespi MQTT error:", err.message);
+  });
+
+  client.on("reconnect", () => {
+    console.log("Reconnecting to Flespi MQTT...");
+  });
+}
+
+
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -385,6 +456,26 @@ app.get("/sirens", (req, res) => {
     sirens: sirenStates
   });
 });
+
+app.get("/map/devices", (req, res) => {
+  if (!checkToken(req, res)) return;
+
+  const now = Date.now();
+
+  const items = Object.values(gpsDevices).map((d) => ({
+    ...d,
+    online: now - d.updated_at_ms < 120000
+  }));
+
+  res.json({
+    status: "ok",
+    total: items.length,
+    devices: items
+  });
+});
+
+startFlespiMqtt();
+
 
 app.listen(PORT, () => {
   console.log(`VS&TI Device Middleware v2.0 running on port ${PORT}`);
