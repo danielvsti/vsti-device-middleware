@@ -183,7 +183,7 @@ function updateGpsDeviceFromNormalized(normalized) {
     last_event_type: normalized.event_type,
     sos_active: isSos ? true : (existing.sos_active || false),
     sos_started_at: isSos ? normalized.received_at : existing.sos_started_at,
-    sos_event_id: isSos ? normalized.event_id : existing.sos_event_id;
+    sos_event_id: isSos ? normalized.event_id : existing.sos_event_id,
     sos_acknowledged: isSos ? false : existing.sos_acknowledged || false,
     sos_acknowledged_at: isSos ? null : existing.sos_acknowledged_at || null
   };
