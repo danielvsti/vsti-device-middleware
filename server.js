@@ -316,7 +316,8 @@ app.get("/", (req, res) => {
       "GET /devices",
       "POST /sirens/command",
       "POST /sirens/status",
-      "GET /sirens"
+      "GET /sirens",
+      "GET /map/devices"
     ]
   });
 });
@@ -464,7 +465,7 @@ app.get("/map/devices", (req, res) => {
 
   const items = Object.values(gpsDevices).map((d) => ({
     ...d,
-    online: now - d.updated_at_ms < 120000
+    online: true
   }));
 
   res.json({
