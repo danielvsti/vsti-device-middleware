@@ -477,6 +477,141 @@ app.get("/map/devices", (req, res) => {
   });
 });
 
+const publicSirens = [
+  {
+    id: "LAB-001",
+    name: "Sirena Libertad / 5 Norte",
+    latitude: -33.01895,
+    longitude: -71.55090,
+    location: "Libertad con 5 Norte, Viña del Mar"
+  }
+];
+
+app.get("/public/map-state", (req, res) => {
+  const now = Date.now();
+
+  const devicesForMap = Object.values(gpsDevices).map((d) => ({
+    id: d.id,
+    name: d.id === "8322560" ? "Botón SOS Piloto" : `Botón SOS ${d.id}`,
+    latitude: d.latitude,
+    longitude: d.longitude,
+    speed: d.speed,
+    direction: d.direction,
+    satellites: d.satellites,
+    valid: d.valid,
+    last_seen: d.last_seen,
+    online: true
+  }));
+
+  const sirensForMap = publicSirens.map((s) => {
+    const state = sirenStates[s.id] || {
+      state: "OFF",
+      relay: false,
+      event_id: null,
+      source: null,
+      updated_at: null,
+      expires_at: Date.now()
+    };
+
+    const expired = state.expires_at && now > state.expires_at;
+
+    return {
+      id: s.id,
+      name: s.name,
+      latitude: s.latitude,
+      longitude: s.longitude,
+      location: s.location,
+      state: expired ? "OFF" : state.state,
+      active: !expired && state.relay === true,
+      event_id: expired ? null : state.event_id,
+      source: expired ? null : state.source,
+      updated_at: state.updated_at || null
+    };
+  });
+
+  res.json({
+    status: "ok",
+    updated_at: nowChile(),
+    devices: devicesForMap,
+    sirens: sirensForMap
+  });
+});
+
+app.post("/public/sirens/activate", (req, res) => {
+  const { siren_id, duration_seconds } = req.body;
+
+  if (!siren_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "siren_id is required"
+    });
+  }
+
+  const siren = publicSirens.find((s) => s.id === siren_id);
+
+  if (!siren) {
+    return res.status(404).json({
+      status: "error",
+      message: "Unknown siren_id"
+    });
+  }
+
+  const duration = Number(duration_seconds || 60);
+  const expiresAt = Date.now() + duration * 1000;
+
+  sirenStates[siren_id] = {
+    state: "ON",
+    relay: true,
+    event_id: `PUBLIC-MAP-${Date.now()}`,
+    source: "public-map",
+    updated_at: nowChile(),
+    expires_at: expiresAt
+  };
+
+  res.json({
+    status: "ok",
+    message: "Siren activated",
+    siren_id,
+    duration_seconds: duration
+  });
+});
+
+app.post("/public/sirens/deactivate", (req, res) => {
+  const { siren_id } = req.body;
+
+  if (!siren_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "siren_id is required"
+    });
+  }
+
+  const siren = publicSirens.find((s) => s.id === siren_id);
+
+  if (!siren) {
+    return res.status(404).json({
+      status: "error",
+      message: "Unknown siren_id"
+    });
+  }
+
+  sirenStates[siren_id] = {
+    state: "OFF",
+    relay: false,
+    event_id: `PUBLIC-MAP-OFF-${Date.now()}`,
+    source: "public-map",
+    updated_at: nowChile(),
+    expires_at: Date.now()
+  };
+
+  res.json({
+    status: "ok",
+    message: "Siren deactivated",
+    siren_id
+  });
+});
+
+
 startFlespiMqtt();
 
 
