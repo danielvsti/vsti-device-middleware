@@ -317,17 +317,22 @@ function startFlespiMqtt() {
 
       if (!payload.latitude || !payload.longitude) return;
 
-      gpsDevices[deviceId] = {
-        id: deviceId,
-        latitude: payload.latitude,
-        longitude: payload.longitude,
-        speed: payload.speed ?? null,
-        direction: payload.direction ?? null,
-        satellites: payload.satellites ?? null,
-        valid: payload.valid ?? null,
-        last_seen: nowChile(),
-        updated_at_ms: Date.now()
-      };
+
+const existing = gpsDevices[deviceId] || {};
+
+gpsDevices[deviceId] = {
+  ...existing,
+
+  id: deviceId,
+  latitude: payload.latitude,
+  longitude: payload.longitude,
+  speed: payload.speed ?? null,
+  direction: payload.direction ?? null,
+  satellites: payload.satellites ?? null,
+  valid: payload.valid ?? null,
+  last_seen: nowChile(),
+  updated_at_ms: Date.now()
+};
 
       console.log("GPS POSITION", gpsDevices[deviceId]);
     } catch (error) {
