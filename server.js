@@ -461,6 +461,15 @@ app.post("/sirens/status", (req, res) => {
   if (!checkToken(req, res)) return;
 
   const { siren_id, relay_state, firmware, rssi, uptime } = req.body;
+console.log("[SIREN STATUS]", {
+  siren_id,
+  relay_state,
+  firmware,
+  rssi,
+  uptime,
+  remote_ip: getRemoteIp(req),
+  received_at: nowChile()
+});
 
   if (!siren_id) {
     return res.status(400).json({
@@ -484,6 +493,8 @@ app.post("/sirens/status", (req, res) => {
   }
 
   current.last_seen = nowChile();
+  current.last_seen_ms = Date.now();
+current.remote_ip = getRemoteIp(req);
   current.relay_reported = relay_state ?? null;
   current.firmware = firmware || null;
   current.rssi = rssi ?? null;
