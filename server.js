@@ -542,10 +542,10 @@ app.get("/map/devices", (req, res) => {
 const publicSirens = [
   {
     id: "LAB-001",
-    name: "Sirena Libertad / 5 Norte",
-    latitude: -33.01895,
-    longitude: -71.55090,
-    location: "Libertad con 5 Norte, Viña del Mar"
+    name: "Sirena Huechuraba / Fontova",
+    latitude: -33.36750,
+    longitude: -70.67980,
+    location: "Sector Fontova, Huechuraba, Santiago"
   }
 ];
 
