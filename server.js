@@ -41,9 +41,12 @@ const FLESPI_TOKEN = process.env.FLESPI_TOKEN || "";
 const FLESPI_MQTT_URL = "mqtts://mqtt.flespi.io:8883";
 
 const gpsDevices = {};
+const mobileEvents = {};
 
 const devices = {};
 const sirenStates = {};
+
+
 const SOS_ACTIVE_MS = 60 * 1000;
 const SOS_RECENT_MS = 10 * 60 * 1000;
 
@@ -552,6 +555,29 @@ id: "LAB-001",
 app.get("/public/map-state", (req, res) => {
 		const now = Date.now();
 
+const mobileEventsForMap = Object.values(mobileEvents)
+  .filter((e) => e.state === "ACTIVE" || e.state === "ACKNOWLEDGED")
+  .map((e) => ({
+    id: e.id,
+    type: e.type,
+    source: e.source,
+    user_id: e.user_id,
+    name: e.name,
+    phone: e.phone,
+    latitude: e.latitude,
+    longitude: e.longitude,
+    accuracy: e.accuracy,
+    battery: e.battery,
+    state: e.state,
+    acknowledged: e.acknowledged,
+    acknowledged_at: e.acknowledged_at,
+    cancelled: e.cancelled,
+    created_at: e.created_at,
+    updated_at: e.updated_at
+  }));
+
+
+
 
 		const devicesForMap = Object.values(gpsDevices).map((d) => {
 				let sosState = "NORMAL";
@@ -623,11 +649,13 @@ updated_at: state.updated_at || null
 });
 
 res.json({
-status: "ok",
-updated_at: nowChile(),
-devices: devicesForMap,
-sirens: sirensForMap
+  status: "ok",
+  updated_at: nowChile(),
+  devices: devicesForMap,
+  sirens: sirensForMap,
+  mobile_events: mobileEventsForMap
 });
+
 });
 
 app.post("/public/sirens/activate", (req, res) => {
@@ -739,6 +767,165 @@ device_id: id,
 acknowledged_at: device.sos_acknowledged_at
 });
 });
+
+app.post("/public/mobile/sos", (req, res) => {
+  const {
+    user_id,
+    name,
+    phone,
+    latitude,
+    longitude,
+    accuracy,
+    battery,
+    source
+  } = req.body;
+
+  if (!user_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "user_id is required"
+    });
+  }
+
+  if (latitude == null || longitude == null) {
+    return res.status(400).json({
+      status: "error",
+      message: "latitude and longitude are required"
+    });
+  }
+
+  const eventId = `MOBILE-SOS-${user_id}-${Date.now()}`;
+
+  mobileEvents[eventId] = {
+    id: eventId,
+    type: "MOBILE_SOS",
+    source: source || "mobile_pwa",
+    user_id,
+    name: name || "Usuario movil",
+    phone: phone || null,
+    latitude: Number(latitude),
+    longitude: Number(longitude),
+    accuracy: accuracy ?? null,
+    battery: battery ?? null,
+    state: "ACTIVE",
+    acknowledged: false,
+    acknowledged_at: null,
+    cancelled: false,
+    cancelled_at: null,
+    created_at: nowChile(),
+    created_at_ms: Date.now(),
+    updated_at: nowChile(),
+    updated_at_ms: Date.now()
+  };
+
+  console.log("[MOBILE SOS]", mobileEvents[eventId]);
+
+  res.json({
+    status: "ok",
+    message: "Mobile SOS received",
+    event_id: eventId,
+    state: "ACTIVE",
+    received_at: mobileEvents[eventId].created_at
+  });
+});
+
+app.post("/public/mobile/cancel", (req, res) => {
+  const { event_id, user_id } = req.body;
+
+  if (!event_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "event_id is required"
+    });
+  }
+
+  const event = mobileEvents[event_id];
+
+  if (!event) {
+    return res.status(404).json({
+      status: "error",
+      message: "Unknown event_id"
+    });
+  }
+
+  if (user_id && event.user_id !== user_id) {
+    return res.status(403).json({
+      status: "error",
+      message: "user_id does not match event"
+    });
+  }
+
+  event.state = "CANCELLED";
+  event.cancelled = true;
+  event.cancelled_at = nowChile();
+  event.updated_at = nowChile();
+  event.updated_at_ms = Date.now();
+
+  console.log("[MOBILE SOS CANCELLED]", event);
+
+  res.json({
+    status: "ok",
+    message: "Mobile SOS cancelled",
+    event_id,
+    state: event.state,
+    cancelled_at: event.cancelled_at
+  });
+});
+
+app.post("/public/mobile/ack", (req, res) => {
+  const { event_id, operator } = req.body;
+
+  if (!event_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "event_id is required"
+    });
+  }
+
+  const event = mobileEvents[event_id];
+
+  if (!event) {
+    return res.status(404).json({
+      status: "error",
+      message: "Unknown event_id"
+    });
+  }
+
+  event.state = "ACKNOWLEDGED";
+  event.acknowledged = true;
+  event.acknowledged_by = operator || "operator";
+  event.acknowledged_at = nowChile();
+  event.updated_at = nowChile();
+  event.updated_at_ms = Date.now();
+
+  console.log("[MOBILE SOS ACK]", event);
+
+  res.json({
+    status: "ok",
+    message: "Mobile SOS acknowledged",
+    event_id,
+    state: event.state,
+    acknowledged_at: event.acknowledged_at
+  });
+});
+
+app.get("/public/mobile/status/:event_id", (req, res) => {
+  const { event_id } = req.params;
+  const event = mobileEvents[event_id];
+
+  if (!event) {
+    return res.status(404).json({
+      status: "error",
+      message: "Unknown event_id"
+    });
+  }
+
+  res.json({
+    status: "ok",
+    event
+  });
+});
+
 
 startFlespiMqtt();
 
