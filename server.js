@@ -543,13 +543,19 @@ devices: items
 		});
 
 const publicSirens = [
+
 {
-id: "LAB-001",
-	    name: "Sirena Huechuraba / Fontova",
-	    latitude: -33.352618,
-	    longitude: -70.670551,
-	    location: "Sector Fontova, Huechuraba, Santiago"
+  id: "LAB-001",
+  name: "Sirena Libertad / 5 Norte",
+  latitude: -33.01895,
+  longitude: -71.55090,
+  location: "Libertad con 5 Norte, Viña del Mar",
+  state: currentState,
+  active: currentState === "ON"
 }
+
+
+
 ];
 
 app.get("/public/map-state", (req, res) => {
