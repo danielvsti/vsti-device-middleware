@@ -543,7 +543,6 @@ devices: items
 		});
 
 const publicSirens = [
-
 {
   id: "LAB-001",
   name: "Sirena Libertad / 5 Norte",
@@ -553,9 +552,6 @@ const publicSirens = [
   state: currentState,
   active: currentState === "ON"
 }
-
-
-
 ];
 
 app.get("/public/map-state", (req, res) => {
