@@ -549,8 +549,6 @@ const publicSirens = [
   latitude: -33.01895,
   longitude: -71.55090,
   location: "Libertad con 5 Norte, Viña del Mar",
-  state: currentState,
-  active: currentState === "ON"
 }
 ];
 
