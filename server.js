@@ -24,6 +24,11 @@ Funciones:
 =========================================================
  */
 
+console.log(
+  "DATABASE_URL configurada:",
+  !!process.env.DATABASE_URL
+);
+
 const express = require("express");
 const mqtt = require("mqtt");
 const cors = require("cors");
