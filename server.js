@@ -1194,7 +1194,65 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
+app.post("/auth/login-demo", async (req, res) => {
+  try {
+    const { phone } = req.body;
 
+    if (!phone) {
+      return res.status(400).json({
+        status: "error",
+        message: "phone is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.control_center_id,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+        u.role,
+        u.validation_status,
+        u.full_name,
+        u.phone,
+        u.email,
+        u.declared_address
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.phone = $1
+        AND u.is_active = true
+      ORDER BY u.created_at DESC
+      LIMIT 1
+      `,
+      [phone]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      status: "ok",
+      message: "Login demo OK",
+      token: `demo-token-${user.id}`,
+      user
+    });
+
+  } catch (error) {
+    console.error("[AUTH LOGIN DEMO ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: "Database error logging in"
+    });
+  }
+});
 
 startFlespiMqtt();
 
