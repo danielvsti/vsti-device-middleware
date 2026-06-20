@@ -31,18 +31,6 @@ console.log(
   !!process.env.DATABASE_URL
 );
 
-app.get("/debug/db", async (req, res) => {
-  const result = await pool.query(`
-    SELECT table_name
-    FROM information_schema.tables
-    WHERE table_schema = 'public'
-    ORDER BY table_name
-  `);
-
-  res.json(result.rows);
-});
-
-
 const express = require("express");
 const mqtt = require("mqtt");
 const cors = require("cors");
@@ -50,6 +38,26 @@ const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+
+
+app.get("/debug/db", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+      ORDER BY table_name
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.VSTI_TOKEN || "VSTI_MIDDLEWARE_2026_Q7xF92Lp_4MNd8Rk_91AB";
