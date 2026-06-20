@@ -1408,6 +1408,90 @@ app.post("/auth/login-demo", async (req, res) => {
   }
 });
 
+
+app.get("/tickets", async (req, res) => {
+  try {
+    const {
+      control_center_code,
+      state,
+      limit
+    } = req.query;
+
+    if (!control_center_code) {
+      return res.status(400).json({
+        status: "error",
+        message: "control_center_code is required"
+      });
+    }
+
+    const params = [control_center_code];
+    let where = `cc.code = $1`;
+
+    if (state) {
+      params.push(state);
+      where += ` AND t.state = $${params.length}`;
+    }
+
+    const maxLimit = Math.min(Number(limit || 50), 200);
+    params.push(maxLimit);
+
+    const result = await pool.query(
+      `
+      SELECT
+        t.id,
+        cc.code AS control_center_code,
+        t.source_type,
+        t.source_event_id,
+        t.alert_type,
+        t.title,
+        t.description,
+        t.state,
+        t.priority,
+        t.latitude,
+        t.longitude,
+        t.accuracy,
+        t.created_at,
+        t.acknowledged_at,
+        t.assigned_at,
+        t.resolved_at,
+        t.closed_at,
+        u.full_name AS citizen_name,
+        u.phone AS citizen_phone,
+        resolver.full_name AS resolver_name
+      FROM tickets t
+      JOIN control_centers cc
+        ON cc.id = t.control_center_id
+      LEFT JOIN users u
+        ON u.id = t.citizen_user_id
+      LEFT JOIN users resolver
+        ON resolver.id = t.assigned_resolver_id
+      WHERE ${where}
+      ORDER BY t.created_at DESC
+      LIMIT $${params.length}
+      `,
+      params
+    );
+
+    res.json({
+      status: "ok",
+      total: result.rows.length,
+      tickets: result.rows
+    });
+
+  } catch (error) {
+    console.error("[GET TICKETS ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
+
+
+
 startFlespiMqtt();
 
 
