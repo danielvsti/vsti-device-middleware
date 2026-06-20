@@ -388,6 +388,90 @@ client.on("reconnect", () => {
 }
 
 
+async function createTicket({
+  control_center_id,
+  citizen_user_id = null,
+  source_type,
+  source_event_id = null,
+  alert_type,
+  title,
+  description = null,
+  latitude,
+  longitude,
+  accuracy = null,
+  priority = 3,
+  metadata = {}
+}) {
+  const ticketResult = await pool.query(
+    `
+    INSERT INTO tickets (
+      control_center_id,
+      citizen_user_id,
+      source_type,
+      source_event_id,
+      alert_type,
+      title,
+      description,
+      state,
+      priority,
+      latitude,
+      longitude,
+      accuracy
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,
+      'ACTIVE',
+      $8,$9,$10,$11
+    )
+    RETURNING *
+    `,
+    [
+      control_center_id,
+      citizen_user_id,
+      source_type,
+      source_event_id,
+      alert_type,
+      title,
+      description,
+      priority,
+      latitude,
+      longitude,
+      accuracy
+    ]
+  );
+
+  const ticket = ticketResult.rows[0];
+
+  await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_user_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,$2,$3,$4,$5,$6)
+    `,
+    [
+      ticket.id,
+      citizen_user_id,
+      citizen_user_id ? "NEIGHBOR" : "SYSTEM",
+      "TICKET_CREATED",
+      "Ticket creado por alerta entrante",
+      metadata
+    ]
+  );
+
+  return ticket;
+}
+
+
+
+
+
+
 
 app.get("/", (req, res) => {
 		res.json({
@@ -873,6 +957,46 @@ app.post("/public/mobile/sos", async (req, res) => {
 
     const event = result.rows[0];
 
+const userResult = await pool.query(
+  `
+  SELECT id, control_center_id
+  FROM users
+  WHERE id = $1
+  `,
+  [user_id]
+);
+
+let ticket = null;
+
+if (userResult.rows.length > 0) {
+  const user = userResult.rows[0];
+
+  ticket = await createTicket({
+    control_center_id: user.control_center_id,
+    citizen_user_id: user.id,
+    source_type: "MOBILE_APP",
+    source_event_id: event.id,
+    alert_type: "SOS_MANUAL",
+    title: "SOS móvil",
+    description: "Alerta SOS generada desde aplicación móvil",
+    latitude: event.latitude,
+    longitude: event.longitude,
+    accuracy: event.accuracy,
+    priority: 1,
+    metadata: {
+      mobile_event_id: event.id,
+      phone,
+      battery,
+      source
+    }
+  });
+}
+
+
+
+
+
+
     console.log("[MOBILE SOS DB]", event);
 
     res.json({
@@ -880,7 +1004,8 @@ app.post("/public/mobile/sos", async (req, res) => {
       message: "Mobile SOS received",
       event_id: event.id,
       state: event.state,
-      received_at: event.created_at
+     received_at: event.created_at,
+ticket_id: ticket ? ticket.id : null
     });
 
   } catch (error) {
