@@ -1490,6 +1490,67 @@ app.get("/tickets", async (req, res) => {
 
 
 
+app.post("/tickets/:id/acknowledge", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { operator_user_id } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        state = 'ACKNOWLEDGED',
+        acknowledged_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found"
+      });
+    }
+
+    const ticket = result.rows[0];
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description
+      )
+      VALUES ($1,$2,'OPERATOR','ACKNOWLEDGED',$3)
+      `,
+      [
+        ticket.id,
+        operator_user_id || null,
+        "Operador tomó conocimiento del caso"
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Ticket acknowledged",
+      ticket
+    });
+
+  } catch (error) {
+    console.error("[ACK TICKET ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
 
 
 startFlespiMqtt();
