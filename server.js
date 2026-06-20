@@ -58,6 +58,35 @@ app.get("/debug/db", async (req, res) => {
   }
 });
 
+app.get("/debug/tickets", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        t.id,
+        cc.code AS control_center,
+        t.source_type,
+        t.alert_type,
+        t.state,
+        t.priority,
+        t.created_at
+      FROM tickets t
+      JOIN control_centers cc
+        ON cc.id = t.control_center_id
+      ORDER BY t.created_at DESC
+      LIMIT 20
+    `);
+
+    res.json(result.rows);
+
+  } catch (error) {
+    console.error("[DEBUG TICKETS ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.VSTI_TOKEN || "VSTI_MIDDLEWARE_2026_Q7xF92Lp_4MNd8Rk_91AB";
