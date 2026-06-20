@@ -1036,6 +1036,145 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
   }
 });
 
+app.post("/auth/register", async (req, res) => {
+  try {
+    const {
+      control_center_code,
+      full_name,
+      rut,
+      phone,
+      email,
+      declared_address,
+      latitude,
+      longitude,
+      emergency_contacts
+    } = req.body;
+
+    if (!control_center_code) {
+      return res.status(400).json({
+        status: "error",
+        message: "control_center_code is required"
+      });
+    }
+
+    if (!full_name || !phone) {
+      return res.status(400).json({
+        status: "error",
+        message: "full_name and phone are required"
+      });
+    }
+
+    const ccResult = await pool.query(
+      `
+      SELECT id, code, name
+      FROM control_centers
+      WHERE code = $1
+      `,
+      [control_center_code]
+    );
+
+    if (ccResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Unknown control_center_code"
+      });
+    }
+
+    const controlCenter = ccResult.rows[0];
+
+    const userResult = await pool.query(
+      `
+      INSERT INTO users (
+        control_center_id,
+        role,
+        validation_status,
+        full_name,
+        rut,
+        phone,
+        email,
+        declared_address,
+        latitude,
+        longitude
+      )
+      VALUES (
+        $1,
+        'NEIGHBOR',
+        'PROVISIONAL_ACTIVE',
+        $2,$3,$4,$5,$6,$7,$8
+      )
+      RETURNING *
+      `,
+      [
+        controlCenter.id,
+        full_name,
+        rut || null,
+        phone,
+        email || null,
+        declared_address || null,
+        latitude ?? null,
+        longitude ?? null
+      ]
+    );
+
+    const user = userResult.rows[0];
+
+    const contacts = Array.isArray(emergency_contacts)
+      ? emergency_contacts
+      : [];
+
+    for (const contact of contacts) {
+      if (!contact.name || !contact.phone) continue;
+
+      await pool.query(
+        `
+        INSERT INTO emergency_contacts (
+          user_id,
+          name,
+          relationship,
+          phone,
+          priority
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        `,
+        [
+          user.id,
+          contact.name,
+          contact.relationship || null,
+          contact.phone,
+          contact.priority || 1
+        ]
+      );
+    }
+
+    res.json({
+      status: "ok",
+      message: "User registered",
+      user: {
+        id: user.id,
+        control_center_id: user.control_center_id,
+        control_center_code: controlCenter.code,
+        control_center_name: controlCenter.name,
+        role: user.role,
+        validation_status: user.validation_status,
+        full_name: user.full_name,
+        phone: user.phone,
+        rut: user.rut,
+        email: user.email,
+        declared_address: user.declared_address
+      }
+    });
+
+  } catch (error) {
+    console.error("[AUTH REGISTER ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: "Database error registering user"
+    });
+  }
+});
+
+
 
 startFlespiMqtt();
 
