@@ -24,6 +24,8 @@ Funciones:
 =========================================================
  */
 
+const pool = require("./db");
+
 console.log(
   "DATABASE_URL configurada:",
   !!process.env.DATABASE_URL
@@ -557,31 +559,34 @@ const publicSirens = [
 }
 ];
 
-app.get("/public/map-state", (req, res) => {
+app.get("/public/map-state", async (req, res) => {
 		const now = Date.now();
 
-const mobileEventsForMap = Object.values(mobileEvents)
-  .filter((e) => e.state === "ACTIVE" || e.state === "ACKNOWLEDGED")
-  .map((e) => ({
-    id: e.id,
-    type: e.type,
-    source: e.source,
-    user_id: e.user_id,
-    name: e.name,
-    phone: e.phone,
-    latitude: e.latitude,
-    longitude: e.longitude,
-    accuracy: e.accuracy,
-    battery: e.battery,
-    state: e.state,
-    acknowledged: e.acknowledged,
-    acknowledged_at: e.acknowledged_at,
-    cancelled: e.cancelled,
-    created_at: e.created_at,
-    updated_at: e.updated_at
-  }));
 
+const mobileResult = await pool.query(`
+  SELECT DISTINCT ON (user_id)
+    id,
+    'MOBILE_SOS' AS type,
+    'mobile_pwa' AS source,
+    user_id,
+    name,
+    phone,
+    latitude,
+    longitude,
+    accuracy,
+    battery,
+    state,
+    acknowledged,
+    acknowledged_at,
+    cancelled,
+    created_at,
+    updated_at
+  FROM mobile_events
+  WHERE state IN ('ACTIVE', 'ACKNOWLEDGED')
+  ORDER BY user_id, created_at DESC
+`);
 
+const mobileEventsForMap = mobileResult.rows;
 
 
 		const devicesForMap = Object.values(gpsDevices).map((d) => {
@@ -773,162 +778,262 @@ acknowledged_at: device.sos_acknowledged_at
 });
 });
 
-app.post("/public/mobile/sos", (req, res) => {
-  const {
-    user_id,
-    name,
-    phone,
-    latitude,
-    longitude,
-    accuracy,
-    battery,
-    source
-  } = req.body;
+app.post("/public/mobile/sos", async (req, res) => {
+  try {
+    const {
+      user_id,
+      name,
+      phone,
+      latitude,
+      longitude,
+      accuracy,
+      battery,
+      source
+    } = req.body;
 
-  if (!user_id) {
-    return res.status(400).json({
+    if (!user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "user_id is required"
+      });
+    }
+
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({
+        status: "error",
+        message: "latitude and longitude are required"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE mobile_events
+      SET
+        state = 'CANCELLED',
+        cancelled = true,
+        cancelled_at = NOW(),
+        updated_at = NOW()
+      WHERE user_id = $1
+        AND state = 'ACTIVE'
+      `,
+      [user_id]
+    );
+
+    const eventId = `MOBILE-SOS-${user_id}-${Date.now()}`;
+
+    const result = await pool.query(
+      `
+      INSERT INTO mobile_events (
+        id,
+        user_id,
+        name,
+        phone,
+        latitude,
+        longitude,
+        accuracy,
+        battery,
+        state,
+        acknowledged,
+        cancelled
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',false,false)
+      RETURNING *
+      `,
+      [
+        eventId,
+        user_id,
+        name || "Usuario movil",
+        phone || null,
+        Number(latitude),
+        Number(longitude),
+        accuracy ?? null,
+        battery ?? null
+      ]
+    );
+
+    const event = result.rows[0];
+
+    console.log("[MOBILE SOS DB]", event);
+
+    res.json({
+      status: "ok",
+      message: "Mobile SOS received",
+      event_id: event.id,
+      state: event.state,
+      received_at: event.created_at
+    });
+
+  } catch (error) {
+    console.error("[MOBILE SOS DB ERROR]", error);
+
+    res.status(500).json({
       status: "error",
-      message: "user_id is required"
+      message: "Database error creating mobile SOS"
     });
   }
-
-  if (latitude == null || longitude == null) {
-    return res.status(400).json({
-      status: "error",
-      message: "latitude and longitude are required"
-    });
-  }
-
-  const eventId = `MOBILE-SOS-${user_id}-${Date.now()}`;
-
-  mobileEvents[eventId] = {
-    id: eventId,
-    type: "MOBILE_SOS",
-    source: source || "mobile_pwa",
-    user_id,
-    name: name || "Usuario movil",
-    phone: phone || null,
-    latitude: Number(latitude),
-    longitude: Number(longitude),
-    accuracy: accuracy ?? null,
-    battery: battery ?? null,
-    state: "ACTIVE",
-    acknowledged: false,
-    acknowledged_at: null,
-    cancelled: false,
-    cancelled_at: null,
-    created_at: nowChile(),
-    created_at_ms: Date.now(),
-    updated_at: nowChile(),
-    updated_at_ms: Date.now()
-  };
-
-  console.log("[MOBILE SOS]", mobileEvents[eventId]);
-
-  res.json({
-    status: "ok",
-    message: "Mobile SOS received",
-    event_id: eventId,
-    state: "ACTIVE",
-    received_at: mobileEvents[eventId].created_at
-  });
 });
 
-app.post("/public/mobile/cancel", (req, res) => {
-  const { event_id, user_id } = req.body;
 
-  if (!event_id) {
-    return res.status(400).json({
+app.post("/public/mobile/cancel", async (req, res) => {
+  try {
+    const { event_id, user_id } = req.body;
+
+    if (!event_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "event_id is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM mobile_events
+      WHERE id = $1
+      `,
+      [event_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Unknown event_id"
+      });
+    }
+
+    const event = result.rows[0];
+
+    if (user_id && event.user_id !== user_id) {
+      return res.status(403).json({
+        status: "error",
+        message: "user_id does not match event"
+      });
+    }
+
+    const update = await pool.query(
+      `
+      UPDATE mobile_events
+      SET
+        state = 'CANCELLED',
+        cancelled = true,
+        cancelled_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [event_id]
+    );
+
+    console.log("[MOBILE SOS CANCELLED DB]", update.rows[0]);
+
+    res.json({
+      status: "ok",
+      message: "Mobile SOS cancelled",
+      event_id,
+      state: update.rows[0].state,
+      cancelled_at: update.rows[0].cancelled_at
+    });
+
+  } catch (error) {
+    console.error("[MOBILE CANCEL DB ERROR]", error);
+
+    res.status(500).json({
       status: "error",
-      message: "event_id is required"
+      message: "Database error cancelling mobile SOS"
     });
   }
-
-  const event = mobileEvents[event_id];
-
-  if (!event) {
-    return res.status(404).json({
-      status: "error",
-      message: "Unknown event_id"
-    });
-  }
-
-  if (user_id && event.user_id !== user_id) {
-    return res.status(403).json({
-      status: "error",
-      message: "user_id does not match event"
-    });
-  }
-
-  event.state = "CANCELLED";
-  event.cancelled = true;
-  event.cancelled_at = nowChile();
-  event.updated_at = nowChile();
-  event.updated_at_ms = Date.now();
-
-  console.log("[MOBILE SOS CANCELLED]", event);
-
-  res.json({
-    status: "ok",
-    message: "Mobile SOS cancelled",
-    event_id,
-    state: event.state,
-    cancelled_at: event.cancelled_at
-  });
 });
 
-app.post("/public/mobile/ack", (req, res) => {
-  const { event_id, operator } = req.body;
 
-  if (!event_id) {
-    return res.status(400).json({
+
+app.post("/public/mobile/ack", async (req, res) => {
+  try {
+    const { event_id, operator } = req.body;
+
+    if (!event_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "event_id is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE mobile_events
+      SET
+        state = 'ACKNOWLEDGED',
+        acknowledged = true,
+        acknowledged_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [event_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Unknown event_id"
+      });
+    }
+
+    console.log("[MOBILE SOS ACK DB]", {
+      ...result.rows[0],
+      operator: operator || "operator"
+    });
+
+    res.json({
+      status: "ok",
+      message: "Mobile SOS acknowledged",
+      event_id,
+      state: result.rows[0].state,
+      acknowledged_at: result.rows[0].acknowledged_at
+    });
+
+  } catch (error) {
+    console.error("[MOBILE ACK DB ERROR]", error);
+
+    res.status(500).json({
       status: "error",
-      message: "event_id is required"
+      message: "Database error acknowledging mobile SOS"
     });
   }
-
-  const event = mobileEvents[event_id];
-
-  if (!event) {
-    return res.status(404).json({
-      status: "error",
-      message: "Unknown event_id"
-    });
-  }
-
-  event.state = "ACKNOWLEDGED";
-  event.acknowledged = true;
-  event.acknowledged_by = operator || "operator";
-  event.acknowledged_at = nowChile();
-  event.updated_at = nowChile();
-  event.updated_at_ms = Date.now();
-
-  console.log("[MOBILE SOS ACK]", event);
-
-  res.json({
-    status: "ok",
-    message: "Mobile SOS acknowledged",
-    event_id,
-    state: event.state,
-    acknowledged_at: event.acknowledged_at
-  });
 });
 
-app.get("/public/mobile/status/:event_id", (req, res) => {
-  const { event_id } = req.params;
-  const event = mobileEvents[event_id];
+app.get("/public/mobile/status/:event_id", async (req, res) => {
+  try {
+    const { event_id } = req.params;
 
-  if (!event) {
-    return res.status(404).json({
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM mobile_events
+      WHERE id = $1
+      `,
+      [event_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Unknown event_id"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      event: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[MOBILE STATUS DB ERROR]", error);
+
+    res.status(500).json({
       status: "error",
-      message: "Unknown event_id"
+      message: "Database error getting mobile SOS status"
     });
   }
-
-  res.json({
-    status: "ok",
-    event
-  });
 });
 
 
