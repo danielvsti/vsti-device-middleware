@@ -417,6 +417,146 @@ client.on("reconnect", () => {
 }
 
 
+function distanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (v) => v * Math.PI / 180;
+
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) *
+    Math.cos(toRad(lat2)) *
+    Math.sin(dLon / 2) ** 2;
+
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function autoAssignResolver(ticket) {
+  if (!ticket.latitude || !ticket.longitude) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      u.id,
+      u.full_name,
+      rl.latitude,
+      rl.longitude,
+      rl.status
+    FROM resolver_locations rl
+    JOIN users u ON u.id = rl.user_id
+    WHERE rl.control_center_id = $1
+      AND rl.status = 'AVAILABLE'
+      AND u.role = 'RESOLVER'
+      AND u.is_active = true
+    `,
+    [ticket.control_center_id]
+  );
+
+  if (result.rows.length === 0) {
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_role,
+        action_type,
+        description
+      )
+      VALUES ($1,'SYSTEM','NO_RESOLVER_AVAILABLE',$2)
+      `,
+      [
+        ticket.id,
+        "No hay resolutores disponibles para asignación automática"
+      ]
+    );
+
+    return null;
+  }
+
+  const ranked = result.rows
+    .map((resolver) => ({
+      ...resolver,
+      distance_meters: distanceMeters(
+        Number(ticket.latitude),
+        Number(ticket.longitude),
+        Number(resolver.latitude),
+        Number(resolver.longitude)
+      )
+    }))
+    .sort((a, b) => a.distance_meters - b.distance_meters);
+
+  const selected = ranked[0];
+
+  await pool.query(
+    `
+    INSERT INTO ticket_assignments (
+      ticket_id,
+      resolver_user_id,
+      assignment_type,
+      state,
+      distance_meters,
+      notified_at
+    )
+    VALUES ($1,$2,'AUTO','PENDING',$3,NOW())
+    `,
+    [
+      ticket.id,
+      selected.id,
+      selected.distance_meters
+    ]
+  );
+
+  const update = await pool.query(
+    `
+    UPDATE tickets
+    SET
+      assigned_resolver_id = $1,
+      state = 'ASSIGNED',
+      assigned_at = NOW(),
+      updated_at = NOW()
+    WHERE id = $2
+    RETURNING *
+    `,
+    [
+      selected.id,
+      ticket.id
+    ]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,'SYSTEM','AUTO_ASSIGNED',$2,$3)
+    `,
+    [
+      ticket.id,
+      `Resolutor asignado automáticamente: ${selected.full_name}`,
+      JSON.stringify({
+        resolver_user_id: selected.id,
+        resolver_name: selected.full_name,
+        distance_meters: Math.round(selected.distance_meters)
+      })
+    ]
+  );
+
+  return {
+    ticket: update.rows[0],
+    resolver: selected
+  };
+}
+
+
+
+
 async function createTicket({
   control_center_id,
   citizen_user_id = null,
@@ -492,7 +632,7 @@ async function createTicket({
       metadata
     ]
   );
-
+await autoAssignResolver(ticket);
   return ticket;
 }
 
@@ -1551,6 +1691,56 @@ app.post("/tickets/:id/acknowledge", async (req, res) => {
   }
 });
 
+app.post("/debug/set-role", async (req, res) => {
+  try {
+    const { phone, role } = req.body;
+
+    const validRoles = [
+      "NEIGHBOR",
+      "RESOLVER",
+      "OPERATOR",
+      "ADMIN"
+    ];
+
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid role"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET role = $1,
+          updated_at = NOW()
+      WHERE phone = $2
+      RETURNING id, full_name, phone, role
+      `,
+      [role, phone]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[SET ROLE ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
 
 
 startFlespiMqtt();
