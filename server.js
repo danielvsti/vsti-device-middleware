@@ -31,6 +31,18 @@ console.log(
   !!process.env.DATABASE_URL
 );
 
+app.get("/debug/db", async (req, res) => {
+  const result = await pool.query(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+    ORDER BY table_name
+  `);
+
+  res.json(result.rows);
+});
+
+
 const express = require("express");
 const mqtt = require("mqtt");
 const cors = require("cors");
