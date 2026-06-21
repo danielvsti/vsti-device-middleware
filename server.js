@@ -1135,14 +1135,34 @@ const userResult = await pool.query(
   [user_id]
 );
 
+
+
 let ticket = null;
+let controlCenterId = null;
+let citizenUserId = null;
 
 if (userResult.rows.length > 0) {
-  const user = userResult.rows[0];
+  controlCenterId = userResult.rows[0].control_center_id;
+  citizenUserId = userResult.rows[0].id;
+} else {
+  const ccResult = await pool.query(
+    `
+    SELECT id
+    FROM control_centers
+    WHERE code = $1
+    `,
+    ["CC-VINA"]
+  );
 
+  if (ccResult.rows.length > 0) {
+    controlCenterId = ccResult.rows[0].id;
+  }
+}
+
+if (controlCenterId) {
   ticket = await createTicket({
-    control_center_id: user.control_center_id,
-    citizen_user_id: user.id,
+    control_center_id: controlCenterId,
+    citizen_user_id: citizenUserId,
     source_type: "MOBILE_APP",
     source_event_id: event.id,
     alert_type: "SOS_MANUAL",
@@ -1156,14 +1176,11 @@ if (userResult.rows.length > 0) {
       mobile_event_id: event.id,
       phone,
       battery,
-      source
+      source,
+      anonymous_user_id: user_id
     }
   });
 }
-
-
-
-
 
 
     console.log("[MOBILE SOS DB]", event);
