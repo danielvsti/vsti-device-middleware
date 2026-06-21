@@ -2642,6 +2642,119 @@ app.get("/dashboard/map-state", async (req, res) => {
   }
 });
 
+app.get("/tickets/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const ticketResult = await pool.query(
+      `
+      SELECT
+        t.*,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+
+        citizen.full_name AS citizen_name,
+        citizen.phone AS citizen_phone,
+        citizen.email AS citizen_email,
+        citizen.declared_address,
+
+        resolver.full_name AS resolver_name,
+        resolver.phone AS resolver_phone
+
+      FROM tickets t
+
+      JOIN control_centers cc
+        ON cc.id = t.control_center_id
+
+      LEFT JOIN users citizen
+        ON citizen.id = t.citizen_user_id
+
+      LEFT JOIN users resolver
+        ON resolver.id = t.assigned_resolver_id
+
+      WHERE t.id = $1
+      `,
+      [id]
+    );
+
+    if (ticketResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found"
+      });
+    }
+
+    const ticket = ticketResult.rows[0];
+
+    const contactsResult = ticket.citizen_user_id
+      ? await pool.query(
+          `
+          SELECT
+            id,
+            name,
+            relationship,
+            phone,
+            priority
+          FROM emergency_contacts
+          WHERE user_id = $1
+          ORDER BY priority ASC
+          `,
+          [ticket.citizen_user_id]
+        )
+      : { rows: [] };
+
+    const actionsResult = await pool.query(
+      `
+      SELECT
+        ta.id,
+        ta.action_type,
+        ta.actor_role,
+        ta.description,
+        ta.metadata,
+        ta.created_at,
+        u.full_name AS actor_name
+      FROM ticket_actions ta
+      LEFT JOIN users u
+        ON u.id = ta.actor_user_id
+      WHERE ta.ticket_id = $1
+      ORDER BY ta.created_at ASC
+      `,
+      [id]
+    );
+
+    const notesResult = await pool.query(
+      `
+      SELECT
+        tn.id,
+        tn.note,
+        tn.created_at,
+        u.full_name AS author_name
+      FROM ticket_notes tn
+      LEFT JOIN users u
+        ON u.id = tn.author_user_id
+      WHERE tn.ticket_id = $1
+      ORDER BY tn.created_at ASC
+      `,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      ticket,
+      emergency_contacts: contactsResult.rows,
+      actions: actionsResult.rows,
+      notes: notesResult.rows
+    });
+
+  } catch (error) {
+    console.error("[GET TICKET DETAIL ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
 
 
 
