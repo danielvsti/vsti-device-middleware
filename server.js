@@ -2365,6 +2365,81 @@ app.post("/tickets/:id/reject", async (req, res) => {
   }
 });
 
+app.get("/tickets/:id/actions", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT
+        ta.id,
+        ta.action_type,
+        ta.actor_role,
+        ta.description,
+        ta.metadata,
+        ta.created_at,
+        u.full_name AS actor_name
+      FROM ticket_actions ta
+      LEFT JOIN users u
+        ON u.id = ta.actor_user_id
+      WHERE ta.ticket_id = $1
+      ORDER BY ta.created_at ASC
+      `,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      total: result.rows.length,
+      actions: result.rows
+    });
+
+  } catch (error) {
+    console.error("[GET TICKET ACTIONS ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.get("/tickets/:id/notes", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT
+        tn.id,
+        tn.note,
+        tn.created_at,
+        u.full_name AS author_name
+      FROM ticket_notes tn
+      LEFT JOIN users u
+        ON u.id = tn.author_user_id
+      WHERE tn.ticket_id = $1
+      ORDER BY tn.created_at ASC
+      `,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      total: result.rows.length,
+      notes: result.rows
+    });
+
+  } catch (error) {
+    console.error("[GET TICKET NOTES ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
 
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
 startFlespiMqtt();
