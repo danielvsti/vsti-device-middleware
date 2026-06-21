@@ -1742,6 +1742,103 @@ app.post("/debug/set-role", async (req, res) => {
   }
 });
 
+app.get("/debug/users", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        full_name,
+        role,
+        phone,
+        control_center_id,
+        validation_status,
+        created_at
+      FROM users
+      ORDER BY created_at DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("[DEBUG USERS ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+app.post("/debug/resolver-location", async (req, res) => {
+  try {
+    const {
+      user_id,
+      latitude,
+      longitude,
+      accuracy = 10,
+      status = "AVAILABLE"
+    } = req.body;
+
+    const userResult = await pool.query(
+      `
+      SELECT control_center_id
+      FROM users
+      WHERE id = $1
+      `,
+      [user_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    const control_center_id = userResult.rows[0].control_center_id;
+
+    await pool.query(
+      `
+      INSERT INTO resolver_locations (
+        user_id,
+        control_center_id,
+        latitude,
+        longitude,
+        accuracy,
+        status,
+        updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        latitude = EXCLUDED.latitude,
+        longitude = EXCLUDED.longitude,
+        accuracy = EXCLUDED.accuracy,
+        status = EXCLUDED.status,
+        updated_at = NOW()
+      `,
+      [
+        user_id,
+        control_center_id,
+        latitude,
+        longitude,
+        accuracy,
+        status
+      ]
+    );
+
+    res.json({ status: "ok" });
+
+  } catch (error) {
+    console.error("[RESOLVER LOCATION ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
+
 
 startFlespiMqtt();
 
