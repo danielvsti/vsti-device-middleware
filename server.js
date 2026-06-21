@@ -1839,6 +1839,107 @@ app.post("/debug/resolver-location", async (req, res) => {
 
 
 
+app.post("/tickets/:id/accept", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { resolver_user_id } = req.body;
+
+    if (!resolver_user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "resolver_user_id is required"
+      });
+    }
+
+    const assignmentResult = await pool.query(
+      `
+      SELECT *
+      FROM ticket_assignments
+      WHERE ticket_id = $1
+        AND resolver_user_id = $2
+        AND state = 'PENDING'
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [id, resolver_user_id]
+    );
+
+    if (assignmentResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "No pending assignment found for this resolver"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE ticket_assignments
+      SET
+        state = 'ACCEPTED',
+        accepted_at = NOW()
+      WHERE id = $1
+      `,
+      [assignmentResult.rows[0].id]
+    );
+
+    const ticketResult = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        state = 'ACCEPTED_BY_RESOLVER',
+        assigned_resolver_id = $1,
+        updated_at = NOW()
+      WHERE id = $2
+      RETURNING *
+      `,
+      [resolver_user_id, id]
+    );
+
+    await pool.query(
+      `
+      UPDATE resolver_locations
+      SET
+        status = 'BUSY',
+        updated_at = NOW()
+      WHERE user_id = $1
+      `,
+      [resolver_user_id]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description
+      )
+      VALUES ($1,$2,'RESOLVER','RESOLVER_ACCEPTED',$3)
+      `,
+      [
+        id,
+        resolver_user_id,
+        "Resolutor aceptó el caso"
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Ticket accepted by resolver",
+      ticket: ticketResult.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[ACCEPT TICKET ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
 
 startFlespiMqtt();
 
