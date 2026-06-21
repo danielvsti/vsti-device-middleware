@@ -1940,7 +1940,84 @@ app.post("/tickets/:id/accept", async (req, res) => {
   }
 });
 
+app.post("/tickets/:id/en-route", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { resolver_user_id } = req.body;
 
+    if (!resolver_user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "resolver_user_id is required"
+      });
+    }
+
+    const ticketResult = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        state = 'EN_ROUTE',
+        updated_at = NOW()
+      WHERE id = $1
+        AND assigned_resolver_id = $2
+      RETURNING *
+      `,
+      [id, resolver_user_id]
+    );
+
+    if (ticketResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found or resolver not assigned"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE resolver_locations
+      SET
+        status = 'EN_ROUTE',
+        updated_at = NOW()
+      WHERE user_id = $1
+      `,
+      [resolver_user_id]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description
+      )
+      VALUES ($1,$2,'RESOLVER','RESOLVER_EN_ROUTE',$3)
+      `,
+      [
+        id,
+        resolver_user_id,
+        "Resolutor se dirige al lugar"
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Resolver en route",
+      ticket: ticketResult.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[EN ROUTE TICKET ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+/* kotto insertamos todo antes de ir a Flespi */ 
 startFlespiMqtt();
 
 
