@@ -2496,6 +2496,155 @@ app.get("/dashboard/summary", async (req, res) => {
 });
 
 
+app.get("/dashboard/map-state", async (req, res) => {
+  try {
+    const { control_center_code } = req.query;
+
+    if (!control_center_code) {
+      return res.status(400).json({
+        status: "error",
+        message: "control_center_code is required"
+      });
+    }
+
+    const ccResult = await pool.query(
+      `
+      SELECT id, code, name, latitude, longitude
+      FROM control_centers
+      WHERE code = $1
+      `,
+      [control_center_code]
+    );
+
+    if (ccResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Unknown control_center_code"
+      });
+    }
+
+    const controlCenter = ccResult.rows[0];
+
+    const ticketsResult = await pool.query(
+      `
+      SELECT
+        t.id,
+        t.source_type,
+        t.alert_type,
+        t.title,
+        t.description,
+        t.state,
+        t.priority,
+        t.latitude,
+        t.longitude,
+        t.accuracy,
+        t.created_at,
+        t.acknowledged_at,
+        t.assigned_at,
+        t.resolved_at,
+        t.closed_at,
+        u.full_name AS citizen_name,
+        u.phone AS citizen_phone,
+        r.full_name AS resolver_name
+      FROM tickets t
+      LEFT JOIN users u ON u.id = t.citizen_user_id
+      LEFT JOIN users r ON r.id = t.assigned_resolver_id
+      WHERE t.control_center_id = $1
+        AND t.state NOT IN ('CLOSED', 'CANCELLED')
+      ORDER BY t.created_at DESC
+      `,
+      [controlCenter.id]
+    );
+
+    const resolversResult = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.full_name,
+        u.phone,
+        rl.latitude,
+        rl.longitude,
+        rl.accuracy,
+        rl.status,
+        rl.updated_at
+      FROM resolver_locations rl
+      JOIN users u ON u.id = rl.user_id
+      WHERE rl.control_center_id = $1
+        AND u.role = 'RESOLVER'
+        AND u.is_active = true
+      `,
+      [controlCenter.id]
+    );
+
+    const sirensResult = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        latitude,
+        longitude,
+        location,
+        state,
+        relay,
+        last_seen,
+        rssi,
+        firmware,
+        uptime,
+        updated_at
+      FROM sirens
+      WHERE control_center_id = $1
+      `,
+      [controlCenter.id]
+    );
+
+    const devicesResult = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        type,
+        platform_id,
+        last_latitude,
+        last_longitude,
+        last_seen,
+        status,
+        metadata,
+        updated_at
+      FROM devices
+      WHERE control_center_id = $1
+      `,
+      [controlCenter.id]
+    );
+
+    res.json({
+      status: "ok",
+      updated_at: nowChile(),
+      control_center: controlCenter,
+      counts: {
+        tickets: ticketsResult.rows.length,
+        resolvers: resolversResult.rows.length,
+        sirens: sirensResult.rows.length,
+        devices: devicesResult.rows.length
+      },
+      tickets: ticketsResult.rows,
+      resolvers: resolversResult.rows,
+      sirens: sirensResult.rows,
+      devices: devicesResult.rows
+    });
+
+  } catch (error) {
+    console.error("[DASHBOARD MAP STATE ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
+
+
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
 startFlespiMqtt();
 
