@@ -2440,6 +2440,61 @@ app.get("/tickets/:id/notes", async (req, res) => {
   }
 });
 
+app.get("/dashboard/summary", async (req, res) => {
+  try {
+    const { control_center_code } = req.query;
+
+    if (!control_center_code) {
+      return res.status(400).json({
+        status: "error",
+        message: "control_center_code is required"
+      });
+    }
+
+    const result = await pool.query(`
+      WITH cc AS (
+        SELECT id
+        FROM control_centers
+        WHERE code = $1
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE t.state = 'ACTIVE') AS active_tickets,
+        COUNT(*) FILTER (WHERE t.state = 'ASSIGNED') AS assigned_tickets,
+        COUNT(*) FILTER (WHERE t.state = 'EN_ROUTE') AS en_route_tickets,
+        COUNT(*) FILTER (WHERE t.state = 'ON_SITE') AS on_site_tickets,
+        COUNT(*) FILTER (WHERE t.state = 'RESOLVED') AS resolved_tickets,
+        COUNT(*) FILTER (WHERE t.state = 'CLOSED') AS closed_tickets
+      FROM tickets t
+      WHERE t.control_center_id = (SELECT id FROM cc)
+    `, [control_center_code]);
+
+    const resolvers = await pool.query(`
+      SELECT
+        status,
+        COUNT(*) AS total
+      FROM resolver_locations rl
+      JOIN control_centers cc
+        ON cc.id = rl.control_center_id
+      WHERE cc.code = $1
+      GROUP BY status
+    `, [control_center_code]);
+
+    res.json({
+      status: "ok",
+      tickets: result.rows[0],
+      resolvers: resolvers.rows
+    });
+
+  } catch (error) {
+    console.error("[DASHBOARD ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
 
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
 startFlespiMqtt();
