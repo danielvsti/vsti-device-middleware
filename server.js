@@ -2616,6 +2616,29 @@ app.get("/dashboard/map-state", async (req, res) => {
       [controlCenter.id]
     );
 
+const sirensForDashboard = sirensResult.rows.map((siren) => {
+  const runtime = sirenStates[siren.id];
+
+  if (!runtime) {
+    return {
+      ...siren,
+      active: siren.relay === true || siren.state === "ON"
+    };
+  }
+
+  const expired = runtime.expires_at && Date.now() > runtime.expires_at;
+
+  return {
+    ...siren,
+    state: expired ? "OFF" : runtime.state,
+    relay: expired ? false : runtime.relay,
+    active: !expired && runtime.relay === true,
+    updated_at: runtime.updated_at || siren.updated_at
+  };
+});
+
+
+
     res.json({
       status: "ok",
       updated_at: nowChile(),
@@ -2628,7 +2651,7 @@ app.get("/dashboard/map-state", async (req, res) => {
       },
       tickets: ticketsResult.rows,
       resolvers: resolversResult.rows,
-      sirens: sirensResult.rows,
+      sirens: sirensForDashboard,
       devices: devicesResult.rows
     });
 
