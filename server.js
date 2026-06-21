@@ -2547,6 +2547,7 @@ app.get("/dashboard/map-state", async (req, res) => {
       SELECT
         t.id,
         t.source_type,
+        t.source_event_id,
         t.alert_type,
         t.title,
         t.description,
