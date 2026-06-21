@@ -2094,6 +2094,110 @@ app.post("/tickets/:id/on-site", async (req, res) => {
   }
 });
 
+app.post("/tickets/:id/resolve", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      resolver_user_id,
+      resolution_notes
+    } = req.body;
+
+    if (!resolver_user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "resolver_user_id is required"
+      });
+    }
+
+    const ticketResult = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        state = 'RESOLVED',
+        resolved_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $1
+        AND assigned_resolver_id = $2
+      RETURNING *
+      `,
+      [id, resolver_user_id]
+    );
+
+    if (ticketResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found or resolver not assigned"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE resolver_locations
+      SET
+        status = 'AVAILABLE',
+        updated_at = NOW()
+      WHERE user_id = $1
+      `,
+      [resolver_user_id]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,$2,'RESOLVER','TICKET_RESOLVED',$3,$4)
+      `,
+      [
+        id,
+        resolver_user_id,
+        "Resolutor marcó el caso como resuelto",
+        JSON.stringify({
+          resolution_notes: resolution_notes || null
+        })
+      ]
+    );
+
+    if (resolution_notes) {
+      await pool.query(
+        `
+        INSERT INTO ticket_notes (
+          ticket_id,
+          author_user_id,
+          note
+        )
+        VALUES ($1,$2,$3)
+        `,
+        [
+          id,
+          resolver_user_id,
+          resolution_notes
+        ]
+      );
+    }
+
+    res.json({
+      status: "ok",
+      message: "Ticket resolved",
+      ticket: ticketResult.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[RESOLVE TICKET ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
 
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
 startFlespiMqtt();
