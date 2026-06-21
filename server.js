@@ -2281,6 +2281,91 @@ app.post("/tickets/:id/close", async (req, res) => {
   }
 });
 
+app.post("/tickets/:id/reject", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      resolver_user_id,
+      reject_reason
+    } = req.body;
+
+    if (!resolver_user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "resolver_user_id is required"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE ticket_assignments
+      SET
+        state = 'REJECTED',
+        rejected_at = NOW()
+      WHERE ticket_id = $1
+        AND resolver_user_id = $2
+        AND state = 'PENDING'
+      `,
+      [id, resolver_user_id]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,$2,'RESOLVER','RESOLVER_REJECTED',$3,$4)
+      `,
+      [
+        id,
+        resolver_user_id,
+        "Resolutor rechazó el caso",
+        JSON.stringify({
+          reject_reason: reject_reason || null
+        })
+      ]
+    );
+
+    const ticketResult = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        assigned_resolver_id = NULL,
+        state = 'ACTIVE',
+        assigned_at = NULL,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id]
+    );
+
+    const reassignment = await autoAssignResolver(ticketResult.rows[0]);
+
+    res.json({
+      status: "ok",
+      message: "Ticket rejected by resolver",
+      ticket: reassignment?.ticket || ticketResult.rows[0],
+      reassigned: !!reassignment,
+      new_resolver: reassignment?.resolver || null
+    });
+
+  } catch (error) {
+    console.error("[REJECT TICKET ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
 startFlespiMqtt();
 
