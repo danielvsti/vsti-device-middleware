@@ -825,10 +825,10 @@ devices: items
 const publicSirens = [
 {
   id: "LAB-001",
-  name: "Sirena Libertad / 5 Norte",
-  latitude: -33.01895,
-  longitude: -71.55090,
-  location: "Libertad con 5 Norte, Viña del Mar",
+  name: "Sirena Libertad / 6 Norte",
+  latitude: -33.01775,
+  longitude: -71.55105,
+  location: "Av.Libertad con 6 Norte, Viña del Mar",
 }
 ];
 
