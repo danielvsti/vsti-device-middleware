@@ -1074,7 +1074,9 @@ function safeFileExtension(mimeType, fallbackType) {
 }
 
 function parseDataUrl(dataUrl) {
-  const match = /^data:([^;]+);base64,(.+)$/s.exec(dataUrl || "");
+  // Acepta data URLs simples y también con parámetros, por ejemplo:
+  // data:audio/mp4;codecs=mp4a.40.2;base64,....
+  const match = /^data:([^;,]+)(?:;[^,]*)?;base64,(.+)$/s.exec(dataUrl || "");
 
   if (!match) {
     return null;
@@ -2739,7 +2741,7 @@ app.post("/tickets/:id/call-start", async (req, res) => {
         id,
         sender_role,
         actionType,
-        `${sender_name} inició ${mode === "voice" ? "llamada de voz" : "videollamada"}`,
+        `${sender_name} solicitó ${mode === "voice" ? "llamada de voz" : "videollamada"}`,
         JSON.stringify({
           channel: mode,
           room,
@@ -2756,7 +2758,7 @@ app.post("/tickets/:id/call-start", async (req, res) => {
 
     res.json({
       status: "ok",
-      message: "Call room created",
+      message: "Call request stored",
       mode,
       room,
       room_url: roomUrl,
