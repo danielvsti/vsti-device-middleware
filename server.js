@@ -1461,9 +1461,45 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
       });
     }
 
+    const event = result.rows[0];
+    let pendingCallRequest = null;
+
+    if (event.ticket_id) {
+      const callResult = await pool.query(
+        `
+        SELECT
+          id,
+          action_type,
+          actor_role,
+          description,
+          metadata,
+          created_at
+        FROM ticket_actions
+        WHERE ticket_id = $1
+          AND actor_role = 'OPERATOR'
+          AND action_type IN ('CALL_VOICE','CALL_VIDEO')
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [event.ticket_id]
+      );
+
+      if (callResult.rows.length > 0) {
+        const action = callResult.rows[0];
+        pendingCallRequest = {
+          id: action.id,
+          mode: action.action_type === "CALL_VIDEO" ? "video" : "voice",
+          description: action.description,
+          metadata: action.metadata,
+          created_at: action.created_at
+        };
+      }
+    }
+
     res.json({
       status: "ok",
-      event: result.rows[0]
+      event,
+      pending_call_request: pendingCallRequest
     });
 
   } catch (error) {
@@ -2720,9 +2756,11 @@ app.post("/tickets/:id/call-start", async (req, res) => {
       });
     }
 
-    const room = meetingRoomForTicket(id);
-    const roomUrl = meetingUrlForTicket(id, mode);
     const actionType = mode === "voice" ? "CALL_VOICE" : "CALL_VIDEO";
+    const isOperator = sender_role === "OPERATOR";
+    const description = isOperator
+      ? `Central SOS solicitó ${mode === "voice" ? "llamada de voz" : "videollamada"} al vecino`
+      : `${sender_name} solicitó ${mode === "voice" ? "llamada de voz" : "videollamada"}`;
 
     const actionResult = await pool.query(
       `
@@ -2741,11 +2779,11 @@ app.post("/tickets/:id/call-start", async (req, res) => {
         id,
         sender_role,
         actionType,
-        `${sender_name} solicitó ${mode === "voice" ? "llamada de voz" : "videollamada"}`,
+        description,
         JSON.stringify({
           channel: mode,
-          room,
-          room_url: roomUrl,
+          mode,
+          direction: isOperator ? "central_to_neighbor" : "neighbor_to_central",
           sender_name
         })
       ]
@@ -2760,13 +2798,103 @@ app.post("/tickets/:id/call-start", async (req, res) => {
       status: "ok",
       message: "Call request stored",
       mode,
-      room,
-      room_url: roomUrl,
       action: actionResult.rows[0]
     });
 
   } catch (error) {
     console.error("[TICKET CALL ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/tickets/:id/call-response", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      request_action_id = null,
+      response,
+      mode = "voice",
+      sender_role = "NEIGHBOR",
+      sender_name = "Vecino"
+    } = req.body;
+
+    if (!["ACCEPTED", "REJECTED"].includes(response)) {
+      return res.status(400).json({
+        status: "error",
+        message: "response must be ACCEPTED or REJECTED"
+      });
+    }
+
+    if (!["voice", "video"].includes(mode)) {
+      return res.status(400).json({
+        status: "error",
+        message: "mode must be voice or video"
+      });
+    }
+
+    const ticketCheck = await pool.query(
+      `SELECT id FROM tickets WHERE id = $1`,
+      [id]
+    );
+
+    if (ticketCheck.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found"
+      });
+    }
+
+    const actionType = response === "ACCEPTED" ? "CALL_ACCEPTED" : "CALL_REJECTED";
+    const description = response === "ACCEPTED"
+      ? `${sender_name} aceptó la ${mode === "voice" ? "llamada de voz" : "videollamada"}`
+      : `${sender_name} rechazó la ${mode === "voice" ? "llamada de voz" : "videollamada"}`;
+
+    const actionResult = await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,NULL,$2,$3,$4,$5)
+      RETURNING *
+      `,
+      [
+        id,
+        sender_role,
+        actionType,
+        description,
+        JSON.stringify({
+          channel: mode,
+          mode,
+          response,
+          request_action_id,
+          sender_name
+        })
+      ]
+    );
+
+    await pool.query(
+      `UPDATE tickets SET updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Call response stored",
+      response,
+      action: actionResult.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[TICKET CALL RESPONSE ERROR]", error);
 
     res.status(500).json({
       status: "error",
