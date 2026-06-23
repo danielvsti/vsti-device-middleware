@@ -206,6 +206,54 @@ async function init() {
       updated_at = NOW();
   `);
 
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS resolver_locations (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    control_center_id UUID REFERENCES control_centers(id),
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    accuracy DOUBLE PRECISION,
+    status TEXT DEFAULT 'AVAILABLE',
+    updated_at TIMESTAMP DEFAULT NOW()
+  );
+`);
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS ticket_assignments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    ticket_id UUID REFERENCES tickets(id) ON DELETE CASCADE,
+    resolver_user_id UUID REFERENCES users(id),
+    assignment_type TEXT DEFAULT 'AUTO',
+    state TEXT DEFAULT 'PENDING',
+    distance_meters DOUBLE PRECISION,
+    notified_at TIMESTAMP,
+    accepted_at TIMESTAMP,
+    rejected_at TIMESTAMP,
+    expired_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW()
+  );
+`);
+
+await pool.query(`
+  CREATE INDEX IF NOT EXISTS idx_resolver_locations_control_center
+  ON resolver_locations(control_center_id);
+
+  CREATE INDEX IF NOT EXISTS idx_resolver_locations_status
+  ON resolver_locations(status);
+
+  CREATE INDEX IF NOT EXISTS idx_ticket_assignments_ticket
+  ON ticket_assignments(ticket_id);
+
+  CREATE INDEX IF NOT EXISTS idx_ticket_assignments_resolver
+  ON ticket_assignments(resolver_user_id);
+`);
+
+
+
+
+
+
   console.log("Base plataforma SOS inicializada correctamente.");
   process.exit(0);
 }

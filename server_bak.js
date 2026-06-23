@@ -1061,12 +1061,7 @@ app.post("/public/mobile/sos", async (req, res) => {
       longitude,
       accuracy,
       battery,
-      source,
-      alert_type = "SOS_MANUAL",
-      title,
-      priority = 1,
-      description,
-      control_center_code = "CC-VINA"
+      source
     } = req.body;
 
     if (!user_id) {
@@ -1156,16 +1151,12 @@ if (userResult.rows.length > 0) {
     FROM control_centers
     WHERE code = $1
     `,
-    [control_center_code]
+    ["CC-VINA"]
   );
 
   if (ccResult.rows.length > 0) {
     controlCenterId = ccResult.rows[0].id;
   }
-}
-
-if (!controlCenterId) {
-  console.warn(`[MOBILE SOS] Control center not found: ${control_center_code}. Ticket not created.`);
 }
 
 if (controlCenterId) {
@@ -1174,22 +1165,18 @@ if (controlCenterId) {
     citizen_user_id: citizenUserId,
     source_type: "MOBILE_APP",
     source_event_id: event.id,
-    alert_type: alert_type || "SOS_MANUAL",
-    title: title || "SOS móvil",
-    description: description || "Alerta SOS generada desde aplicación móvil",
+    alert_type: "SOS_MANUAL",
+    title: "SOS móvil",
+    description: "Alerta SOS generada desde aplicación móvil",
     latitude: event.latitude,
     longitude: event.longitude,
     accuracy: event.accuracy,
-    priority: Number(priority || 1),
+    priority: 1,
     metadata: {
       mobile_event_id: event.id,
       phone,
       battery,
       source,
-      alert_type,
-      title,
-      priority,
-      control_center_code,
       anonymous_user_id: user_id
     }
   });
@@ -1268,20 +1255,6 @@ app.post("/public/mobile/cancel", async (req, res) => {
       [event_id]
     );
 
-    await pool.query(
-      `
-      UPDATE tickets
-      SET
-        state = 'CANCELLED',
-        closed_at = COALESCE(closed_at, NOW()),
-        updated_at = NOW()
-      WHERE source_type = 'MOBILE_APP'
-        AND source_event_id = $1
-        AND state NOT IN ('CLOSED','RESOLVED','CANCELLED')
-      `,
-      [event_id]
-    );
-
     console.log("[MOBILE SOS CANCELLED DB]", update.rows[0]);
 
     res.json({
@@ -1335,20 +1308,6 @@ app.post("/public/mobile/ack", async (req, res) => {
         message: "Unknown event_id"
       });
     }
-
-    await pool.query(
-      `
-      UPDATE tickets
-      SET
-        state = 'ACKNOWLEDGED',
-        acknowledged_at = COALESCE(acknowledged_at, NOW()),
-        updated_at = NOW()
-      WHERE source_type = 'MOBILE_APP'
-        AND source_event_id = $1
-        AND state = 'ACTIVE'
-      `,
-      [event_id]
-    );
 
     console.log("[MOBILE SOS ACK DB]", {
       ...result.rows[0],
