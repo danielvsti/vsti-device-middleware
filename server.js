@@ -25,6 +25,8 @@ Funciones:
  */
 
 const pool = require("./db");
+const fs = require("fs");
+const path = require("path");
 
 console.log(
   "DATABASE_URL configurada:",
@@ -36,8 +38,13 @@ const mqtt = require("mqtt");
 const cors = require("cors");
 const app = express();
 
+app.set("trust proxy", true);
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "30mb" }));
+
+const UPLOAD_DIR = process.env.SOS_UPLOAD_DIR || "/tmp/sos_uploads";
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+app.use("/uploads", express.static(UPLOAD_DIR));
 
 
 app.get("/debug/db", async (req, res) => {
@@ -1051,6 +1058,49 @@ acknowledged_at: device.sos_acknowledged_at
 });
 });
 
+
+function safeFileExtension(mimeType, fallbackType) {
+  const map = {
+    "audio/webm": "webm",
+    "audio/mp4": "m4a",
+    "audio/mpeg": "mp3",
+    "audio/wav": "wav",
+    "video/webm": "webm",
+    "video/mp4": "mp4",
+    "video/quicktime": "mov"
+  };
+
+  return map[mimeType] || (fallbackType === "video" ? "mp4" : "webm");
+}
+
+function parseDataUrl(dataUrl) {
+  const match = /^data:([^;]+);base64,(.+)$/s.exec(dataUrl || "");
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    mimeType: match[1],
+    buffer: Buffer.from(match[2], "base64")
+  };
+}
+
+function publicBaseUrl(req) {
+  return process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
+}
+
+function meetingRoomForTicket(ticketId) {
+  return `VSTI-SOS-${String(ticketId).replace(/[^a-zA-Z0-9]/g, "").slice(0, 32)}`;
+}
+
+function meetingUrlForTicket(ticketId, mode = "video") {
+  const room = meetingRoomForTicket(ticketId);
+  const startWithVideoMuted = mode === "voice" ? "true" : "false";
+
+  return `https://meet.jit.si/${room}#config.prejoinPageEnabled=false&config.startWithVideoMuted=${startWithVideoMuted}&config.startWithAudioMuted=false`;
+}
+
 app.post("/public/mobile/sos", async (req, res) => {
   try {
     const {
@@ -1231,9 +1281,17 @@ app.post("/public/mobile/cancel", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT *
-      FROM mobile_events
-      WHERE id = $1
+      SELECT
+        m.*,
+        t.id AS ticket_id,
+        t.state AS ticket_state
+      FROM mobile_events m
+      LEFT JOIN tickets t
+        ON t.source_type = 'MOBILE_APP'
+       AND t.source_event_id = m.id
+      WHERE m.id = $1
+      ORDER BY t.created_at DESC NULLS LAST
+      LIMIT 1
       `,
       [event_id]
     );
@@ -1379,9 +1437,17 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT *
-      FROM mobile_events
-      WHERE id = $1
+      SELECT
+        m.*,
+        t.id AS ticket_id,
+        t.state AS ticket_state
+      FROM mobile_events m
+      LEFT JOIN tickets t
+        ON t.source_type = 'MOBILE_APP'
+       AND t.source_event_id = m.id
+      WHERE m.id = $1
+      ORDER BY t.created_at DESC NULLS LAST
+      LIMIT 1
       `,
       [event_id]
     );
@@ -2415,6 +2481,290 @@ app.post("/tickets/:id/reject", async (req, res) => {
 
   } catch (error) {
     console.error("[REJECT TICKET ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
+app.post("/tickets/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      message,
+      sender_role = "NEIGHBOR",
+      sender_name = "Vecino"
+    } = req.body;
+
+    const cleanMessage = String(message || "").trim();
+
+    if (!cleanMessage) {
+      return res.status(400).json({
+        status: "error",
+        message: "message is required"
+      });
+    }
+
+    const ticketCheck = await pool.query(
+      `SELECT id FROM tickets WHERE id = $1`,
+      [id]
+    );
+
+    if (ticketCheck.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found"
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO ticket_notes (
+        ticket_id,
+        author_user_id,
+        note
+      )
+      VALUES ($1,NULL,$2)
+      `,
+      [id, `[${sender_name}] ${cleanMessage}`]
+    );
+
+    const actionResult = await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,NULL,$2,'MESSAGE_TEXT',$3,$4)
+      RETURNING *
+      `,
+      [
+        id,
+        sender_role,
+        `${sender_name} envió un mensaje de texto`,
+        JSON.stringify({
+          channel: "text",
+          message: cleanMessage,
+          sender_name
+        })
+      ]
+    );
+
+    await pool.query(
+      `UPDATE tickets SET updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Message stored",
+      action: actionResult.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[TICKET MESSAGE ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/tickets/:id/media", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      media_type,
+      data_url,
+      file_name,
+      sender_role = "NEIGHBOR",
+      sender_name = "Vecino"
+    } = req.body;
+
+    if (!["audio", "video"].includes(media_type)) {
+      return res.status(400).json({
+        status: "error",
+        message: "media_type must be audio or video"
+      });
+    }
+
+    const parsed = parseDataUrl(data_url);
+
+    if (!parsed) {
+      return res.status(400).json({
+        status: "error",
+        message: "data_url must be a valid base64 data URL"
+      });
+    }
+
+    const maxBytes = media_type === "video"
+      ? 25 * 1024 * 1024
+      : 8 * 1024 * 1024;
+
+    if (parsed.buffer.length > maxBytes) {
+      return res.status(413).json({
+        status: "error",
+        message: "media file too large"
+      });
+    }
+
+    const ticketCheck = await pool.query(
+      `SELECT id FROM tickets WHERE id = $1`,
+      [id]
+    );
+
+    if (ticketCheck.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found"
+      });
+    }
+
+    const ext = safeFileExtension(parsed.mimeType, media_type);
+    const safeTicket = String(id).replace(/[^a-zA-Z0-9_-]/g, "");
+    const uploadName = `${safeTicket}-${Date.now()}-${media_type}.${ext}`;
+    const uploadPath = path.join(UPLOAD_DIR, uploadName);
+
+    fs.writeFileSync(uploadPath, parsed.buffer);
+
+    const mediaUrl = `${publicBaseUrl(req)}/uploads/${uploadName}`;
+    const actionType = media_type === "audio" ? "MEDIA_AUDIO" : "MEDIA_VIDEO";
+
+    const actionResult = await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,NULL,$2,$3,$4,$5)
+      RETURNING *
+      `,
+      [
+        id,
+        sender_role,
+        actionType,
+        `${sender_name} envió ${media_type === "audio" ? "un audio" : "un video"}`,
+        JSON.stringify({
+          channel: media_type,
+          media_type,
+          media_url: mediaUrl,
+          file_name: file_name || uploadName,
+          mime_type: parsed.mimeType,
+          size_bytes: parsed.buffer.length,
+          sender_name
+        })
+      ]
+    );
+
+    await pool.query(
+      `UPDATE tickets SET updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Media stored",
+      media_url: mediaUrl,
+      action: actionResult.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[TICKET MEDIA ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/tickets/:id/call-start", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      mode = "video",
+      sender_role = "NEIGHBOR",
+      sender_name = "Vecino"
+    } = req.body;
+
+    if (!["voice", "video"].includes(mode)) {
+      return res.status(400).json({
+        status: "error",
+        message: "mode must be voice or video"
+      });
+    }
+
+    const ticketCheck = await pool.query(
+      `SELECT id FROM tickets WHERE id = $1`,
+      [id]
+    );
+
+    if (ticketCheck.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found"
+      });
+    }
+
+    const room = meetingRoomForTicket(id);
+    const roomUrl = meetingUrlForTicket(id, mode);
+    const actionType = mode === "voice" ? "CALL_VOICE" : "CALL_VIDEO";
+
+    const actionResult = await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,NULL,$2,$3,$4,$5)
+      RETURNING *
+      `,
+      [
+        id,
+        sender_role,
+        actionType,
+        `${sender_name} inició ${mode === "voice" ? "llamada de voz" : "videollamada"}`,
+        JSON.stringify({
+          channel: mode,
+          room,
+          room_url: roomUrl,
+          sender_name
+        })
+      ]
+    );
+
+    await pool.query(
+      `UPDATE tickets SET updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Call room created",
+      mode,
+      room,
+      room_url: roomUrl,
+      action: actionResult.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[TICKET CALL ERROR]", error);
 
     res.status(500).json({
       status: "error",
