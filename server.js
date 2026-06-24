@@ -1589,46 +1589,113 @@ app.post("/auth/register", async (req, res) => {
     }
 
     const controlCenter = ccResult.rows[0];
+    const cleanPhone = String(phone).trim().replace(/\s+/g, "");
 
-    const userResult = await pool.query(
+    const existingResult = await pool.query(
       `
-      INSERT INTO users (
-        control_center_id,
-        role,
-        validation_status,
-        full_name,
-        rut,
-        phone,
-        email,
-        declared_address,
-        latitude,
-        longitude
-      )
-      VALUES (
-        $1,
-        'NEIGHBOR',
-        'PROVISIONAL_ACTIVE',
-        $2,$3,$4,$5,$6,$7,$8
-      )
-      RETURNING *
+      SELECT *
+      FROM users
+      WHERE phone = $1
+        AND is_active = true
+      ORDER BY created_at DESC
+      LIMIT 1
       `,
-      [
-        controlCenter.id,
-        full_name,
-        rut || null,
-        phone,
-        email || null,
-        declared_address || null,
-        latitude ?? null,
-        longitude ?? null
-      ]
+      [cleanPhone]
     );
 
-    const user = userResult.rows[0];
+    let user;
+    let operation = "created";
+
+    if (existingResult.rows.length > 0) {
+      const existing = existingResult.rows[0];
+
+      if (existing.role !== "NEIGHBOR") {
+        return res.status(409).json({
+          status: "error",
+          message: `Phone already registered with role ${existing.role}`
+        });
+      }
+
+      const updateResult = await pool.query(
+        `
+        UPDATE users
+        SET
+          control_center_id = $1,
+          full_name = $2,
+          rut = $3,
+          email = $4,
+          declared_address = $5,
+          latitude = $6,
+          longitude = $7,
+          validation_status = COALESCE(validation_status, 'PROVISIONAL_ACTIVE'),
+          is_active = true,
+          updated_at = NOW()
+        WHERE id = $8
+        RETURNING *
+        `,
+        [
+          controlCenter.id,
+          full_name,
+          rut || null,
+          email || null,
+          declared_address || null,
+          latitude ?? null,
+          longitude ?? null,
+          existing.id
+        ]
+      );
+
+      user = updateResult.rows[0];
+      operation = "updated";
+    } else {
+      const userResult = await pool.query(
+        `
+        INSERT INTO users (
+          control_center_id,
+          role,
+          validation_status,
+          full_name,
+          rut,
+          phone,
+          email,
+          declared_address,
+          latitude,
+          longitude
+        )
+        VALUES (
+          $1,
+          'NEIGHBOR',
+          'PROVISIONAL_ACTIVE',
+          $2,$3,$4,$5,$6,$7,$8
+        )
+        RETURNING *
+        `,
+        [
+          controlCenter.id,
+          full_name,
+          rut || null,
+          cleanPhone,
+          email || null,
+          declared_address || null,
+          latitude ?? null,
+          longitude ?? null
+        ]
+      );
+
+      user = userResult.rows[0];
+    }
 
     const contacts = Array.isArray(emergency_contacts)
       ? emergency_contacts
       : [];
+
+    await pool.query(
+      `
+      DELETE FROM emergency_contacts
+      WHERE user_id = $1
+      `,
+      [user.id]
+    );
 
     for (const contact of contacts) {
       if (!contact.name || !contact.phone) continue;
@@ -1656,7 +1723,8 @@ app.post("/auth/register", async (req, res) => {
 
     res.json({
       status: "ok",
-      message: "User registered",
+      message: operation === "created" ? "User registered" : "User updated",
+      operation,
       user: {
         id: user.id,
         control_center_id: user.control_center_id,
@@ -1668,7 +1736,9 @@ app.post("/auth/register", async (req, res) => {
         phone: user.phone,
         rut: user.rut,
         email: user.email,
-        declared_address: user.declared_address
+        declared_address: user.declared_address,
+        latitude: user.latitude,
+        longitude: user.longitude
       }
     });
 
@@ -1705,7 +1775,10 @@ app.post("/auth/login-demo", async (req, res) => {
         u.full_name,
         u.phone,
         u.email,
-        u.declared_address
+        u.rut,
+        u.declared_address,
+        u.latitude,
+        u.longitude
       FROM users u
       JOIN control_centers cc ON cc.id = u.control_center_id
       WHERE u.phone = $1
