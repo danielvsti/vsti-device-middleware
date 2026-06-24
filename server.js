@@ -2594,18 +2594,9 @@ app.post("/tickets/:id/messages", async (req, res) => {
       });
     }
 
-    await pool.query(
-      `
-      INSERT INTO ticket_notes (
-        ticket_id,
-        author_user_id,
-        note
-      )
-      VALUES ($1,NULL,$2)
-      `,
-      [id, `[${sender_name}] ${cleanMessage}`]
-    );
-
+    // Los mensajes operativos se guardan solo como ticket_actions.
+    // SOS-MAP los muestra en la sección Comunicaciones.
+    // No se duplican en ticket_notes; Notas queda reservado para cierre, resolución o notas internas.
     const actionResult = await pool.query(
       `
       INSERT INTO ticket_actions (
