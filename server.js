@@ -643,6 +643,29 @@ await autoAssignResolver(ticket);
   return ticket;
 }
 
+async function syncMobileEventStateFromTicket(ticketId, mobileState) {
+  try {
+    await pool.query(
+      `
+      UPDATE mobile_events m
+      SET
+        state = $2,
+        updated_at = NOW()
+      FROM tickets t
+      WHERE t.id = $1
+        AND t.source_type = 'MOBILE_APP'
+        AND t.source_event_id = m.id
+      `,
+      [ticketId, mobileState]
+    );
+  } catch (error) {
+    console.warn(
+      `[MOBILE EVENT SYNC WARNING] Could not sync ticket ${ticketId} to ${mobileState}:`,
+      error.message
+    );
+  }
+}
+
 
 
 
@@ -1462,9 +1485,16 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
     }
 
     const event = result.rows[0];
+    const terminalTicketStates = ["RESOLVED", "CLOSED", "CANCELLED"];
+    const effectiveState = terminalTicketStates.includes(event.ticket_state)
+      ? event.ticket_state
+      : event.state;
+
+    event.effective_state = effectiveState;
+
     let pendingCallRequest = null;
 
-    if (event.ticket_id) {
+    if (event.ticket_id && !terminalTicketStates.includes(effectiveState)) {
       const callResult = await pool.query(
         `
         SELECT
@@ -1499,6 +1529,8 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
     res.json({
       status: "ok",
       event,
+      ticket_state: event.ticket_state || null,
+      effective_state: effectiveState,
       pending_call_request: pendingCallRequest
     });
 
@@ -2134,6 +2166,8 @@ app.post("/tickets/:id/en-route", async (req, res) => {
       });
     }
 
+    await syncMobileEventStateFromTicket(id, "RESOLVED");
+
     await pool.query(
       `
       UPDATE resolver_locations
@@ -2386,6 +2420,8 @@ app.post("/tickets/:id/close", async (req, res) => {
         message: "Ticket not found"
       });
     }
+
+    await syncMobileEventStateFromTicket(id, "CLOSED");
 
     await pool.query(
       `
