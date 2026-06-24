@@ -3320,6 +3320,420 @@ app.get("/tickets/:id", async (req, res) => {
 
 
 
+
+
+/*
+   =========================================================
+   RESOLVER MOBILE APP - DEMO / MVP ENDPOINTS
+   =========================================================
+ */
+
+app.post("/resolver/location", async (req, res) => {
+  try {
+    const {
+      user_id,
+      latitude,
+      longitude,
+      accuracy = null,
+      status = "AVAILABLE"
+    } = req.body;
+
+    const validStatuses = [
+      "AVAILABLE",
+      "BUSY",
+      "EN_ROUTE",
+      "ON_SITE",
+      "OFFLINE"
+    ];
+
+    if (!user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "user_id is required"
+      });
+    }
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid resolver status"
+      });
+    }
+
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({
+        status: "error",
+        message: "latitude and longitude are required"
+      });
+    }
+
+    const userResult = await pool.query(
+      `
+      SELECT id, control_center_id, role, full_name
+      FROM users
+      WHERE id = $1
+        AND is_active = true
+      `,
+      [user_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    if (user.role !== "RESOLVER") {
+      return res.status(403).json({
+        status: "error",
+        message: "User is not a resolver"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO resolver_locations (
+        user_id,
+        control_center_id,
+        latitude,
+        longitude,
+        accuracy,
+        status,
+        updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        latitude = EXCLUDED.latitude,
+        longitude = EXCLUDED.longitude,
+        accuracy = EXCLUDED.accuracy,
+        status = EXCLUDED.status,
+        updated_at = NOW()
+      RETURNING *
+      `,
+      [
+        user.id,
+        user.control_center_id,
+        Number(latitude),
+        Number(longitude),
+        accuracy,
+        status
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Resolver location updated",
+      resolver_location: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[RESOLVER LOCATION MVP ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.get("/resolver/:user_id/state", async (req, res) => {
+  try {
+    const { user_id } = req.params;
+
+    const userResult = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.control_center_id,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+        u.role,
+        u.validation_status,
+        u.full_name,
+        u.phone,
+        u.email,
+        u.is_active
+      FROM users u
+      JOIN control_centers cc
+        ON cc.id = u.control_center_id
+      WHERE u.id = $1
+      `,
+      [user_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Resolver not found"
+      });
+    }
+
+    const resolver = userResult.rows[0];
+
+    if (resolver.role !== "RESOLVER") {
+      return res.status(403).json({
+        status: "error",
+        message: "User is not a resolver"
+      });
+    }
+
+    const locationResult = await pool.query(
+      `
+      SELECT *
+      FROM resolver_locations
+      WHERE user_id = $1
+      `,
+      [user_id]
+    );
+
+    const ticketsResult = await pool.query(
+      `
+      SELECT
+        t.id,
+        t.control_center_id,
+        t.source_type,
+        t.source_event_id,
+        t.alert_type,
+        t.title,
+        t.description,
+        t.state,
+        t.priority,
+        t.latitude,
+        t.longitude,
+        t.accuracy,
+        t.assigned_resolver_id,
+        t.created_at,
+        t.acknowledged_at,
+        t.assigned_at,
+        t.resolved_at,
+        t.closed_at,
+        citizen.full_name AS citizen_name,
+        citizen.phone AS citizen_phone,
+        resolver_user.full_name AS resolver_name,
+        latest_assignment.state AS assignment_state,
+        latest_assignment.assignment_type,
+        latest_assignment.distance_meters
+      FROM tickets t
+      LEFT JOIN users citizen
+        ON citizen.id = t.citizen_user_id
+      LEFT JOIN users resolver_user
+        ON resolver_user.id = t.assigned_resolver_id
+      LEFT JOIN LATERAL (
+        SELECT
+          ta.state,
+          ta.assignment_type,
+          ta.distance_meters,
+          ta.created_at
+        FROM ticket_assignments ta
+        WHERE ta.ticket_id = t.id
+          AND ta.resolver_user_id = $1
+        ORDER BY ta.created_at DESC
+        LIMIT 1
+      ) latest_assignment ON true
+      WHERE t.control_center_id = $2
+        AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+        AND (
+          t.assigned_resolver_id = $1
+          OR latest_assignment.state = 'PENDING'
+          OR t.assigned_resolver_id IS NULL
+        )
+      ORDER BY
+        CASE
+          WHEN t.assigned_resolver_id = $1 THEN 0
+          WHEN latest_assignment.state = 'PENDING' THEN 1
+          ELSE 2
+        END,
+        t.priority ASC,
+        t.created_at DESC
+      `,
+      [user_id, resolver.control_center_id]
+    );
+
+    res.json({
+      status: "ok",
+      updated_at: nowChile(),
+      resolver,
+      location: locationResult.rows[0] || null,
+      tickets: ticketsResult.rows,
+      counts: {
+        tickets: ticketsResult.rows.length,
+        assigned_to_me: ticketsResult.rows.filter(t => t.assigned_resolver_id === user_id).length,
+        pending_for_me: ticketsResult.rows.filter(t => t.assignment_state === "PENDING").length,
+        unassigned: ticketsResult.rows.filter(t => !t.assigned_resolver_id).length
+      }
+    });
+
+  } catch (error) {
+    console.error("[RESOLVER STATE ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/tickets/:id/take", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { resolver_user_id } = req.body;
+
+    if (!resolver_user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "resolver_user_id is required"
+      });
+    }
+
+    const resolverResult = await pool.query(
+      `
+      SELECT id, control_center_id, role, full_name
+      FROM users
+      WHERE id = $1
+        AND is_active = true
+      `,
+      [resolver_user_id]
+    );
+
+    if (resolverResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Resolver not found"
+      });
+    }
+
+    const resolver = resolverResult.rows[0];
+
+    if (resolver.role !== "RESOLVER") {
+      return res.status(403).json({
+        status: "error",
+        message: "User is not a resolver"
+      });
+    }
+
+    const ticketResult = await pool.query(
+      `
+      SELECT *
+      FROM tickets
+      WHERE id = $1
+      `,
+      [id]
+    );
+
+    if (ticketResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket not found"
+      });
+    }
+
+    const ticket = ticketResult.rows[0];
+
+    if (ticket.control_center_id !== resolver.control_center_id) {
+      return res.status(403).json({
+        status: "error",
+        message: "Ticket belongs to another control center"
+      });
+    }
+
+    if (["CLOSED", "CANCELLED", "RESOLVED"].includes(ticket.state)) {
+      return res.status(409).json({
+        status: "error",
+        message: "Ticket is already closed"
+      });
+    }
+
+    if (
+      ticket.assigned_resolver_id &&
+      ticket.assigned_resolver_id !== resolver_user_id
+    ) {
+      return res.status(409).json({
+        status: "error",
+        message: "Ticket is assigned to another resolver"
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO ticket_assignments (
+        ticket_id,
+        resolver_user_id,
+        assignment_type,
+        state,
+        accepted_at,
+        notified_at
+      )
+      VALUES ($1,$2,'MANUAL','ACCEPTED',NOW(),NOW())
+      `,
+      [id, resolver_user_id]
+    );
+
+    const update = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        assigned_resolver_id = $1,
+        state = 'ACCEPTED_BY_RESOLVER',
+        assigned_at = COALESCE(assigned_at, NOW()),
+        updated_at = NOW()
+      WHERE id = $2
+      RETURNING *
+      `,
+      [resolver_user_id, id]
+    );
+
+    await pool.query(
+      `
+      UPDATE resolver_locations
+      SET
+        status = 'BUSY',
+        updated_at = NOW()
+      WHERE user_id = $1
+      `,
+      [resolver_user_id]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,$2,'RESOLVER','RESOLVER_TAKE_CASE',$3,$4)
+      `,
+      [
+        id,
+        resolver_user_id,
+        `Resolutor tomó el caso: ${resolver.full_name}`,
+        JSON.stringify({ resolver_user_id, resolver_name: resolver.full_name })
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Ticket taken by resolver",
+      ticket: update.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[TAKE TICKET ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
 startFlespiMqtt();
 
