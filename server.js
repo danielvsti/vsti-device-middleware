@@ -2796,7 +2796,7 @@ app.post("/tickets/:id/call-start", async (req, res) => {
 
     res.json({
       status: "ok",
-      message: "Call request stored",
+      message: "Internal call request stored",
       mode,
       action: actionResult.rows[0]
     });
@@ -2888,7 +2888,7 @@ app.post("/tickets/:id/call-response", async (req, res) => {
 
     res.json({
       status: "ok",
-      message: "Call response stored",
+      message: "Internal call response stored",
       response,
       action: actionResult.rows[0]
     });
