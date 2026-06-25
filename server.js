@@ -913,7 +913,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0",
+version: "2.0-v15-neighbor-status",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -1546,11 +1546,24 @@ app.post("/public/mobile/cancel", async (req, res) => {
       SELECT
         m.*,
         t.id AS ticket_id,
-        t.state AS ticket_state
+        t.state AS ticket_state,
+        t.title AS ticket_title,
+        t.alert_type AS ticket_alert_type,
+        t.priority AS ticket_priority,
+        t.created_at AS ticket_created_at,
+        t.acknowledged_at AS ticket_acknowledged_at,
+        t.assigned_at AS ticket_assigned_at,
+        t.resolved_at AS ticket_resolved_at,
+        t.closed_at AS ticket_closed_at,
+        t.assigned_resolver_id,
+        r.full_name AS resolver_name,
+        r.phone AS resolver_phone
       FROM mobile_events m
       LEFT JOIN tickets t
         ON t.source_type = 'MOBILE_APP'
        AND t.source_event_id = m.id
+      LEFT JOIN users r
+        ON r.id = t.assigned_resolver_id
       WHERE m.id = $1
       ORDER BY t.created_at DESC NULLS LAST
       LIMIT 1
@@ -1693,6 +1706,133 @@ app.post("/public/mobile/ack", async (req, res) => {
   }
 });
 
+
+function buildNeighborProgress(event) {
+  const state = event.ticket_state || event.state || "ACTIVE";
+  const shortTicket = event.ticket_id
+    ? `#${String(event.ticket_id).slice(0, 8).toUpperCase()}`
+    : null;
+
+  const steps = [
+    {
+      key: "central_informed",
+      label: "Central informada",
+      detail: shortTicket
+        ? `La central recibió tu emergencia ${shortTicket}.`
+        : "La central recibió tu emergencia.",
+      done: true,
+      active: state === "ACTIVE" && !event.assigned_resolver_id,
+      at: event.ticket_created_at || event.created_at || null
+    }
+  ];
+
+  if (event.assigned_resolver_id) {
+    steps.push({
+      key: "resolver_assigned",
+      label: "Resolutor asignado",
+      detail: event.resolver_name
+        ? `${event.resolver_name} fue asignado a tu caso.`
+        : "Un resolutor municipal fue asignado a tu caso.",
+      done: true,
+      active: ["ASSIGNED", "ACCEPTED_BY_RESOLVER"].includes(state),
+      at: event.ticket_assigned_at || null,
+      resolver_name: event.resolver_name || null,
+      resolver_phone: event.resolver_phone || null
+    });
+  } else if (!["RESOLVED", "CLOSED", "CANCELLED"].includes(state)) {
+    steps.push({
+      key: "resolver_pending",
+      label: "Esperando resolutor disponible",
+      detail: "La central mantiene el caso activo hasta asignar apoyo en terreno.",
+      done: false,
+      active: true,
+      at: null
+    });
+  }
+
+  if (["EN_ROUTE", "ON_SITE", "RESOLVED", "CLOSED"].includes(state)) {
+    steps.push({
+      key: "resolver_en_route",
+      label: "Resolutor en camino",
+      detail: event.resolver_name
+        ? `${event.resolver_name} se dirige al lugar.`
+        : "El resolutor se dirige al lugar.",
+      done: true,
+      active: state === "EN_ROUTE",
+      at: null
+    });
+  }
+
+  if (["ON_SITE", "RESOLVED", "CLOSED"].includes(state)) {
+    steps.push({
+      key: "resolver_on_site",
+      label: "Resolutor en sitio",
+      detail: "El resolutor informó llegada al lugar.",
+      done: true,
+      active: state === "ON_SITE",
+      at: null
+    });
+  }
+
+  if (["RESOLVED", "CLOSED"].includes(state)) {
+    steps.push({
+      key: "case_closed",
+      label: state === "RESOLVED" ? "Caso resuelto" : "Caso cerrado",
+      detail: "La emergencia fue finalizada por el equipo municipal.",
+      done: true,
+      active: false,
+      at: event.ticket_resolved_at || event.ticket_closed_at || null
+    });
+  }
+
+  let headline = "La central ya recibió tu emergencia.";
+  let detail = "Puedes agregar información mientras se gestiona el caso.";
+
+  if (state === "ASSIGNED") {
+    headline = "Resolutor asignado.";
+    detail = event.resolver_name
+      ? `${event.resolver_name} fue asignado a tu caso.`
+      : "Un resolutor municipal fue asignado a tu caso.";
+  } else if (state === "ACCEPTED_BY_RESOLVER") {
+    headline = "El resolutor aceptó el caso.";
+    detail = event.resolver_name
+      ? `${event.resolver_name} está coordinando la atención.`
+      : "El resolutor está coordinando la atención.";
+  } else if (state === "EN_ROUTE") {
+    headline = "Resolutor en camino.";
+    detail = event.resolver_name
+      ? `${event.resolver_name} se dirige al lugar.`
+      : "El resolutor se dirige al lugar.";
+  } else if (state === "ON_SITE") {
+    headline = "Resolutor en sitio.";
+    detail = "El resolutor informó que llegó al lugar.";
+  } else if (state === "RESOLVED") {
+    headline = "Caso resuelto.";
+    detail = "La central finalizó la atención del caso.";
+  } else if (state === "CLOSED") {
+    headline = "Caso cerrado.";
+    detail = "La central cerró administrativamente el caso.";
+  } else if (!event.assigned_resolver_id) {
+    headline = "Central informada.";
+    detail = "Tu emergencia está activa. Aún no hay resolutor asignado.";
+  }
+
+  return {
+    ticket_id: event.ticket_id || null,
+    ticket_state: state,
+    headline,
+    detail,
+    resolver: event.assigned_resolver_id
+      ? {
+          id: event.assigned_resolver_id,
+          name: event.resolver_name || "Resolutor municipal",
+          phone: event.resolver_phone || null
+        }
+      : null,
+    steps
+  };
+}
+
 app.get("/public/mobile/status/:event_id", async (req, res) => {
   try {
     const { event_id } = req.params;
@@ -1702,11 +1842,24 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
       SELECT
         m.*,
         t.id AS ticket_id,
-        t.state AS ticket_state
+        t.state AS ticket_state,
+        t.title AS ticket_title,
+        t.alert_type AS ticket_alert_type,
+        t.priority AS ticket_priority,
+        t.created_at AS ticket_created_at,
+        t.acknowledged_at AS ticket_acknowledged_at,
+        t.assigned_at AS ticket_assigned_at,
+        t.resolved_at AS ticket_resolved_at,
+        t.closed_at AS ticket_closed_at,
+        t.assigned_resolver_id,
+        r.full_name AS resolver_name,
+        r.phone AS resolver_phone
       FROM mobile_events m
       LEFT JOIN tickets t
         ON t.source_type = 'MOBILE_APP'
        AND t.source_event_id = m.id
+      LEFT JOIN users r
+        ON r.id = t.assigned_resolver_id
       WHERE m.id = $1
       ORDER BY t.created_at DESC NULLS LAST
       LIMIT 1
@@ -1728,6 +1881,8 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
       : event.state;
 
     event.effective_state = effectiveState;
+
+    const neighborProgress = buildNeighborProgress(event);
 
     let pendingCallRequest = null;
 
@@ -1768,6 +1923,7 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
       event,
       ticket_state: event.ticket_state || null,
       effective_state: effectiveState,
+      neighbor_progress: neighborProgress,
       pending_call_request: pendingCallRequest
     });
 
@@ -2475,8 +2631,6 @@ app.post("/tickets/:id/en-route", async (req, res) => {
         message: "Ticket not found or resolver not assigned"
       });
     }
-
-    await syncMobileEventStateFromTicket(id, "RESOLVED");
 
     await pool.query(
       `
