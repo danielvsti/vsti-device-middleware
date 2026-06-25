@@ -110,8 +110,8 @@ const devices = {};
 const sirenStates = {};
 
 
-const SOS_ACTIVE_MS = 60 * 1000;
-const SOS_RECENT_MS = 10 * 60 * 1000;
+const SOS_ACTIVE_MS = 5 * 60 * 1000;
+const SOS_RECENT_MS = 20 * 60 * 1000;
 
 function nowChile() {
 	return new Date().toLocaleString("sv-SE", { timeZone: "America/Santiago" });
@@ -130,6 +130,227 @@ function getRemoteIp(req) {
 	return (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
 		.split(",")[0]
 		.trim();
+}
+
+/*
+   =========================================================
+   PHYSICAL SOS BUTTON REGISTRY
+   =========================================================
+
+   Los botones físicos no tienen una PWA asociada, por lo que la
+   central no puede enviarles solicitudes internas de llamada/video.
+   Para esos casos se registra un teléfono directo asociado al botón.
+
+   Puedes configurar/editar el inventario por variable de entorno:
+
+   PHYSICAL_SOS_BUTTONS_JSON='[{"id":"8322560","ident":"9705249564","name":"BotonSOS_1_Pudahuel","phone":"+569XXXXXXXX","control_center_code":"CC-VINA","address":"..."}]'
+
+   También se deja el botón piloto declarado como base, sin teléfono
+   real hardcodeado.
+   =========================================================
+ */
+
+const DEFAULT_PHYSICAL_SOS_BUTTONS = [
+  {
+    id: "8322560",
+    platform_id: "8322560",
+    ident: "9705249564",
+    name: "BotonSOS_1_Pudahuel",
+    phone: process.env.PHYSICAL_BUTTON_8322560_PHONE || "",
+    control_center_code: "CC-VINA",
+    address: "Botón físico SOS piloto",
+    notes: "Botón físico RF-V51 piloto"
+  }
+];
+
+function loadPhysicalSosButtons() {
+  const raw = process.env.PHYSICAL_SOS_BUTTONS_JSON;
+
+  if (!raw) return DEFAULT_PHYSICAL_SOS_BUTTONS;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === "object") return Object.values(parsed);
+  } catch (error) {
+    console.warn("[PHYSICAL SOS REGISTRY] Invalid PHYSICAL_SOS_BUTTONS_JSON:", error.message);
+  }
+
+  return DEFAULT_PHYSICAL_SOS_BUTTONS;
+}
+
+function getPhysicalSosButtonProfile(normalized) {
+  const platformId = normalized?.device?.platform_id ? String(normalized.device.platform_id) : null;
+  const ident = normalized?.device?.id ? String(normalized.device.id) : null;
+  const name = normalized?.device?.name || null;
+
+  const registry = loadPhysicalSosButtons();
+
+  const found = registry.find((item) => {
+    const keys = [
+      item.id,
+      item.platform_id,
+      item.ident,
+      item.device_id,
+      item.name
+    ]
+      .filter(Boolean)
+      .map(String);
+
+    return (platformId && keys.includes(platformId)) ||
+      (ident && keys.includes(ident)) ||
+      (name && keys.includes(name));
+  });
+
+  return {
+    id: platformId || ident || "UNKNOWN",
+    platform_id: platformId,
+    ident,
+    name: normalized?.device?.name || found?.name || `Botón SOS ${platformId || ident || "UNKNOWN"}`,
+    phone: found?.phone || "",
+    address: found?.address || found?.location || "",
+    owner_name: found?.owner_name || found?.owner || "",
+    control_center_code: found?.control_center_code || "CC-VINA",
+    notes: found?.notes || ""
+  };
+}
+
+async function getControlCenterIdByCode(code = "CC-VINA") {
+  const result = await pool.query(
+    `
+    SELECT id
+    FROM control_centers
+    WHERE code = $1
+    LIMIT 1
+    `,
+    [code]
+  );
+
+  return result.rows[0]?.id || null;
+}
+
+async function findOpenPhysicalDeviceTicket(normalized, profile) {
+  const platformId = profile.platform_id || null;
+  const ident = profile.ident || null;
+
+  const exactResult = await pool.query(
+    `
+    SELECT *
+    FROM tickets
+    WHERE source_type = 'GPS_DEVICE'
+      AND source_event_id = $1
+      AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+    ORDER BY created_at DESC
+    LIMIT 1
+    `,
+    [normalized.event_id]
+  );
+
+  if (exactResult.rows.length > 0) {
+    return exactResult.rows[0];
+  }
+
+  try {
+    const recentResult = await pool.query(
+      `
+      SELECT DISTINCT t.*
+      FROM tickets t
+      JOIN ticket_actions ta ON ta.ticket_id = t.id
+      WHERE t.source_type = 'GPS_DEVICE'
+        AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+        AND t.created_at > NOW() - INTERVAL '30 minutes'
+        AND ta.action_type = 'TICKET_CREATED'
+        AND (
+          ta.metadata->>'platform_id' = $1
+          OR ta.metadata->>'device_id' = $1
+          OR ta.metadata->>'ident' = $2
+          OR ta.metadata->>'device_id' = $2
+        )
+      ORDER BY t.created_at DESC
+      LIMIT 1
+      `,
+      [platformId, ident]
+    );
+
+    return recentResult.rows[0] || null;
+  } catch (error) {
+    console.warn("[PHYSICAL SOS DUP CHECK WARNING]", error.message);
+    return null;
+  }
+}
+
+async function createTicketFromPhysicalSos(normalized) {
+  if (normalized.event_type !== "SOS") return null;
+
+  const latitude = normalized.position?.latitude;
+  const longitude = normalized.position?.longitude;
+
+  if (latitude == null || longitude == null) {
+    console.warn("[PHYSICAL SOS] SOS received without position. Ticket not created.", normalized.event_id);
+    return null;
+  }
+
+  const profile = getPhysicalSosButtonProfile(normalized);
+  const existingTicket = await findOpenPhysicalDeviceTicket(normalized, profile);
+
+  if (existingTicket) {
+    console.log("[PHYSICAL SOS] Open ticket already exists", {
+      ticket_id: existingTicket.id,
+      source_event_id: normalized.event_id,
+      device_id: profile.id
+    });
+
+    return existingTicket;
+  }
+
+  const controlCenterId = await getControlCenterIdByCode(profile.control_center_code);
+
+  if (!controlCenterId) {
+    console.warn("[PHYSICAL SOS] Control center not found", profile.control_center_code);
+    return null;
+  }
+
+  const phoneText = profile.phone ? ` Teléfono asociado: ${profile.phone}.` : "";
+  const addressText = profile.address ? ` Ubicación/sector registrado: ${profile.address}.` : "";
+
+  const ticket = await createTicket({
+    control_center_id: controlCenterId,
+    citizen_user_id: null,
+    source_type: "GPS_DEVICE",
+    source_event_id: normalized.event_id,
+    alert_type: "SOS_DEVICE",
+    title: "SOS botón físico",
+    description: `Alerta SOS generada por botón físico ${profile.name}.${phoneText}${addressText}`,
+    latitude,
+    longitude,
+    accuracy: normalized.position?.accuracy ?? null,
+    priority: 1,
+    metadata: {
+      channel: "physical_sos_button",
+      device_id: profile.id,
+      platform_id: profile.platform_id,
+      ident: profile.ident,
+      device_name: profile.name,
+      device_phone: profile.phone || null,
+      owner_name: profile.owner_name || null,
+      registered_address: profile.address || null,
+      registry_notes: profile.notes || null,
+      source_event_id: normalized.event_id,
+      raw_type: normalized.raw_type,
+      battery: normalized.device?.battery ?? null,
+      satellites: normalized.position?.satellites ?? null,
+      valid: normalized.position?.valid ?? null
+    }
+  });
+
+  console.log("[PHYSICAL SOS TICKET CREATED]", {
+    ticket_id: ticket.id,
+    source_event_id: normalized.event_id,
+    device_id: profile.id,
+    device_phone: profile.phone || null
+  });
+
+  return ticket;
 }
 
 
@@ -327,6 +548,16 @@ async function processIncomingMessage(msg, receivedAt) {
 
 	updateGpsDeviceFromNormalized(normalized);
 
+	let physicalSosTicket = null;
+
+	if (normalized.event_type === "SOS") {
+		try {
+			physicalSosTicket = await createTicketFromPhysicalSos(normalized);
+		} catch (error) {
+			console.error("[PHYSICAL SOS TICKET ERROR]", error);
+		}
+	}
+
 
 	const shouldSendToSayVU = true;
 
@@ -338,14 +569,14 @@ async function processIncomingMessage(msg, receivedAt) {
 
 	   if (normalized.event_type === "KEEP_ALIVE") {
 	   console.log("KEEP_ALIVE received. Internal monitoring only.");
-	   return { normalized, forwarded: false };
+	   return { normalized, forwarded: false, physical_sos_ticket: physicalSosTicket };
 	   }
 	 */
 
 
 	if (shouldSendToSayVU) {
 		const result = await sendToSayVU(normalized);
-		return { normalized, forwarded: true, result };
+		return { normalized, forwarded: true, result, physical_sos_ticket: physicalSosTicket };
 	}
 
 	console.log("Message received but not forwarded.");
@@ -668,7 +899,13 @@ async function syncMobileEventStateFromTicket(ticketId, mobileState) {
 
 
 
-
+app.get("/debug/physical-buttons", (req, res) => {
+  res.json({
+    status: "ok",
+    total: loadPhysicalSosButtons().length,
+    buttons: loadPhysicalSosButtons()
+  });
+});
 
 
 
