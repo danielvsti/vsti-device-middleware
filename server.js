@@ -1793,6 +1793,73 @@ function meetingUrlForTicket(ticketId, mode = "video") {
   return `https://meet.jit.si/${room}#config.prejoinPageEnabled=false&config.startWithVideoMuted=${startWithVideoMuted}&config.startWithAudioMuted=false`;
 }
 
+
+function normalizeMobileSosPayload(reqBody = {}) {
+  const rawType = String(reqBody.alert_type || "SOS_MANUAL").toUpperCase();
+
+  const definitions = {
+    SOS_MANUAL: {
+      alert_type: "SOS_MANUAL",
+      title: "SOS móvil",
+      description: "Alerta SOS generada desde aplicación móvil",
+      priority: 1
+    },
+    VIF: {
+      alert_type: "VIF",
+      title: "Violencia Intrafamiliar",
+      description: "Alerta de violencia intrafamiliar generada desde aplicación móvil",
+      priority: 1
+    },
+    VIF_SILENT_SHAKE: {
+      alert_type: "VIF_SILENT_SHAKE",
+      title: "Alerta silenciosa VIF",
+      description: "Alerta silenciosa generada por triple agitación del teléfono. No llamar automáticamente; evaluar contacto discreto.",
+      priority: 1
+    },
+    FALL_DETECTED: {
+      alert_type: "FALL_DETECTED",
+      title: "Posible caída / emergencia médica",
+      description: "Evento generado por detección de caída o impacto fuerte del teléfono, sin cancelación del usuario.",
+      priority: 1
+    },
+    MEDICAL: {
+      alert_type: "MEDICAL",
+      title: "Emergencia médica",
+      description: "Emergencia médica reportada desde aplicación móvil",
+      priority: 1
+    },
+    FIRE: {
+      alert_type: "FIRE",
+      title: "Incendio",
+      description: "Incendio reportado desde aplicación móvil",
+      priority: 1
+    },
+    SECURITY: {
+      alert_type: "SECURITY",
+      title: "Seguridad ciudadana",
+      description: "Evento de seguridad reportado desde aplicación móvil",
+      priority: 2
+    }
+  };
+
+  const base = definitions[rawType] || {
+    alert_type: rawType,
+    title: reqBody.title || "SOS móvil",
+    description: reqBody.description || "Alerta generada desde aplicación móvil",
+    priority: Number(reqBody.priority || 1)
+  };
+
+  return {
+    ...base,
+    title: reqBody.title || base.title,
+    description: reqBody.description || base.description,
+    priority: Number(reqBody.priority || base.priority || 1),
+    sensor_event_type: reqBody.sensor_event_type || null,
+    silent: reqBody.silent === true,
+    confidence: reqBody.confidence || null
+  };
+}
+
 app.post("/public/mobile/sos", async (req, res) => {
   try {
     const {
@@ -1808,6 +1875,9 @@ app.post("/public/mobile/sos", async (req, res) => {
       title,
       priority = 1,
       description,
+      sensor_event_type,
+      silent,
+      confidence,
       control_center_code = "CC-VINA"
     } = req.body;
 
@@ -1921,27 +1991,40 @@ app.post("/public/mobile/sos", async (req, res) => {
     );
 
     const event = result.rows[0];
+    const normalizedAlert = normalizeMobileSosPayload({
+      alert_type,
+      title,
+      priority,
+      description,
+      sensor_event_type,
+      silent,
+      confidence,
+      source
+    });
 
     const ticket = await createTicket({
       control_center_id: controlCenterId,
       citizen_user_id: citizenUserId,
       source_type: "MOBILE_APP",
       source_event_id: event.id,
-      alert_type: alert_type || "SOS_MANUAL",
-      title: title || "SOS móvil",
-      description: description || "Alerta SOS generada desde aplicación móvil",
+      alert_type: normalizedAlert.alert_type,
+      title: normalizedAlert.title,
+      description: normalizedAlert.description,
       latitude: event.latitude,
       longitude: event.longitude,
       accuracy: event.accuracy,
-      priority: Number(priority || 1),
+      priority: normalizedAlert.priority,
       metadata: {
         mobile_event_id: event.id,
         phone: citizen.phone || phone,
         battery,
         source,
-        alert_type,
-        title,
-        priority,
+        alert_type: normalizedAlert.alert_type,
+        title: normalizedAlert.title,
+        priority: normalizedAlert.priority,
+        sensor_event_type: normalizedAlert.sensor_event_type,
+        silent: normalizedAlert.silent,
+        confidence: normalizedAlert.confidence,
         control_center_code: citizen.control_center_code || control_center_code,
         citizen_validation_status: citizen.validation_status,
         anonymous_user_id: user_id
