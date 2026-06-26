@@ -4743,6 +4743,503 @@ app.post("/tickets/:id/take", async (req, res) => {
 });
 
 
+
+
+/*
+   =========================================================
+   ADMIN USERS / MUNICIPAL VALIDATION
+   =========================================================
+*/
+
+function checkAdminToken(req, res) {
+  const expected = process.env.ADMIN_TOKEN || "";
+  if (!expected) return true;
+
+  const token =
+    req.headers["x-admin-token"] ||
+    req.query.admin_token ||
+    "";
+
+  if (token !== expected) {
+    res.status(401).json({
+      status: "error",
+      message: "Unauthorized admin request"
+    });
+    return false;
+  }
+
+  return true;
+}
+
+const VALID_USER_ROLES = [
+  "NEIGHBOR",
+  "RESOLVER",
+  "OPERATOR",
+  "ADMIN"
+];
+
+const VALID_VALIDATION_STATUSES = [
+  "PENDING_VERIFICATION",
+  "PROVISIONAL_ACTIVE",
+  "VALIDATED",
+  "REJECTED",
+  "SUSPENDED"
+];
+
+app.get("/admin/users", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const {
+      control_center_code = "CC-VINA",
+      role,
+      validation_status,
+      q,
+      limit
+    } = req.query;
+
+    const params = [control_center_code];
+    const where = ["cc.code = $1"];
+
+    if (role && role !== "ALL") {
+      params.push(role);
+      where.push(`u.role = $${params.length}`);
+    }
+
+    if (validation_status && validation_status !== "ALL") {
+      params.push(validation_status);
+      where.push(`u.validation_status = $${params.length}`);
+    }
+
+    if (q) {
+      params.push(`%${String(q).trim()}%`);
+      where.push(`(
+        u.full_name ILIKE $${params.length}
+        OR u.phone ILIKE $${params.length}
+        OR COALESCE(u.rut,'') ILIKE $${params.length}
+        OR COALESCE(u.email,'') ILIKE $${params.length}
+        OR COALESCE(u.declared_address,'') ILIKE $${params.length}
+      )`);
+    }
+
+    const maxLimit = Math.min(Number(limit || 200), 500);
+    params.push(maxLimit);
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.full_name,
+        u.role,
+        u.phone,
+        u.email,
+        u.rut,
+        u.declared_address,
+        u.latitude,
+        u.longitude,
+        u.validation_status,
+        u.is_active,
+        u.created_at,
+        u.updated_at,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+        COUNT(t.id)::int AS tickets_count,
+        MAX(t.created_at) AS last_ticket_at
+      FROM users u
+      JOIN control_centers cc
+        ON cc.id = u.control_center_id
+      LEFT JOIN tickets t
+        ON t.citizen_user_id = u.id
+      WHERE ${where.join(" AND ")}
+      GROUP BY
+        u.id,
+        cc.code,
+        cc.name
+      ORDER BY
+        u.created_at DESC
+      LIMIT $${params.length}
+      `,
+      params
+    );
+
+    res.json({
+      status: "ok",
+      total: result.rows.length,
+      users: result.rows
+    });
+
+  } catch (error) {
+    console.error("[ADMIN USERS ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.get("/admin/users/:id", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const { id } = req.params;
+
+    const userResult = await pool.query(
+      `
+      SELECT
+        u.*,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name
+      FROM users u
+      JOIN control_centers cc
+        ON cc.id = u.control_center_id
+      WHERE u.id = $1
+      `,
+      [id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    const contactsResult = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        relationship,
+        phone,
+        priority
+      FROM emergency_contacts
+      WHERE user_id = $1
+      ORDER BY priority ASC, created_at ASC
+      `,
+      [id]
+    );
+
+    const ticketsResult = await pool.query(
+      `
+      SELECT
+        id,
+        source_type,
+        alert_type,
+        title,
+        state,
+        priority,
+        latitude,
+        longitude,
+        created_at,
+        resolved_at,
+        closed_at
+      FROM tickets
+      WHERE citizen_user_id = $1
+      ORDER BY created_at DESC
+      LIMIT 20
+      `,
+      [id]
+    );
+
+    const resolverLocationResult = await pool.query(
+      `
+      SELECT
+        latitude,
+        longitude,
+        accuracy,
+        status,
+        updated_at
+      FROM resolver_locations
+      WHERE user_id = $1
+      `,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      user: userResult.rows[0],
+      emergency_contacts: contactsResult.rows,
+      tickets: ticketsResult.rows,
+      resolver_location: resolverLocationResult.rows[0] || null
+    });
+
+  } catch (error) {
+    console.error("[ADMIN USER DETAIL ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/admin/users/:id/validation", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const { id } = req.params;
+    const { validation_status, operator_user_id, reason } = req.body;
+
+    if (!VALID_VALIDATION_STATUSES.includes(validation_status)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid validation_status"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        validation_status = $1,
+        updated_at = NOW()
+      WHERE id = $2
+      RETURNING id, full_name, phone, role, validation_status, is_active, updated_at
+      `,
+      [validation_status, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    console.log("[ADMIN USER VALIDATION]", {
+      user_id: id,
+      validation_status,
+      operator_user_id: operator_user_id || null,
+      reason: reason || null
+    });
+
+    res.json({
+      status: "ok",
+      message: "Validation status updated",
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[ADMIN USER VALIDATION ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/admin/users/:id/role", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!VALID_USER_ROLES.includes(role)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid role"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        role = $1,
+        updated_at = NOW()
+      WHERE id = $2
+      RETURNING id, full_name, phone, role, validation_status, is_active, updated_at
+      `,
+      [role, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Role updated",
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[ADMIN USER ROLE ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/admin/users/:id/active", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const { id } = req.params;
+    const { is_active } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        is_active = $1,
+        validation_status = CASE
+          WHEN $1 = false THEN 'SUSPENDED'
+          WHEN validation_status = 'SUSPENDED' AND $1 = true THEN 'PROVISIONAL_ACTIVE'
+          ELSE validation_status
+        END,
+        updated_at = NOW()
+      WHERE id = $2
+      RETURNING id, full_name, phone, role, validation_status, is_active, updated_at
+      `,
+      [is_active === true, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Active state updated",
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[ADMIN USER ACTIVE ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/admin/users/:id/update", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const { id } = req.params;
+    const {
+      full_name,
+      rut,
+      email,
+      declared_address,
+      latitude,
+      longitude
+    } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        full_name = COALESCE($1, full_name),
+        rut = $2,
+        email = $3,
+        declared_address = $4,
+        latitude = $5,
+        longitude = $6,
+        updated_at = NOW()
+      WHERE id = $7
+      RETURNING *
+      `,
+      [
+        full_name || null,
+        rut || null,
+        email || null,
+        declared_address || null,
+        latitude ?? null,
+        longitude ?? null,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "User updated",
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error("[ADMIN USER UPDATE ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/admin/users/:id/contacts", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const { id } = req.params;
+    const contacts = Array.isArray(req.body.contacts)
+      ? req.body.contacts
+      : [];
+
+    await pool.query("BEGIN");
+
+    await pool.query(
+      `DELETE FROM emergency_contacts WHERE user_id = $1`,
+      [id]
+    );
+
+    for (const [index, contact] of contacts.entries()) {
+      if (!contact.name || !contact.phone) continue;
+
+      await pool.query(
+        `
+        INSERT INTO emergency_contacts (
+          user_id,
+          name,
+          relationship,
+          phone,
+          priority
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        `,
+        [
+          id,
+          contact.name,
+          contact.relationship || null,
+          contact.phone,
+          contact.priority || index + 1
+        ]
+      );
+    }
+
+    await pool.query("COMMIT");
+
+    res.json({
+      status: "ok",
+      message: "Contacts updated"
+    });
+
+  } catch (error) {
+    await pool.query("ROLLBACK");
+    console.error("[ADMIN USER CONTACTS ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
 startFlespiMqtt();
 
