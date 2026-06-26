@@ -1043,6 +1043,56 @@ client.on("reconnect", () => {
 }
 
 
+
+function normalizeResolverId(id) {
+  return String(id || "").trim().toLowerCase();
+}
+
+async function getRejectedResolverIdsForTicket(ticketId) {
+  const rejected = new Set();
+
+  const add = (value) => {
+    const normalized = normalizeResolverId(value);
+    if (normalized) rejected.add(normalized);
+  };
+
+  // Main source: assignment lifecycle table.
+  try {
+    const result = await pool.query(
+      `
+      SELECT DISTINCT resolver_user_id
+      FROM ticket_assignments
+      WHERE ticket_id = $1
+        AND UPPER(COALESCE(state,'')) = 'REJECTED'
+        AND resolver_user_id IS NOT NULL
+      `,
+      [ticketId]
+    );
+    for (const row of result.rows || []) add(row.resolver_user_id);
+  } catch (error) {
+    console.warn('[REJECTED RESOLVER IDS] ticket_assignments lookup failed:', error.message);
+  }
+
+  // Safety source: action log. This catches legacy/manual flows where the assignment row was not updated.
+  try {
+    const result = await pool.query(
+      `
+      SELECT DISTINCT actor_user_id
+      FROM ticket_actions
+      WHERE ticket_id = $1
+        AND action_type = 'RESOLVER_REJECTED'
+        AND actor_user_id IS NOT NULL
+      `,
+      [ticketId]
+    );
+    for (const row of result.rows || []) add(row.actor_user_id);
+  } catch (error) {
+    console.warn('[REJECTED RESOLVER IDS] ticket_actions lookup failed:', error.message);
+  }
+
+  return Array.from(rejected);
+}
+
 function distanceMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const toRad = (v) => v * Math.PI / 180;
@@ -1061,6 +1111,12 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
 
 async function autoAssignResolver(ticket, options = {}) {
   const force = options.force === true;
+  const excludeResolverUserIds = new Set(
+    (options.excludeResolverUserIds || options.exclude_resolver_user_ids || [])
+      .filter(Boolean)
+      .map(normalizeResolverId)
+      .filter(Boolean)
+  );
 
   if (!ticket || !ticket.id) {
     return null;
@@ -1094,6 +1150,11 @@ async function autoAssignResolver(ticket, options = {}) {
       ]
     );
     return null;
+  }
+
+  const rejectedResolverIds = await getRejectedResolverIdsForTicket(ticket.id);
+  for (const resolverId of rejectedResolverIds) {
+    excludeResolverUserIds.add(normalizeResolverId(resolverId));
   }
 
   const candidateResult = await pool.query(
@@ -1132,6 +1193,7 @@ async function autoAssignResolver(ticket, options = {}) {
     const isStale = maxAgeSeconds > 0 && age != null && age > maxAgeSeconds;
 
     const rejection_reasons = [];
+    if (excludeResolverUserIds.has(normalizeResolverId(resolver.id))) rejection_reasons.push("ALREADY_REJECTED_TICKET");
     if (resolver.is_active !== true) rejection_reasons.push("USER_INACTIVE");
     if (String(resolver.status || "").toUpperCase() !== "AVAILABLE") rejection_reasons.push(`STATUS_${resolver.status || "NO_STATUS"}`);
     if (!hasLocation) rejection_reasons.push("NO_LOCATION");
@@ -1172,6 +1234,7 @@ async function autoAssignResolver(ticket, options = {}) {
         JSON.stringify({
           reason: "NO_ELIGIBLE_RESOLVER",
           total_resolvers_in_center: candidates.length,
+          excluded_resolver_user_ids: Array.from(excludeResolverUserIds),
           candidates: candidates.map((r) => ({
             resolver_user_id: r.id,
             resolver_name: r.full_name,
@@ -1198,7 +1261,7 @@ async function autoAssignResolver(ticket, options = {}) {
       UPDATE ticket_assignments
       SET state = 'SUPERSEDED', updated_at = NOW()
       WHERE ticket_id = $1
-        AND state = 'PENDING'
+        AND state IN ('PENDING','ACCEPTED')
       `,
       [ticket.id]
     ).catch(() => null);
@@ -4372,18 +4435,81 @@ app.post("/tickets/:id/reject", async (req, res) => {
       });
     }
 
-    await pool.query(
+    const ticketBeforeResult = await pool.query(
+      `
+      SELECT *
+      FROM tickets
+      WHERE id = $1
+        AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+      LIMIT 1
+      `,
+      [id]
+    );
+
+    if (!ticketBeforeResult.rows.length) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket no encontrado o ya cerrado"
+      });
+    }
+
+    const ticketBefore = ticketBeforeResult.rows[0];
+
+    const assignmentUpdate = await pool.query(
       `
       UPDATE ticket_assignments
       SET
         state = 'REJECTED',
-        rejected_at = NOW()
+        rejected_at = NOW(),
+        updated_at = NOW()
       WHERE ticket_id = $1
         AND resolver_user_id = $2
-        AND state = 'PENDING'
+        AND state IN ('PENDING','ACCEPTED')
+      RETURNING *
       `,
       [id, resolver_user_id]
     );
+
+    // Even if the assignment row was already marked as REJECTED, the ticket must not remain locked
+    // to that resolver. This fixes manual assignment + resolver rejection flows.
+    const ticketResult = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        assigned_resolver_id = NULL,
+        state = CASE
+          WHEN state IN ('CLOSED','CANCELLED','RESOLVED') THEN state
+          ELSE 'ACTIVE'
+        END,
+        assigned_at = NULL,
+        updated_at = NOW()
+      WHERE id = $1
+        AND (assigned_resolver_id = $2 OR assigned_resolver_id IS NOT NULL)
+        AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+      RETURNING *
+      `,
+      [id, resolver_user_id]
+    );
+
+    const releasedTicket = ticketResult.rows[0] || ticketBefore;
+
+    await pool.query(
+      `
+      UPDATE resolver_locations rl
+      SET
+        status = 'AVAILABLE',
+        updated_at = NOW()
+      WHERE rl.user_id = $1
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tickets t
+          WHERE t.assigned_resolver_id = $1
+            AND t.id <> $2
+            AND t.state IN ('ASSIGNED','ACCEPTED_BY_RESOLVER','EN_ROUTE','ON_SITE')
+        )
+      `,
+      [resolver_user_id, id]
+    ).catch(() => null);
 
     await pool.query(
       `
@@ -4400,34 +4526,33 @@ app.post("/tickets/:id/reject", async (req, res) => {
       [
         id,
         resolver_user_id,
-        "Resolutor rechazó el caso",
+        "Resolutor rechazó el caso. El ticket queda liberado para reasignación.",
         JSON.stringify({
-          reject_reason: reject_reason || null
+          reject_reason: reject_reason || null,
+          previous_assigned_resolver_id: ticketBefore.assigned_resolver_id || null,
+          assignment_rows_rejected: assignmentUpdate.rows.length
         })
       ]
     );
 
-    const ticketResult = await pool.query(
-      `
-      UPDATE tickets
-      SET
-        assigned_resolver_id = NULL,
-        state = 'ACTIVE',
-        assigned_at = NULL,
-        updated_at = NOW()
-      WHERE id = $1
-      RETURNING *
-      `,
-      [id]
-    );
+    const excludedAfterReject = Array.from(new Set([
+      normalizeResolverId(resolver_user_id),
+      ...(await getRejectedResolverIdsForTicket(id))
+    ].filter(Boolean)));
 
-    const reassignment = await autoAssignResolver(ticketResult.rows[0]);
+    const reassignment = await autoAssignResolver(releasedTicket, {
+      force: true,
+      excludeResolverUserIds: excludedAfterReject
+    });
 
     res.json({
       status: "ok",
       message: "Ticket rejected by resolver",
-      ticket: reassignment?.ticket || ticketResult.rows[0],
+      ticket: reassignment?.ticket || releasedTicket,
+      released: true,
       reassigned: !!reassignment,
+      rejected_resolver_user_id: resolver_user_id,
+      excluded_resolver_user_ids: excludedAfterReject,
       new_resolver: reassignment?.resolver || null
     });
 
@@ -4464,12 +4589,57 @@ app.post("/tickets/:id/auto-assign", async (req, res) => {
       });
     }
 
-    const assignment = await autoAssignResolver(ticketResult.rows[0], { force: true });
+    let ticket = ticketResult.rows[0];
+
+    const rejectedResolverIds = await getRejectedResolverIdsForTicket(id);
+
+    const latestAssignmentResult = await pool.query(
+      `
+      SELECT *
+      FROM ticket_assignments
+      WHERE ticket_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [id]
+    ).catch(() => ({ rows: [] }));
+
+    const latestAssignment = latestAssignmentResult.rows?.[0] || null;
+
+    // Safety repair: if a resolver rejected but the ticket still points to that resolver,
+    // release it before retrying assignment.
+    if (
+      latestAssignment &&
+      latestAssignment.state === 'REJECTED' &&
+      ticket.assigned_resolver_id &&
+      String(ticket.assigned_resolver_id) === String(latestAssignment.resolver_user_id)
+    ) {
+      const released = await pool.query(
+        `
+        UPDATE tickets
+        SET
+          assigned_resolver_id = NULL,
+          state = 'ACTIVE',
+          assigned_at = NULL,
+          updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+        `,
+        [id]
+      );
+      ticket = released.rows[0] || ticket;
+    }
+
+    const assignment = await autoAssignResolver(ticket, {
+      force: true,
+      excludeResolverUserIds: rejectedResolverIds
+    });
 
     if (!assignment || !assignment.ticket) {
       return res.status(409).json({
         status: "no_resolver_available",
-        message: "No hay resolutores AVAILABLE elegibles para este ticket. Revisa estado, centro de control y ubicación GPS del resolutor."
+        message: "No hay resolutores AVAILABLE elegibles para este ticket. Revisa estado, centro de control y ubicación GPS del resolutor. Los resolutores que ya rechazaron este ticket quedan excluidos de la reasignación automática.",
+        excluded_resolver_user_ids: rejectedResolverIds
       });
     }
 
@@ -4477,6 +4647,7 @@ app.post("/tickets/:id/auto-assign", async (req, res) => {
       status: "ok",
       message: "Ticket asignado automáticamente",
       ticket: assignment.ticket,
+      excluded_resolver_user_ids: rejectedResolverIds,
       resolver: {
         id: assignment.resolver.id,
         full_name: assignment.resolver.full_name,
@@ -5593,10 +5764,25 @@ app.get("/dashboard/map-state", async (req, res) => {
         t.closed_at,
         u.full_name AS citizen_name,
         u.phone AS citizen_phone,
-        r.full_name AS resolver_name
+        r.full_name AS resolver_name,
+        latest_assignment.state AS latest_assignment_state,
+        latest_assignment.resolver_user_id AS latest_assignment_resolver_user_id,
+        latest_assignment.rejected_at AS latest_assignment_rejected_at,
+        latest_assignment.assignment_type AS latest_assignment_type
       FROM tickets t
       LEFT JOIN users u ON u.id = t.citizen_user_id
       LEFT JOIN users r ON r.id = t.assigned_resolver_id
+      LEFT JOIN LATERAL (
+        SELECT
+          ta.state,
+          ta.resolver_user_id,
+          ta.rejected_at,
+          ta.assignment_type
+        FROM ticket_assignments ta
+        WHERE ta.ticket_id = t.id
+        ORDER BY ta.created_at DESC
+        LIMIT 1
+      ) latest_assignment ON true
       WHERE t.control_center_id = $1
         AND t.state NOT IN ('CLOSED', 'CANCELLED')
       ORDER BY t.created_at DESC
@@ -5730,7 +5916,11 @@ app.get("/tickets/:id", async (req, res) => {
         citizen.declared_address,
 
         resolver.full_name AS resolver_name,
-        resolver.phone AS resolver_phone
+        resolver.phone AS resolver_phone,
+        latest_assignment.state AS latest_assignment_state,
+        latest_assignment.resolver_user_id AS latest_assignment_resolver_user_id,
+        latest_assignment.rejected_at AS latest_assignment_rejected_at,
+        latest_assignment.assignment_type AS latest_assignment_type
 
       FROM tickets t
 
@@ -5742,6 +5932,18 @@ app.get("/tickets/:id", async (req, res) => {
 
       LEFT JOIN users resolver
         ON resolver.id = t.assigned_resolver_id
+
+      LEFT JOIN LATERAL (
+        SELECT
+          ta.state,
+          ta.resolver_user_id,
+          ta.rejected_at,
+          ta.assignment_type
+        FROM ticket_assignments ta
+        WHERE ta.ticket_id = t.id
+        ORDER BY ta.created_at DESC
+        LIMIT 1
+      ) latest_assignment ON true
 
       WHERE t.id = $1
       `,
