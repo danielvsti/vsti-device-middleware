@@ -133,6 +133,132 @@ function getRemoteIp(req) {
 		.trim();
 }
 
+
+/*
+   =========================================================
+   PANEL ACCESS SESSIONS
+   =========================================================
+
+   Control de acceso para paneles operacionales:
+   - SOS-MAP / Central: OPERATOR o ADMIN
+   - SOS-ADMIN: ADMIN
+
+   En esta etapa el login es por teléfono registrado y activo. En producción
+   puede conectarse al mismo flujo OTP usado por vecinos.
+   =========================================================
+*/
+
+const SESSION_SECRET = process.env.SOS_SESSION_SECRET || process.env.ADMIN_TOKEN || TOKEN || "SOS_SESSION_DEV_SECRET";
+const PANEL_SESSION_TTL_HOURS = Number(process.env.PANEL_SESSION_TTL_HOURS || 12);
+
+function base64UrlEncode(value) {
+  return Buffer.from(typeof value === "string" ? value : JSON.stringify(value))
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function base64UrlDecode(value) {
+  const normalized = String(value || "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+  return Buffer.from(padded, "base64").toString("utf8");
+}
+
+function signSessionPayload(encodedPayload) {
+  return crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(encodedPayload)
+    .digest("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function createPanelSessionToken(user, panelType = "CONTROL_CENTER") {
+  const now = Date.now();
+  const payload = {
+    typ: "sos-panel-session",
+    sub: user.id,
+    name: user.full_name,
+    phone: user.phone,
+    role: user.role,
+    control_center_id: user.control_center_id,
+    control_center_code: user.control_center_code,
+    panel_type: panelType,
+    iat: now,
+    exp: now + PANEL_SESSION_TTL_HOURS * 60 * 60 * 1000
+  };
+
+  const encodedPayload = base64UrlEncode(payload);
+  const signature = signSessionPayload(encodedPayload);
+  return `sos.${encodedPayload}.${signature}`;
+}
+
+function getBearerOrPanelToken(req) {
+  const auth = req.headers["authorization"] || "";
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+
+  return req.headers["x-sos-token"] || req.query.sos_token || "";
+}
+
+function verifyPanelSessionToken(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length !== 3 || parts[0] !== "sos") return null;
+
+    const [, encodedPayload, signature] = parts;
+    const expectedSignature = signSessionPayload(encodedPayload);
+
+    const a = Buffer.from(signature);
+    const b = Buffer.from(expectedSignature);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return null;
+    }
+
+    const payload = JSON.parse(base64UrlDecode(encodedPayload));
+    if (!payload || payload.typ !== "sos-panel-session") return null;
+    if (payload.exp && Date.now() > Number(payload.exp)) return null;
+
+    return payload;
+  } catch (error) {
+    return null;
+  }
+}
+
+function panelSessionFromRequest(req) {
+  return verifyPanelSessionToken(getBearerOrPanelToken(req));
+}
+
+function checkRoleAccess(req, res, allowedRoles, message = "Unauthorized panel request") {
+  const session = panelSessionFromRequest(req);
+
+  if (!session || !allowedRoles.includes(session.role)) {
+    res.status(401).json({
+      status: "error",
+      message
+    });
+    return false;
+  }
+
+  req.panel_session = session;
+  return true;
+}
+
+function allowedRolesForPanel(panelType) {
+  const normalized = String(panelType || "CONTROL_CENTER").toUpperCase();
+
+  if (normalized === "ADMIN") return ["ADMIN"];
+  if (normalized === "CONTROL_CENTER") return ["OPERATOR", "ADMIN"];
+  if (normalized === "RESOLVER") return ["RESOLVER", "ADMIN"];
+
+  return ["OPERATOR", "ADMIN"];
+}
+
 /*
    =========================================================
    PHYSICAL SOS BUTTON REGISTRY
@@ -2343,6 +2469,148 @@ app.get("/public/mobile/active", async (req, res) => {
 });
 
 
+
+app.post("/auth/panel-login", async (req, res) => {
+  try {
+    const {
+      phone,
+      panel_type = "CONTROL_CENTER"
+    } = req.body || {};
+
+    const cleanPhone = normalizePhoneForAuth(phone);
+    const allowedRoles = allowedRolesForPanel(panel_type);
+
+    if (!cleanPhone) {
+      return res.status(400).json({
+        status: "error",
+        message: "phone is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.control_center_id,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+        u.role,
+        u.validation_status,
+        u.is_active,
+        u.full_name,
+        u.phone,
+        u.email,
+        u.rut,
+        u.declared_address,
+        u.latitude,
+        u.longitude
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.phone = $1
+      ORDER BY u.created_at DESC
+      LIMIT 1
+      `,
+      [cleanPhone]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Usuario no encontrado"
+      });
+    }
+
+    const user = result.rows[0];
+
+    if (user.is_active !== true) {
+      return res.status(403).json({
+        status: "error",
+        message: "La cuenta está suspendida o inactiva"
+      });
+    }
+
+    if (!allowedRoles.includes(user.role)) {
+      return res.status(403).json({
+        status: "error",
+        message: `Acceso no permitido para rol ${user.role}`
+      });
+    }
+
+    const token = createPanelSessionToken(user, panel_type);
+
+    res.json({
+      status: "ok",
+      message: "Login panel OK",
+      token,
+      expires_hours: PANEL_SESSION_TTL_HOURS,
+      user
+    });
+  } catch (error) {
+    console.error("[PANEL LOGIN ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message || "Error logging into panel"
+    });
+  }
+});
+
+app.get("/auth/session", async (req, res) => {
+  try {
+    const session = panelSessionFromRequest(req);
+
+    if (!session) {
+      return res.status(401).json({
+        status: "error",
+        message: "Sesión inválida o expirada"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.control_center_id,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+        u.role,
+        u.validation_status,
+        u.is_active,
+        u.full_name,
+        u.phone,
+        u.email,
+        u.rut,
+        u.declared_address,
+        u.latitude,
+        u.longitude
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.id = $1
+      LIMIT 1
+      `,
+      [session.sub]
+    );
+
+    if (result.rows.length === 0 || result.rows[0].is_active !== true) {
+      return res.status(401).json({
+        status: "error",
+        message: "Usuario inactivo o no encontrado"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      session,
+      user: result.rows[0]
+    });
+  } catch (error) {
+    console.error("[SESSION CHECK ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message || "Error checking session"
+    });
+  }
+});
+
 app.get("/auth/me", async (req, res) => {
   try {
     const userId = req.query.user_id || req.headers["x-user-id"];
@@ -4152,6 +4420,10 @@ app.get("/dashboard/summary", async (req, res) => {
 
 
 app.get("/dashboard/map-state", async (req, res) => {
+  if (String(process.env.REQUIRE_CONTROL_PANEL_AUTH || "false").toLowerCase() === "true") {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al panel de control")) return;
+  }
+
   try {
     const { control_center_code } = req.query;
 
@@ -4861,22 +5133,18 @@ app.post("/tickets/:id/take", async (req, res) => {
 
 function checkAdminToken(req, res) {
   const expected = process.env.ADMIN_TOKEN || "";
-  if (!expected) return true;
-
-  const token =
+  const legacyAdminToken =
     req.headers["x-admin-token"] ||
     req.query.admin_token ||
     "";
 
-  if (token !== expected) {
-    res.status(401).json({
-      status: "error",
-      message: "Unauthorized admin request"
-    });
-    return false;
+  // Compatibilidad: si se define ADMIN_TOKEN, sigue funcionando como llave maestra.
+  if (expected && legacyAdminToken === expected) {
+    return true;
   }
 
-  return true;
+  // Nuevo control de acceso por sesión de usuario ADMIN.
+  return checkRoleAccess(req, res, ["ADMIN"], "Se requiere usuario ADMIN para acceder al mantenedor");
 }
 
 const VALID_USER_ROLES = [
