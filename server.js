@@ -27,6 +27,7 @@ Funciones:
 const pool = require("./db");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 console.log(
   "DATABASE_URL configurada:",
@@ -914,7 +915,15 @@ function generateOtpCode() {
   const digits = Math.max(4, Math.min(8, OTP_LENGTH));
   const min = 10 ** (digits - 1);
   const max = 10 ** digits - 1;
-  return String(crypto.randomInt(min, max + 1));
+
+  if (typeof crypto.randomInt === "function") {
+    return String(crypto.randomInt(min, max + 1));
+  }
+
+  // Fallback defensivo para runtimes Node antiguos.
+  const range = max - min + 1;
+  const random = crypto.randomBytes(4).readUInt32BE(0);
+  return String(min + (random % range));
 }
 
 function hashOtpCode(phone, code) {
