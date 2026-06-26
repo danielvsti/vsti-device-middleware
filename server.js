@@ -4419,6 +4419,430 @@ app.get("/dashboard/summary", async (req, res) => {
 });
 
 
+
+/*
+   =========================================================
+   EXECUTIVE DASHBOARD / ANALYTICS
+   =========================================================
+
+   Dashboard estadístico para venta/operación municipal.
+   Acceso: OPERATOR o ADMIN mediante sesión de panel.
+   =========================================================
+*/
+
+function dashboardNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function minutesToHuman(minutes) {
+  const value = dashboardNumber(minutes, 0);
+  if (value <= 0) return "0 min";
+  if (value < 60) return `${Math.round(value)} min`;
+  const h = Math.floor(value / 60);
+  const m = Math.round(value % 60);
+  return m ? `${h} h ${m} min` : `${h} h`;
+}
+
+app.get("/dashboard/analytics", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al dashboard")) return;
+
+  try {
+    const days = Math.max(1, Math.min(365, Number(req.query.days || 30)));
+    const requestedCode = req.query.control_center_code || req.panel_session?.control_center_code || "CC-VINA";
+
+    const ccResult = await pool.query(
+      `
+      SELECT id, code, name, latitude, longitude
+      FROM control_centers
+      WHERE code = $1
+      LIMIT 1
+      `,
+      [requestedCode]
+    );
+
+    if (ccResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Unknown control_center_code"
+      });
+    }
+
+    const controlCenter = ccResult.rows[0];
+    const ccId = controlCenter.id;
+
+    const summaryResult = await pool.query(
+      `
+      WITH all_tickets AS (
+        SELECT *
+        FROM tickets
+        WHERE control_center_id = $1
+      ), period_tickets AS (
+        SELECT *
+        FROM all_tickets
+        WHERE created_at >= NOW() - ($2::int || ' days')::interval
+      )
+      SELECT
+        (SELECT COUNT(*)::int FROM all_tickets) AS tickets_total_all_time,
+        COUNT(*)::int AS tickets_total_period,
+        COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS tickets_open,
+        COUNT(*) FILTER (WHERE state = 'ACTIVE')::int AS tickets_active,
+        COUNT(*) FILTER (WHERE state = 'ASSIGNED')::int AS tickets_assigned,
+        COUNT(*) FILTER (WHERE state = 'EN_ROUTE')::int AS tickets_en_route,
+        COUNT(*) FILTER (WHERE state = 'ON_SITE')::int AS tickets_on_site,
+        COUNT(*) FILTER (WHERE state = 'RESOLVED')::int AS tickets_resolved,
+        COUNT(*) FILTER (WHERE state = 'CLOSED')::int AS tickets_closed,
+        COUNT(*) FILTER (WHERE state = 'CANCELLED')::int AS tickets_cancelled,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')::int AS tickets_last_24h,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS tickets_last_7d,
+        COUNT(*) FILTER (WHERE priority <= 2)::int AS tickets_high_priority,
+        ROUND(AVG(EXTRACT(EPOCH FROM (acknowledged_at - created_at)) / 60.0) FILTER (WHERE acknowledged_at IS NOT NULL)::numeric, 1) AS avg_ack_minutes,
+        ROUND(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at)) / 60.0) FILTER (WHERE assigned_at IS NOT NULL)::numeric, 1) AS avg_assign_minutes,
+        ROUND(AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 60.0) FILTER (WHERE resolved_at IS NOT NULL)::numeric, 1) AS avg_resolve_minutes,
+        ROUND(AVG(EXTRACT(EPOCH FROM (closed_at - created_at)) / 60.0) FILTER (WHERE closed_at IS NOT NULL)::numeric, 1) AS avg_close_minutes,
+        ROUND(MAX(EXTRACT(EPOCH FROM (NOW() - created_at)) / 60.0) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::numeric, 1) AS oldest_open_minutes,
+        ROUND(
+          100.0 * COUNT(*) FILTER (WHERE acknowledged_at IS NOT NULL AND acknowledged_at <= created_at + INTERVAL '5 minutes')
+          / NULLIF(COUNT(*) FILTER (WHERE acknowledged_at IS NOT NULL), 0),
+          1
+        ) AS sla_ack_5m_pct,
+        ROUND(
+          100.0 * COUNT(*) FILTER (WHERE assigned_at IS NOT NULL AND assigned_at <= created_at + INTERVAL '15 minutes')
+          / NULLIF(COUNT(*) FILTER (WHERE assigned_at IS NOT NULL), 0),
+          1
+        ) AS sla_assign_15m_pct,
+        ROUND(
+          100.0 * COUNT(*) FILTER (WHERE resolved_at IS NOT NULL AND resolved_at <= created_at + INTERVAL '60 minutes')
+          / NULLIF(COUNT(*) FILTER (WHERE resolved_at IS NOT NULL), 0),
+          1
+        ) AS sla_resolve_60m_pct
+      FROM period_tickets
+      `,
+      [ccId, days]
+    );
+
+    const usersSummaryResult = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS users_total,
+        COUNT(*) FILTER (WHERE is_active = true)::int AS users_active,
+        COUNT(*) FILTER (WHERE is_active = false)::int AS users_inactive,
+        COUNT(*) FILTER (WHERE role = 'NEIGHBOR')::int AS neighbors_total,
+        COUNT(*) FILTER (WHERE role = 'NEIGHBOR' AND validation_status = 'VALIDATED')::int AS neighbors_validated,
+        COUNT(*) FILTER (WHERE role = 'NEIGHBOR' AND validation_status = 'PROVISIONAL_ACTIVE')::int AS neighbors_provisional,
+        COUNT(*) FILTER (WHERE role = 'NEIGHBOR' AND validation_status = 'REJECTED')::int AS neighbors_rejected,
+        COUNT(*) FILTER (WHERE role = 'RESOLVER')::int AS resolvers_total,
+        COUNT(*) FILTER (WHERE role = 'OPERATOR')::int AS operators_total,
+        COUNT(*) FILTER (WHERE role = 'ADMIN')::int AS admins_total
+      FROM users
+      WHERE control_center_id = $1
+      `,
+      [ccId]
+    );
+
+    const resolversSummaryResult = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS resolvers_total,
+        COUNT(*) FILTER (WHERE u.is_active = true)::int AS resolvers_active,
+        COUNT(*) FILTER (WHERE rl.user_id IS NULL)::int AS resolvers_without_location,
+        COUNT(*) FILTER (WHERE rl.updated_at >= NOW() - INTERVAL '3 minutes')::int AS resolvers_online,
+        COUNT(*) FILTER (WHERE rl.updated_at < NOW() - INTERVAL '3 minutes' AND rl.updated_at >= NOW() - INTERVAL '10 minutes')::int AS resolvers_stale,
+        COUNT(*) FILTER (WHERE rl.updated_at < NOW() - INTERVAL '10 minutes' OR rl.user_id IS NULL)::int AS resolvers_offline,
+        COUNT(*) FILTER (WHERE rl.status = 'AVAILABLE' AND rl.updated_at >= NOW() - INTERVAL '5 minutes')::int AS resolvers_available_now,
+        COUNT(*) FILTER (WHERE rl.status = 'BUSY')::int AS resolvers_busy,
+        COUNT(*) FILTER (WHERE rl.status = 'EN_ROUTE')::int AS resolvers_en_route,
+        COUNT(*) FILTER (WHERE rl.status = 'ON_SITE')::int AS resolvers_on_site
+      FROM users u
+      LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+      WHERE u.control_center_id = $1
+        AND u.role = 'RESOLVER'
+      `,
+      [ccId]
+    );
+
+    const sirensSummaryResult = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS sirens_total,
+        COUNT(*) FILTER (WHERE state = 'ON' OR relay = true)::int AS sirens_active,
+        COUNT(*) FILTER (WHERE last_seen IS NOT NULL AND last_seen >= NOW() - INTERVAL '2 minutes')::int AS sirens_online,
+        COUNT(*) FILTER (WHERE last_seen IS NULL OR last_seen < NOW() - INTERVAL '10 minutes')::int AS sirens_offline
+      FROM sirens
+      WHERE control_center_id = $1
+      `,
+      [ccId]
+    );
+
+    const devicesSummaryResult = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS devices_total,
+        COUNT(*) FILTER (WHERE last_seen IS NOT NULL AND last_seen >= NOW() - INTERVAL '10 minutes')::int AS devices_online,
+        COUNT(*) FILTER (WHERE last_seen IS NULL OR last_seen < NOW() - INTERVAL '10 minutes')::int AS devices_offline,
+        COUNT(*) FILTER (WHERE status = 'SOS_ACTIVE')::int AS devices_sos_active
+      FROM devices
+      WHERE control_center_id = $1
+      `,
+      [ccId]
+    );
+
+    const stateResult = await pool.query(
+      `
+      SELECT state AS label, COUNT(*)::int AS value
+      FROM tickets
+      WHERE control_center_id = $1
+        AND created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY state
+      ORDER BY value DESC
+      `,
+      [ccId, days]
+    );
+
+    const alertTypeResult = await pool.query(
+      `
+      SELECT COALESCE(alert_type, 'SIN_TIPO') AS label, COUNT(*)::int AS value
+      FROM tickets
+      WHERE control_center_id = $1
+        AND created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY COALESCE(alert_type, 'SIN_TIPO')
+      ORDER BY value DESC
+      LIMIT 12
+      `,
+      [ccId, days]
+    );
+
+    const sourceResult = await pool.query(
+      `
+      SELECT COALESCE(source_type, 'SIN_ORIGEN') AS label, COUNT(*)::int AS value
+      FROM tickets
+      WHERE control_center_id = $1
+        AND created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY COALESCE(source_type, 'SIN_ORIGEN')
+      ORDER BY value DESC
+      `,
+      [ccId, days]
+    );
+
+    const dailyResult = await pool.query(
+      `
+      SELECT
+        TO_CHAR(date_trunc('day', created_at AT TIME ZONE 'America/Santiago'), 'YYYY-MM-DD') AS label,
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS open,
+        COUNT(*) FILTER (WHERE state IN ('CLOSED','RESOLVED'))::int AS resolved
+      FROM tickets
+      WHERE control_center_id = $1
+        AND created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY date_trunc('day', created_at AT TIME ZONE 'America/Santiago')
+      ORDER BY label
+      `,
+      [ccId, days]
+    );
+
+    const hourlyResult = await pool.query(
+      `
+      SELECT
+        EXTRACT(HOUR FROM created_at AT TIME ZONE 'America/Santiago')::int AS hour,
+        COUNT(*)::int AS value
+      FROM tickets
+      WHERE control_center_id = $1
+        AND created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY hour
+      ORDER BY hour
+      `,
+      [ccId, days]
+    );
+
+    const topNeighborsResult = await pool.query(
+      `
+      SELECT
+        COALESCE(u.full_name, 'Sin vecino asociado') AS name,
+        u.phone,
+        COUNT(t.id)::int AS tickets_count,
+        MAX(t.created_at) AS last_ticket_at
+      FROM tickets t
+      LEFT JOIN users u ON u.id = t.citizen_user_id
+      WHERE t.control_center_id = $1
+        AND t.created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY u.id, u.full_name, u.phone
+      ORDER BY tickets_count DESC, last_ticket_at DESC NULLS LAST
+      LIMIT 10
+      `,
+      [ccId, days]
+    );
+
+    const topResolversResult = await pool.query(
+      `
+      SELECT
+        COALESCE(u.full_name, 'Sin resolutor') AS name,
+        u.phone,
+        COUNT(t.id)::int AS assigned_count,
+        COUNT(t.id) FILTER (WHERE t.state IN ('RESOLVED','CLOSED'))::int AS closed_count,
+        ROUND(AVG(EXTRACT(EPOCH FROM (t.resolved_at - t.created_at)) / 60.0) FILTER (WHERE t.resolved_at IS NOT NULL)::numeric, 1) AS avg_resolve_minutes
+      FROM tickets t
+      LEFT JOIN users u ON u.id = t.assigned_resolver_id
+      WHERE t.control_center_id = $1
+        AND t.created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY u.id, u.full_name, u.phone
+      ORDER BY assigned_count DESC
+      LIMIT 10
+      `,
+      [ccId, days]
+    );
+
+    const pendingValidationResult = await pool.query(
+      `
+      SELECT
+        id,
+        full_name,
+        phone,
+        rut,
+        declared_address,
+        validation_status,
+        created_at
+      FROM users
+      WHERE control_center_id = $1
+        AND role = 'NEIGHBOR'
+        AND validation_status IN ('PENDING_VERIFICATION','PROVISIONAL_ACTIVE')
+        AND is_active = true
+      ORDER BY created_at DESC
+      LIMIT 10
+      `,
+      [ccId]
+    );
+
+    const recentTicketsResult = await pool.query(
+      `
+      SELECT
+        t.id,
+        t.title,
+        t.alert_type,
+        t.source_type,
+        t.state,
+        t.priority,
+        t.created_at,
+        t.acknowledged_at,
+        t.assigned_at,
+        t.resolved_at,
+        t.closed_at,
+        ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS age_minutes,
+        citizen.full_name AS citizen_name,
+        citizen.phone AS citizen_phone,
+        resolver.full_name AS resolver_name
+      FROM tickets t
+      LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+      LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+      WHERE t.control_center_id = $1
+      ORDER BY t.created_at DESC
+      LIMIT 12
+      `,
+      [ccId]
+    );
+
+    const resolverStatusResult = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.full_name,
+        u.phone,
+        u.is_active,
+        COALESCE(rl.status, 'SIN_UBICACION') AS status,
+        rl.updated_at,
+        CASE
+          WHEN rl.updated_at IS NULL THEN 'SIN_UBICACION'
+          WHEN rl.updated_at >= NOW() - INTERVAL '3 minutes' THEN 'ONLINE'
+          WHEN rl.updated_at >= NOW() - INTERVAL '10 minutes' THEN 'DESACTUALIZADO'
+          ELSE 'OFFLINE'
+        END AS heartbeat
+      FROM users u
+      LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+      WHERE u.control_center_id = $1
+        AND u.role = 'RESOLVER'
+      ORDER BY u.full_name ASC
+      `,
+      [ccId]
+    );
+
+    const actionsResult = await pool.query(
+      `
+      SELECT
+        action_type AS label,
+        COUNT(*)::int AS value
+      FROM ticket_actions ta
+      JOIN tickets t ON t.id = ta.ticket_id
+      WHERE t.control_center_id = $1
+        AND ta.created_at >= NOW() - ($2::int || ' days')::interval
+      GROUP BY action_type
+      ORDER BY value DESC
+      LIMIT 12
+      `,
+      [ccId, days]
+    );
+
+    const hourly = Array.from({ length: 24 }, (_, hour) => {
+      const found = hourlyResult.rows.find((item) => Number(item.hour) === hour);
+      return { hour, label: `${String(hour).padStart(2, "0")}:00`, value: found ? Number(found.value) : 0 };
+    });
+
+    const ticketSummary = summaryResult.rows[0] || {};
+    const usersSummary = usersSummaryResult.rows[0] || {};
+    const resolversSummary = resolversSummaryResult.rows[0] || {};
+    const sirensSummary = sirensSummaryResult.rows[0] || {};
+    const devicesSummary = devicesSummaryResult.rows[0] || {};
+
+    res.json({
+      status: "ok",
+      updated_at: nowChile(),
+      period_days: days,
+      control_center: controlCenter,
+      generated_by: req.panel_session ? {
+        id: req.panel_session.sub,
+        name: req.panel_session.name,
+        role: req.panel_session.role
+      } : null,
+      summary: {
+        tickets: {
+          ...ticketSummary,
+          avg_ack_human: minutesToHuman(ticketSummary.avg_ack_minutes),
+          avg_assign_human: minutesToHuman(ticketSummary.avg_assign_minutes),
+          avg_resolve_human: minutesToHuman(ticketSummary.avg_resolve_minutes),
+          avg_close_human: minutesToHuman(ticketSummary.avg_close_minutes),
+          oldest_open_human: minutesToHuman(ticketSummary.oldest_open_minutes)
+        },
+        users: usersSummary,
+        resolvers: resolversSummary,
+        sirens: sirensSummary,
+        devices: devicesSummary
+      },
+      charts: {
+        tickets_by_day: dailyResult.rows,
+        tickets_by_hour: hourly,
+        tickets_by_state: stateResult.rows,
+        tickets_by_alert_type: alertTypeResult.rows,
+        tickets_by_source: sourceResult.rows,
+        actions_by_type: actionsResult.rows
+      },
+      rankings: {
+        top_neighbors: topNeighborsResult.rows,
+        top_resolvers: topResolversResult.rows
+      },
+      operations: {
+        recent_tickets: recentTicketsResult.rows,
+        pending_validation_neighbors: pendingValidationResult.rows,
+        resolver_status: resolverStatusResult.rows
+      }
+    });
+  } catch (error) {
+    console.error("[DASHBOARD ANALYTICS ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message || "Error generating dashboard analytics"
+    });
+  }
+});
+
+
 app.get("/dashboard/map-state", async (req, res) => {
   if (String(process.env.REQUIRE_CONTROL_PANEL_AUTH || "false").toLowerCase() === "true") {
     if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al panel de control")) return;
