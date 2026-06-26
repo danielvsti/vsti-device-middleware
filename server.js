@@ -1145,6 +1145,7 @@ function publicUserPayload(user, controlCenter = null) {
     control_center_name: user.control_center_name || controlCenter?.name || null,
     role: user.role,
     validation_status: user.validation_status,
+    is_active: user.is_active === true,
     full_name: user.full_name,
     phone: user.phone,
     rut: user.rut,
@@ -1153,6 +1154,52 @@ function publicUserPayload(user, controlCenter = null) {
     latitude: user.latitude,
     longitude: user.longitude
   };
+}
+
+
+function canNeighborUseSos(user) {
+  if (!user) return { ok: false, reason: "Usuario no encontrado" };
+
+  if (user.role !== "NEIGHBOR") {
+    return { ok: false, reason: "El usuario no tiene perfil de vecino" };
+  }
+
+  if (user.is_active !== true) {
+    return { ok: false, reason: "La cuenta está suspendida o inactiva" };
+  }
+
+  const blockedStatuses = [
+    "PENDING_VERIFICATION",
+    "REJECTED",
+    "SUSPENDED"
+  ];
+
+  if (blockedStatuses.includes(user.validation_status)) {
+    return {
+      ok: false,
+      reason: `El usuario no está habilitado para generar SOS (${user.validation_status})`
+    };
+  }
+
+  return { ok: true };
+}
+
+async function getNeighborById(userId) {
+  const result = await pool.query(
+    `
+    SELECT
+      u.*,
+      cc.code AS control_center_code,
+      cc.name AS control_center_name
+    FROM users u
+    LEFT JOIN control_centers cc ON cc.id = u.control_center_id
+    WHERE u.id = $1
+    LIMIT 1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] || null;
 }
 
 
@@ -1652,6 +1699,55 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    const userResult = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.control_center_id,
+        u.role,
+        u.validation_status,
+        u.is_active,
+        u.full_name,
+        u.phone,
+        u.declared_address,
+        cc.code AS control_center_code
+      FROM users u
+      LEFT JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.id = $1
+      LIMIT 1
+      `,
+      [user_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(403).json({
+        status: "error",
+        message: "El vecino debe estar registrado y autenticado para generar SOS"
+      });
+    }
+
+    const citizen = userResult.rows[0];
+    const sosPermission = canNeighborUseSos(citizen);
+
+    if (!sosPermission.ok) {
+      return res.status(403).json({
+        status: "error",
+        message: sosPermission.reason,
+        validation_status: citizen.validation_status,
+        is_active: citizen.is_active === true
+      });
+    }
+
+    const controlCenterId = citizen.control_center_id;
+    const citizenUserId = citizen.id;
+
+    if (!controlCenterId) {
+      return res.status(400).json({
+        status: "error",
+        message: "El vecino no tiene centro de control asignado"
+      });
+    }
+
     await pool.query(
       `
       UPDATE mobile_events
@@ -1689,8 +1785,8 @@ app.post("/public/mobile/sos", async (req, res) => {
       [
         eventId,
         user_id,
-        name || "Usuario movil",
-        phone || null,
+        citizen.full_name || name || "Usuario movil",
+        citizen.phone || phone || null,
         Number(latitude),
         Number(longitude),
         accuracy ?? null,
@@ -1700,70 +1796,31 @@ app.post("/public/mobile/sos", async (req, res) => {
 
     const event = result.rows[0];
 
-const userResult = await pool.query(
-  `
-  SELECT id, control_center_id
-  FROM users
-  WHERE id = $1
-  `,
-  [user_id]
-);
-
-
-
-let ticket = null;
-let controlCenterId = null;
-let citizenUserId = null;
-
-if (userResult.rows.length > 0) {
-  controlCenterId = userResult.rows[0].control_center_id;
-  citizenUserId = userResult.rows[0].id;
-} else {
-  const ccResult = await pool.query(
-    `
-    SELECT id
-    FROM control_centers
-    WHERE code = $1
-    `,
-    [control_center_code]
-  );
-
-  if (ccResult.rows.length > 0) {
-    controlCenterId = ccResult.rows[0].id;
-  }
-}
-
-if (!controlCenterId) {
-  console.warn(`[MOBILE SOS] Control center not found: ${control_center_code}. Ticket not created.`);
-}
-
-if (controlCenterId) {
-  ticket = await createTicket({
-    control_center_id: controlCenterId,
-    citizen_user_id: citizenUserId,
-    source_type: "MOBILE_APP",
-    source_event_id: event.id,
-    alert_type: alert_type || "SOS_MANUAL",
-    title: title || "SOS móvil",
-    description: description || "Alerta SOS generada desde aplicación móvil",
-    latitude: event.latitude,
-    longitude: event.longitude,
-    accuracy: event.accuracy,
-    priority: Number(priority || 1),
-    metadata: {
-      mobile_event_id: event.id,
-      phone,
-      battery,
-      source,
-      alert_type,
-      title,
-      priority,
-      control_center_code,
-      anonymous_user_id: user_id
-    }
-  });
-}
-
+    const ticket = await createTicket({
+      control_center_id: controlCenterId,
+      citizen_user_id: citizenUserId,
+      source_type: "MOBILE_APP",
+      source_event_id: event.id,
+      alert_type: alert_type || "SOS_MANUAL",
+      title: title || "SOS móvil",
+      description: description || "Alerta SOS generada desde aplicación móvil",
+      latitude: event.latitude,
+      longitude: event.longitude,
+      accuracy: event.accuracy,
+      priority: Number(priority || 1),
+      metadata: {
+        mobile_event_id: event.id,
+        phone: citizen.phone || phone,
+        battery,
+        source,
+        alert_type,
+        title,
+        priority,
+        control_center_code: citizen.control_center_code || control_center_code,
+        citizen_validation_status: citizen.validation_status,
+        anonymous_user_id: user_id
+      }
+    });
 
     console.log("[MOBILE SOS DB]", event);
 
@@ -1772,8 +1829,9 @@ if (controlCenterId) {
       message: "Mobile SOS received",
       event_id: event.id,
       state: event.state,
-     received_at: event.created_at,
-ticket_id: ticket ? ticket.id : null
+      received_at: event.created_at,
+      ticket_id: ticket ? ticket.id : null,
+      user: publicUserPayload(citizen)
     });
 
   } catch (error) {
@@ -1781,7 +1839,7 @@ ticket_id: ticket ? ticket.id : null
 
     res.status(500).json({
       status: "error",
-      message: "Database error creating mobile SOS"
+      message: error.message || "Database error creating mobile SOS"
     });
   }
 });
@@ -2284,6 +2342,44 @@ app.get("/public/mobile/active", async (req, res) => {
   }
 });
 
+
+app.get("/auth/me", async (req, res) => {
+  try {
+    const userId = req.query.user_id || req.headers["x-user-id"];
+
+    if (!userId) {
+      return res.status(400).json({
+        status: "error",
+        message: "user_id is required"
+      });
+    }
+
+    const user = await getNeighborById(userId);
+
+    if (!user) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      user: publicUserPayload(user),
+      can_use_sos: canNeighborUseSos(user).ok,
+      block_reason: canNeighborUseSos(user).reason || null
+    });
+
+  } catch (error) {
+    console.error("[AUTH ME ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message || "Error getting current user"
+    });
+  }
+});
+
 app.post("/auth/register", async (req, res) => {
   try {
     const {
@@ -2523,7 +2619,6 @@ app.post("/auth/request-code", async (req, res) => {
       FROM users u
       JOIN control_centers cc ON cc.id = u.control_center_id
       WHERE u.phone = $1
-        AND u.is_active = true
       ORDER BY u.created_at DESC
       LIMIT 1
       `,
@@ -2538,6 +2633,13 @@ app.post("/auth/request-code", async (req, res) => {
     }
 
     const user = userResult.rows[0];
+
+    if (user.is_active !== true) {
+      return res.status(403).json({
+        status: "error",
+        message: "La cuenta está suspendida o inactiva. Contacta a la central."
+      });
+    }
 
     if (user.role !== "NEIGHBOR") {
       return res.status(403).json({
@@ -2616,7 +2718,6 @@ app.post("/auth/verify-code", async (req, res) => {
       FROM users u
       JOIN control_centers cc ON cc.id = u.control_center_id
       WHERE u.phone = $1
-        AND u.is_active = true
       ORDER BY u.created_at DESC
       LIMIT 1
       `,
@@ -2631,6 +2732,13 @@ app.post("/auth/verify-code", async (req, res) => {
     }
 
     const user = userResult.rows[0];
+
+    if (user.is_active !== true) {
+      return res.status(403).json({
+        status: "error",
+        message: "La cuenta está suspendida o inactiva. Contacta a la central."
+      });
+    }
 
     if (user.role !== "NEIGHBOR") {
       return res.status(403).json({
