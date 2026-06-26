@@ -4894,6 +4894,199 @@ const VALID_VALIDATION_STATUSES = [
   "SUSPENDED"
 ];
 
+
+function defaultValidationStatusForRole(role) {
+  return role === "NEIGHBOR" ? "PROVISIONAL_ACTIVE" : "VALIDATED";
+}
+
+function normalizeAdminBoolean(value, fallback) {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return fallback;
+}
+
+async function adminCreateOrUpdateUser(payload) {
+  const {
+    control_center_code = "CC-VINA",
+    full_name,
+    phone,
+    role = "NEIGHBOR",
+    validation_status,
+    is_active,
+    rut,
+    email,
+    declared_address,
+    latitude,
+    longitude,
+    emergency_contacts
+  } = payload;
+
+  if (!full_name || !phone) {
+    throw new Error("full_name and phone are required");
+  }
+
+  if (!VALID_USER_ROLES.includes(role)) {
+    throw new Error(`Invalid role: ${role}`);
+  }
+
+  const finalValidationStatus = validation_status || defaultValidationStatusForRole(role);
+
+  if (!VALID_VALIDATION_STATUSES.includes(finalValidationStatus)) {
+    throw new Error(`Invalid validation_status: ${finalValidationStatus}`);
+  }
+
+  let finalIsActive = normalizeAdminBoolean(
+    is_active,
+    !["REJECTED", "SUSPENDED", "PENDING_VERIFICATION"].includes(finalValidationStatus)
+  );
+
+  if (["REJECTED", "SUSPENDED", "PENDING_VERIFICATION"].includes(finalValidationStatus)) {
+    finalIsActive = false;
+  }
+
+  const ccResult = await pool.query(
+    `
+    SELECT id, code, name
+    FROM control_centers
+    WHERE code = $1
+    `,
+    [control_center_code]
+  );
+
+  if (ccResult.rows.length === 0) {
+    throw new Error(`Unknown control_center_code: ${control_center_code}`);
+  }
+
+  const controlCenter = ccResult.rows[0];
+  const cleanPhone = normalizePhoneForAuth(phone);
+
+  const existingResult = await pool.query(
+    `
+    SELECT *
+    FROM users
+    WHERE phone = $1
+    ORDER BY created_at DESC
+    LIMIT 1
+    `,
+    [cleanPhone]
+  );
+
+  let user;
+  let operation;
+
+  if (existingResult.rows.length > 0) {
+    const updateResult = await pool.query(
+      `
+      UPDATE users
+      SET
+        control_center_id = $1,
+        role = $2,
+        validation_status = $3,
+        is_active = $4,
+        full_name = $5,
+        rut = $6,
+        email = $7,
+        declared_address = $8,
+        latitude = $9,
+        longitude = $10,
+        updated_at = NOW()
+      WHERE id = $11
+      RETURNING *
+      `,
+      [
+        controlCenter.id,
+        role,
+        finalValidationStatus,
+        finalIsActive,
+        full_name,
+        rut || null,
+        email || null,
+        declared_address || null,
+        latitude ?? null,
+        longitude ?? null,
+        existingResult.rows[0].id
+      ]
+    );
+
+    user = updateResult.rows[0];
+    operation = "updated";
+  } else {
+    const insertResult = await pool.query(
+      `
+      INSERT INTO users (
+        control_center_id,
+        role,
+        validation_status,
+        is_active,
+        full_name,
+        rut,
+        phone,
+        email,
+        declared_address,
+        latitude,
+        longitude
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING *
+      `,
+      [
+        controlCenter.id,
+        role,
+        finalValidationStatus,
+        finalIsActive,
+        full_name,
+        rut || null,
+        cleanPhone,
+        email || null,
+        declared_address || null,
+        latitude ?? null,
+        longitude ?? null
+      ]
+    );
+
+    user = insertResult.rows[0];
+    operation = "created";
+  }
+
+  if (Array.isArray(emergency_contacts)) {
+    await pool.query(
+      `DELETE FROM emergency_contacts WHERE user_id = $1`,
+      [user.id]
+    );
+
+    for (const [index, contact] of emergency_contacts.entries()) {
+      if (!contact.name || !contact.phone) continue;
+
+      await pool.query(
+        `
+        INSERT INTO emergency_contacts (
+          user_id,
+          name,
+          relationship,
+          phone,
+          priority
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        `,
+        [
+          user.id,
+          contact.name,
+          contact.relationship || null,
+          normalizePhoneForAuth(contact.phone),
+          contact.priority || index + 1
+        ]
+      );
+    }
+  }
+
+  return {
+    operation,
+    user,
+    control_center: controlCenter
+  };
+}
+
 app.get("/admin/users", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
 
@@ -4978,6 +5171,89 @@ app.get("/admin/users", async (req, res) => {
 
   } catch (error) {
     console.error("[ADMIN USERS ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
+app.post("/admin/users", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const result = await adminCreateOrUpdateUser(req.body || {});
+
+    res.json({
+      status: "ok",
+      message: result.operation === "created" ? "User created" : "User updated",
+      operation: result.operation,
+      user: result.user
+    });
+  } catch (error) {
+    console.error("[ADMIN CREATE USER ERROR]", error);
+    res.status(400).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/admin/users/bulk", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const users = Array.isArray(req.body.users)
+      ? req.body.users
+      : [];
+
+    if (users.length === 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "users must be a non-empty array"
+      });
+    }
+
+    if (users.length > 200) {
+      return res.status(400).json({
+        status: "error",
+        message: "Bulk user creation is limited to 200 users per request"
+      });
+    }
+
+    const results = [];
+
+    for (const [index, userPayload] of users.entries()) {
+      try {
+        const result = await adminCreateOrUpdateUser(userPayload);
+        results.push({
+          index,
+          status: "ok",
+          operation: result.operation,
+          user: result.user
+        });
+      } catch (error) {
+        results.push({
+          index,
+          status: "error",
+          message: error.message,
+          input: userPayload
+        });
+      }
+    }
+
+    res.json({
+      status: "ok",
+      total: results.length,
+      created: results.filter(r => r.operation === "created").length,
+      updated: results.filter(r => r.operation === "updated").length,
+      failed: results.filter(r => r.status === "error").length,
+      results
+    });
+
+  } catch (error) {
+    console.error("[ADMIN BULK USERS ERROR]", error);
     res.status(500).json({
       status: "error",
       message: error.message
@@ -5099,6 +5375,11 @@ app.post("/admin/users/:id/validation", async (req, res) => {
       UPDATE users
       SET
         validation_status = $1,
+        is_active = CASE
+          WHEN $1 IN ('REJECTED', 'SUSPENDED', 'PENDING_VERIFICATION') THEN false
+          WHEN $1 IN ('VALIDATED', 'PROVISIONAL_ACTIVE') THEN true
+          ELSE is_active
+        END,
         updated_at = NOW()
       WHERE id = $2
       RETURNING id, full_name, phone, role, validation_status, is_active, updated_at
@@ -5196,8 +5477,7 @@ app.post("/admin/users/:id/active", async (req, res) => {
       SET
         is_active = $1,
         validation_status = CASE
-          WHEN $1 = false THEN 'SUSPENDED'
-          WHEN validation_status = 'SUSPENDED' AND $1 = true THEN 'PROVISIONAL_ACTIVE'
+          WHEN $1 = true AND validation_status = 'SUSPENDED' THEN 'PROVISIONAL_ACTIVE'
           ELSE validation_status
         END,
         updated_at = NOW()
