@@ -899,6 +899,254 @@ async function syncMobileEventStateFromTicket(ticketId, mobileState) {
 
 
 
+const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
+const OTP_LENGTH = Number(process.env.OTP_LENGTH || 6);
+const OTP_DEMO_MODE = process.env.OTP_DEMO_MODE !== "false";
+const OTP_DEFAULT_CHANNEL = process.env.OTP_DEFAULT_CHANNEL || "demo";
+
+let authOtpTableReady = false;
+
+function normalizePhoneForAuth(phone) {
+  return String(phone || "").trim().replace(/\s+/g, "");
+}
+
+function generateOtpCode() {
+  const digits = Math.max(4, Math.min(8, OTP_LENGTH));
+  const min = 10 ** (digits - 1);
+  const max = 10 ** digits - 1;
+  return String(crypto.randomInt(min, max + 1));
+}
+
+function hashOtpCode(phone, code) {
+  return crypto
+    .createHash("sha256")
+    .update(`${normalizePhoneForAuth(phone)}:${code}:${process.env.OTP_HASH_SECRET || TOKEN}`)
+    .digest("hex");
+}
+
+function resolveOtpChannel(channel, email) {
+  const requested = String(channel || OTP_DEFAULT_CHANNEL || "demo").toLowerCase();
+
+  if (["sms", "whatsapp", "email", "demo"].includes(requested)) {
+    if (requested === "email" && !email) return "demo";
+    return requested;
+  }
+
+  return email ? "email" : "demo";
+}
+
+async function ensureAuthOtpTable() {
+  if (authOtpTableReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS auth_otps (
+      id BIGSERIAL PRIMARY KEY,
+      phone TEXT NOT NULL,
+      email TEXT,
+      channel TEXT NOT NULL,
+      purpose TEXT NOT NULL DEFAULT 'LOGIN',
+      code_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      expires_at TIMESTAMPTZ NOT NULL,
+      consumed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      metadata JSONB DEFAULT '{}'::jsonb
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_auth_otps_phone_created
+    ON auth_otps(phone, created_at DESC)
+  `);
+
+  authOtpTableReady = true;
+}
+
+async function sendOtpByWebhook({ url, token, payload }) {
+  if (!url) return { sent: false, reason: "webhook_not_configured" };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const text = await response.text();
+
+  return {
+    sent: response.ok,
+    status: response.status,
+    response: text
+  };
+}
+
+async function deliverOtpCode({ phone, email, channel, code, purpose }) {
+  const message = `Tu código SOS Municipal es ${code}. Vigencia ${OTP_TTL_MINUTES} minutos.`;
+  const token = process.env.OTP_WEBHOOK_TOKEN || "";
+  let result = { sent: false, channel, reason: "demo_mode_or_not_configured" };
+
+  try {
+    if (channel === "sms") {
+      result = await sendOtpByWebhook({
+        url: process.env.OTP_SMS_WEBHOOK_URL,
+        token,
+        payload: { to: phone, text: message, code, purpose }
+      });
+    } else if (channel === "whatsapp") {
+      result = await sendOtpByWebhook({
+        url: process.env.OTP_WHATSAPP_WEBHOOK_URL,
+        token,
+        payload: { to: phone, text: message, code, purpose }
+      });
+    } else if (channel === "email") {
+      result = await sendOtpByWebhook({
+        url: process.env.OTP_EMAIL_WEBHOOK_URL,
+        token,
+        payload: {
+          to: email,
+          subject: "Código SOS Municipal",
+          text: message,
+          code,
+          purpose
+        }
+      });
+    }
+  } catch (error) {
+    console.error("[OTP DELIVERY ERROR]", error.message);
+    result = { sent: false, channel, error: error.message };
+  }
+
+  if (!result.sent || OTP_DEMO_MODE) {
+    console.log("[OTP DEMO CODE]", {
+      phone,
+      email: email || null,
+      channel,
+      purpose,
+      code,
+      expires_minutes: OTP_TTL_MINUTES
+    });
+  }
+
+  return result;
+}
+
+async function createAndSendOtp({ phone, email = null, channel = null, purpose = "LOGIN", metadata = {} }) {
+  await ensureAuthOtpTable();
+
+  const cleanPhone = normalizePhoneForAuth(phone);
+  const selectedChannel = resolveOtpChannel(channel, email);
+  const code = generateOtpCode();
+  const codeHash = hashOtpCode(cleanPhone, code);
+
+  await pool.query(
+    `
+    INSERT INTO auth_otps (
+      phone,
+      email,
+      channel,
+      purpose,
+      code_hash,
+      expires_at,
+      metadata
+    )
+    VALUES ($1,$2,$3,$4,$5,NOW() + ($6 || ' minutes')::interval,$7)
+    `,
+    [
+      cleanPhone,
+      email || null,
+      selectedChannel,
+      purpose,
+      codeHash,
+      String(OTP_TTL_MINUTES),
+      JSON.stringify(metadata || {})
+    ]
+  );
+
+  const delivery = await deliverOtpCode({
+    phone: cleanPhone,
+    email,
+    channel: selectedChannel,
+    code,
+    purpose
+  });
+
+  return {
+    channel: selectedChannel,
+    delivery,
+    demo_code: OTP_DEMO_MODE ? code : undefined,
+    expires_minutes: OTP_TTL_MINUTES
+  };
+}
+
+async function verifyOtpForPhone({ phone, code, purpose = null }) {
+  await ensureAuthOtpTable();
+
+  const cleanPhone = normalizePhoneForAuth(phone);
+  const codeHash = hashOtpCode(cleanPhone, String(code || "").trim());
+
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM auth_otps
+    WHERE phone = $1
+      AND consumed_at IS NULL
+      AND expires_at > NOW()
+      ${purpose ? "AND purpose = $2" : ""}
+    ORDER BY created_at DESC
+    LIMIT 1
+    `,
+    purpose ? [cleanPhone, purpose] : [cleanPhone]
+  );
+
+  if (result.rows.length === 0) {
+    return { ok: false, reason: "invalid_or_expired" };
+  }
+
+  const otp = result.rows[0];
+
+  if (otp.attempts >= 5) {
+    return { ok: false, reason: "too_many_attempts" };
+  }
+
+  if (otp.code_hash !== codeHash) {
+    await pool.query(
+      `UPDATE auth_otps SET attempts = attempts + 1 WHERE id = $1`,
+      [otp.id]
+    );
+
+    return { ok: false, reason: "invalid_or_expired" };
+  }
+
+  await pool.query(
+    `UPDATE auth_otps SET consumed_at = NOW() WHERE id = $1`,
+    [otp.id]
+  );
+
+  return { ok: true, otp };
+}
+
+function publicUserPayload(user, controlCenter = null) {
+  return {
+    id: user.id,
+    control_center_id: user.control_center_id,
+    control_center_code: user.control_center_code || controlCenter?.code || null,
+    control_center_name: user.control_center_name || controlCenter?.name || null,
+    role: user.role,
+    validation_status: user.validation_status,
+    full_name: user.full_name,
+    phone: user.phone,
+    rut: user.rut,
+    email: user.email,
+    declared_address: user.declared_address,
+    latitude: user.latitude,
+    longitude: user.longitude
+  };
+}
+
+
 app.get("/debug/physical-buttons", (req, res) => {
   res.json({
     status: "ok",
@@ -2038,7 +2286,8 @@ app.post("/auth/register", async (req, res) => {
       declared_address,
       latitude,
       longitude,
-      emergency_contacts
+      emergency_contacts,
+      otp_channel
     } = req.body;
 
     if (!control_center_code) {
@@ -2048,10 +2297,10 @@ app.post("/auth/register", async (req, res) => {
       });
     }
 
-    if (!full_name || !phone) {
+    if (!full_name || !phone || !declared_address) {
       return res.status(400).json({
         status: "error",
-        message: "full_name and phone are required"
+        message: "full_name, phone and declared_address are required"
       });
     }
 
@@ -2072,7 +2321,7 @@ app.post("/auth/register", async (req, res) => {
     }
 
     const controlCenter = ccResult.rows[0];
-    const cleanPhone = String(phone).trim().replace(/\s+/g, "");
+    const cleanPhone = normalizePhoneForAuth(phone);
 
     const existingResult = await pool.query(
       `
@@ -2204,25 +2453,29 @@ app.post("/auth/register", async (req, res) => {
       );
     }
 
+    const otp = await createAndSendOtp({
+      phone: cleanPhone,
+      email: email || null,
+      channel: otp_channel || null,
+      purpose: "REGISTER",
+      metadata: {
+        user_id: user.id,
+        operation,
+        control_center_code: controlCenter.code
+      }
+    });
+
     res.json({
       status: "ok",
-      message: operation === "created" ? "User registered" : "User updated",
+      message: operation === "created"
+        ? "User registered. Verification code sent."
+        : "User updated. Verification code sent.",
       operation,
-      user: {
-        id: user.id,
-        control_center_id: user.control_center_id,
-        control_center_code: controlCenter.code,
-        control_center_name: controlCenter.name,
-        role: user.role,
-        validation_status: user.validation_status,
-        full_name: user.full_name,
-        phone: user.phone,
-        rut: user.rut,
-        email: user.email,
-        declared_address: user.declared_address,
-        latitude: user.latitude,
-        longitude: user.longitude
-      }
+      requires_verification: true,
+      otp_channel: otp.channel,
+      otp_expires_minutes: otp.expires_minutes,
+      ...(otp.demo_code ? { demo_code: otp.demo_code } : {}),
+      user: publicUserPayload(user, controlCenter)
     });
 
   } catch (error) {
@@ -2230,9 +2483,175 @@ app.post("/auth/register", async (req, res) => {
 
     res.status(500).json({
       status: "error",
-      message: "Database error registering user"
+      message: error.message || "Database error registering user"
     });
   }
+});
+
+app.post("/auth/request-code", async (req, res) => {
+  try {
+    const {
+      phone,
+      channel,
+      purpose = "LOGIN"
+    } = req.body;
+
+    const cleanPhone = normalizePhoneForAuth(phone);
+
+    if (!cleanPhone) {
+      return res.status(400).json({
+        status: "error",
+        message: "phone is required"
+      });
+    }
+
+    const userResult = await pool.query(
+      `
+      SELECT
+        u.*,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.phone = $1
+        AND u.is_active = true
+      ORDER BY u.created_at DESC
+      LIMIT 1
+      `,
+      [cleanPhone]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Usuario no encontrado. Debe registrarse primero."
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    if (user.role !== "NEIGHBOR") {
+      return res.status(403).json({
+        status: "error",
+        message: "Este acceso es solo para vecinos."
+      });
+    }
+
+    const otp = await createAndSendOtp({
+      phone: cleanPhone,
+      email: user.email || null,
+      channel: channel || null,
+      purpose,
+      metadata: {
+        user_id: user.id,
+        control_center_code: user.control_center_code
+      }
+    });
+
+    res.json({
+      status: "ok",
+      message: "Código enviado",
+      otp_channel: otp.channel,
+      otp_expires_minutes: otp.expires_minutes,
+      ...(otp.demo_code ? { demo_code: otp.demo_code } : {})
+    });
+
+  } catch (error) {
+    console.error("[AUTH REQUEST CODE ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message || "Error requesting verification code"
+    });
+  }
+});
+
+app.post("/auth/verify-code", async (req, res) => {
+  try {
+    const {
+      phone,
+      code,
+      purpose = null
+    } = req.body;
+
+    const cleanPhone = normalizePhoneForAuth(phone);
+
+    if (!cleanPhone || !code) {
+      return res.status(400).json({
+        status: "error",
+        message: "phone and code are required"
+      });
+    }
+
+    const verification = await verifyOtpForPhone({
+      phone: cleanPhone,
+      code,
+      purpose
+    });
+
+    if (!verification.ok) {
+      return res.status(401).json({
+        status: "error",
+        message: verification.reason === "too_many_attempts"
+          ? "Demasiados intentos. Solicita un nuevo código."
+          : "Código inválido o expirado."
+      });
+    }
+
+    const userResult = await pool.query(
+      `
+      SELECT
+        u.*,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.phone = $1
+        AND u.is_active = true
+      ORDER BY u.created_at DESC
+      LIMIT 1
+      `,
+      [cleanPhone]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    if (user.role !== "NEIGHBOR") {
+      return res.status(403).json({
+        status: "error",
+        message: "Este acceso es solo para vecinos."
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Código verificado",
+      token: `otp-token-${user.id}`,
+      user: publicUserPayload(user)
+    });
+
+  } catch (error) {
+    console.error("[AUTH VERIFY CODE ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: error.message || "Error verifying code"
+    });
+  }
+});
+
+app.post("/auth/logout", async (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Logged out"
+  });
 });
 
 app.post("/auth/login-demo", async (req, res) => {
