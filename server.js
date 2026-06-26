@@ -259,6 +259,267 @@ function allowedRolesForPanel(panelType) {
   return ["OPERATOR", "ADMIN"];
 }
 
+
+/*
+   =========================================================
+   MUNICIPAL GEOFENCING / JURISDICTION
+   =========================================================
+
+   Cada centro de control puede tener un polígono GeoJSON oficial.
+   Un SOS móvil de vecino solo se transforma en ticket operacional
+   si cae dentro del polígono de su centro de control, con un buffer
+   configurable para tolerancia GPS cerca del límite comunal.
+*/
+
+let geofenceSchemaReady = false;
+
+async function ensureGeofenceSchema() {
+  if (geofenceSchemaReady) return;
+
+  await pool.query(`
+    ALTER TABLE control_centers
+      ADD COLUMN IF NOT EXISTS boundary_geojson JSONB,
+      ADD COLUMN IF NOT EXISTS geofence_buffer_meters INTEGER DEFAULT 100,
+      ADD COLUMN IF NOT EXISTS map_center_lat DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS map_center_lon DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS map_zoom INTEGER DEFAULT 13
+  `);
+
+  await pool.query(`
+    ALTER TABLE tickets
+      ADD COLUMN IF NOT EXISTS jurisdiction_status TEXT DEFAULT 'IN_JURISDICTION',
+      ADD COLUMN IF NOT EXISTS jurisdiction_reason TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE mobile_events
+      ADD COLUMN IF NOT EXISTS jurisdiction_status TEXT DEFAULT 'IN_JURISDICTION',
+      ADD COLUMN IF NOT EXISTS jurisdiction_reason TEXT
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_tickets_cc_jurisdiction
+    ON tickets(control_center_id, jurisdiction_status, created_at DESC)
+  `);
+
+  geofenceSchemaReady = true;
+}
+
+function normalizeGeoJsonGeometry(input) {
+  if (!input) return null;
+  if (input.type === 'Feature') return normalizeGeoJsonGeometry(input.geometry);
+  if (input.type === 'FeatureCollection') {
+    const first = (input.features || []).find(f => f && f.geometry);
+    return first ? normalizeGeoJsonGeometry(first.geometry) : null;
+  }
+  if (input.type === 'Polygon' || input.type === 'MultiPolygon') return input;
+  return null;
+}
+
+function pointInRing(lon, lat, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = Number(ring[i][0]);
+    const yi = Number(ring[i][1]);
+    const xj = Number(ring[j][0]);
+    const yj = Number(ring[j][1]);
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lon < (xj - xi) * (lat - yi) / ((yj - yi) || 1e-12) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function pointInPolygonCoordinates(lon, lat, polygon) {
+  if (!Array.isArray(polygon) || !polygon.length) return false;
+  if (!pointInRing(lon, lat, polygon[0])) return false;
+  for (let i = 1; i < polygon.length; i++) {
+    if (pointInRing(lon, lat, polygon[i])) return false;
+  }
+  return true;
+}
+
+function pointInGeoJson(lon, lat, geometry) {
+  const geo = normalizeGeoJsonGeometry(geometry);
+  if (!geo) return null;
+  if (geo.type === 'Polygon') return pointInPolygonCoordinates(lon, lat, geo.coordinates);
+  if (geo.type === 'MultiPolygon') return geo.coordinates.some(poly => pointInPolygonCoordinates(lon, lat, poly));
+  return null;
+}
+
+function toMeters(lon, lat, refLat) {
+  const R = 6371000;
+  const x = (lon * Math.PI / 180) * R * Math.cos(refLat * Math.PI / 180);
+  const y = (lat * Math.PI / 180) * R;
+  return [x, y];
+}
+
+function distancePointToSegmentMeters(lon, lat, lon1, lat1, lon2, lat2) {
+  const refLat = lat;
+  const [px, py] = toMeters(lon, lat, refLat);
+  const [ax, ay] = toMeters(lon1, lat1, refLat);
+  const [bx, by] = toMeters(lon2, lat2, refLat);
+  const dx = bx - ax;
+  const dy = by - ay;
+  if (dx === 0 && dy === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)));
+  const cx = ax + t * dx;
+  const cy = ay + t * dy;
+  return Math.hypot(px - cx, py - cy);
+}
+
+function minDistanceToRingMeters(lon, lat, ring) {
+  let min = Infinity;
+  for (let i = 1; i < ring.length; i++) {
+    const a = ring[i - 1];
+    const b = ring[i];
+    const d = distancePointToSegmentMeters(lon, lat, Number(a[0]), Number(a[1]), Number(b[0]), Number(b[1]));
+    if (d < min) min = d;
+  }
+  return min;
+}
+
+function minDistanceToGeoJsonMeters(lon, lat, geometry) {
+  const geo = normalizeGeoJsonGeometry(geometry);
+  if (!geo) return null;
+  const polygons = geo.type === 'Polygon' ? [geo.coordinates] : geo.coordinates;
+  let min = Infinity;
+  for (const polygon of polygons) {
+    for (const ring of polygon) {
+      const d = minDistanceToRingMeters(lon, lat, ring);
+      if (d < min) min = d;
+    }
+  }
+  return Number.isFinite(min) ? min : null;
+}
+
+function getGeoJsonBounds(geometry) {
+  const geo = normalizeGeoJsonGeometry(geometry);
+  if (!geo) return null;
+  const coords = [];
+  const polygons = geo.type === 'Polygon' ? [geo.coordinates] : geo.coordinates;
+  polygons.forEach(poly => poly.forEach(ring => ring.forEach(c => coords.push(c))));
+  if (!coords.length) return null;
+  let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
+  coords.forEach(c => {
+    const lon = Number(c[0]);
+    const lat = Number(c[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    minLon = Math.min(minLon, lon); maxLon = Math.max(maxLon, lon);
+    minLat = Math.min(minLat, lat); maxLat = Math.max(maxLat, lat);
+  });
+  if (!Number.isFinite(minLat)) return null;
+  return { minLon, minLat, maxLon, maxLat, centerLat: (minLat + maxLat) / 2, centerLon: (minLon + maxLon) / 2 };
+}
+
+function evaluateJurisdiction(controlCenter, latitude, longitude) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return { valid: false, status: 'INVALID_LOCATION', reason: 'Ubicación inválida' };
+  }
+
+  const boundary = normalizeGeoJsonGeometry(controlCenter?.boundary_geojson);
+  if (!boundary) {
+    // Mientras no se cargue polígono, no bloqueamos. Se marca como no verificado.
+    return { valid: true, status: 'NO_GEOFENCE_CONFIGURED', reason: 'Centro de control sin polígono configurado' };
+  }
+
+  const inside = pointInGeoJson(lon, lat, boundary);
+  if (inside === true) {
+    return { valid: true, status: 'IN_JURISDICTION', reason: 'Dentro del límite comunal' };
+  }
+
+  const buffer = Math.max(0, Number(controlCenter?.geofence_buffer_meters || 0));
+  const distance = minDistanceToGeoJsonMeters(lon, lat, boundary);
+  if (distance != null && distance <= buffer) {
+    return {
+      valid: true,
+      status: 'IN_JURISDICTION_BUFFER',
+      reason: `Dentro de tolerancia GPS (${Math.round(distance)} m del límite comunal)`,
+      distance_meters: Math.round(distance)
+    };
+  }
+
+  return {
+    valid: false,
+    status: 'OUT_OF_JURISDICTION',
+    reason: `Evento fuera del territorio autorizado del centro de control${distance != null ? ` (${Math.round(distance)} m del límite)` : ''}`,
+    distance_meters: distance == null ? null : Math.round(distance)
+  };
+}
+
+app.get('/admin/control-centers/:code/geofence', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    await ensureGeofenceSchema();
+    const result = await pool.query(`
+      SELECT id, code, name, latitude, longitude, boundary_geojson,
+             geofence_buffer_meters, map_center_lat, map_center_lon, map_zoom
+      FROM control_centers
+      WHERE code = $1
+      LIMIT 1
+    `, [req.params.code]);
+    if (!result.rows.length) return res.status(404).json({ status: 'error', message: 'Unknown control center' });
+    res.json({ status: 'ok', control_center: result.rows[0] });
+  } catch (error) {
+    console.error('[GET GEOFENCE ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/admin/control-centers/:code/geofence', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    await ensureGeofenceSchema();
+    const boundary = normalizeGeoJsonGeometry(req.body.boundary_geojson || req.body.geojson || req.body);
+    if (!boundary) {
+      return res.status(400).json({ status: 'error', message: 'Debes enviar un GeoJSON Polygon, MultiPolygon, Feature o FeatureCollection' });
+    }
+    const bounds = getGeoJsonBounds(boundary);
+    const buffer = Math.max(0, Number(req.body.geofence_buffer_meters ?? 100));
+    const mapZoom = Math.max(8, Math.min(18, Number(req.body.map_zoom || 13)));
+    const centerLat = Number(req.body.map_center_lat ?? bounds?.centerLat);
+    const centerLon = Number(req.body.map_center_lon ?? bounds?.centerLon);
+
+    const result = await pool.query(`
+      UPDATE control_centers
+      SET boundary_geojson = $2::jsonb,
+          geofence_buffer_meters = $3,
+          map_center_lat = $4,
+          map_center_lon = $5,
+          map_zoom = $6
+      WHERE code = $1
+      RETURNING id, code, name, latitude, longitude, boundary_geojson,
+                geofence_buffer_meters, map_center_lat, map_center_lon, map_zoom
+    `, [req.params.code, JSON.stringify(boundary), buffer, centerLat, centerLon, mapZoom]);
+
+    if (!result.rows.length) return res.status(404).json({ status: 'error', message: 'Unknown control center' });
+    res.json({ status: 'ok', message: 'Geofence updated', control_center: result.rows[0], bounds });
+  } catch (error) {
+    console.error('[SET GEOFENCE ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/debug/geofence/check', async (req, res) => {
+  try {
+    await ensureGeofenceSchema();
+    const code = req.body.control_center_code || 'CC-VINA';
+    const ccResult = await pool.query(`
+      SELECT id, code, name, boundary_geojson, geofence_buffer_meters
+      FROM control_centers
+      WHERE code = $1
+      LIMIT 1
+    `, [code]);
+    if (!ccResult.rows.length) return res.status(404).json({ status: 'error', message: 'Unknown control center' });
+    const result = evaluateJurisdiction(ccResult.rows[0], req.body.latitude, req.body.longitude);
+    res.json({ status: 'ok', control_center_code: code, jurisdiction: result });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
 /*
    =========================================================
    PHYSICAL SOS BUTTON REGISTRY
@@ -1906,7 +2167,13 @@ app.post("/public/mobile/sos", async (req, res) => {
         u.full_name,
         u.phone,
         u.declared_address,
-        cc.code AS control_center_code
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+        cc.boundary_geojson,
+        cc.geofence_buffer_meters,
+        cc.map_center_lat,
+        cc.map_center_lon,
+        cc.map_zoom
       FROM users u
       LEFT JOIN control_centers cc ON cc.id = u.control_center_id
       WHERE u.id = $1
@@ -1944,6 +2211,69 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    await ensureGeofenceSchema();
+    const jurisdiction = evaluateJurisdiction(citizen, Number(latitude), Number(longitude));
+
+    if (!jurisdiction.valid) {
+      await pool.query(
+        `
+        UPDATE mobile_events
+        SET
+          state = 'CANCELLED',
+          cancelled = true,
+          cancelled_at = NOW(),
+          updated_at = NOW()
+        WHERE user_id = $1
+          AND state = 'ACTIVE'
+        `,
+        [user_id]
+      );
+
+      const rejectedEventId = `MOBILE-SOS-${user_id}-${Date.now()}`;
+      const rejectedEvent = await pool.query(
+        `
+        INSERT INTO mobile_events (
+          id,
+          user_id,
+          name,
+          phone,
+          latitude,
+          longitude,
+          accuracy,
+          battery,
+          state,
+          acknowledged,
+          cancelled,
+          jurisdiction_status,
+          jurisdiction_reason
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'OUT_OF_JURISDICTION',false,true,$9,$10)
+        RETURNING *
+        `,
+        [
+          rejectedEventId,
+          user_id,
+          citizen.full_name || name || "Usuario movil",
+          citizen.phone || phone || null,
+          Number(latitude),
+          Number(longitude),
+          accuracy ?? null,
+          battery ?? null,
+          jurisdiction.status,
+          jurisdiction.reason
+        ]
+      );
+
+      return res.status(422).json({
+        status: "out_of_jurisdiction",
+        message: "Tu alerta fue recibida, pero estás fuera del territorio cubierto por tu Municipalidad. En caso de emergencia real, contacta a los servicios de emergencia locales.",
+        event_id: rejectedEvent.rows[0].id,
+        ticket_id: null,
+        jurisdiction,
+        user: publicUserPayload(citizen)
+      });
+    }
+
     await pool.query(
       `
       UPDATE mobile_events
@@ -1973,9 +2303,11 @@ app.post("/public/mobile/sos", async (req, res) => {
         battery,
         state,
         acknowledged,
-        cancelled
+        cancelled,
+        jurisdiction_status,
+        jurisdiction_reason
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',false,false)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',false,false,$9,$10)
       RETURNING *
       `,
       [
@@ -1986,7 +2318,9 @@ app.post("/public/mobile/sos", async (req, res) => {
         Number(latitude),
         Number(longitude),
         accuracy ?? null,
-        battery ?? null
+        battery ?? null,
+        jurisdiction.status,
+        jurisdiction.reason
       ]
     );
 
@@ -2027,9 +2361,22 @@ app.post("/public/mobile/sos", async (req, res) => {
         confidence: normalizedAlert.confidence,
         control_center_code: citizen.control_center_code || control_center_code,
         citizen_validation_status: citizen.validation_status,
-        anonymous_user_id: user_id
+        anonymous_user_id: user_id,
+        jurisdiction_status: jurisdiction.status,
+        jurisdiction_reason: jurisdiction.reason,
+        jurisdiction_distance_meters: jurisdiction.distance_meters ?? null
       }
     });
+
+    await pool.query(
+      `
+      UPDATE tickets
+      SET jurisdiction_status = $2,
+          jurisdiction_reason = $3
+      WHERE id = $1
+      `,
+      [ticket.id, jurisdiction.status, jurisdiction.reason]
+    );
 
     console.log("[MOBILE SOS DB]", event);
 
@@ -4448,6 +4795,7 @@ app.get("/tickets/:id/notes", async (req, res) => {
 
 app.get("/dashboard/summary", async (req, res) => {
   try {
+    await ensureGeofenceSchema();
     const { control_center_code } = req.query;
 
     if (!control_center_code) {
@@ -4531,12 +4879,20 @@ app.get("/dashboard/analytics", async (req, res) => {
   if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al dashboard")) return;
 
   try {
+    await ensureGeofenceSchema();
     const days = Math.max(1, Math.min(365, Number(req.query.days || 30)));
     const requestedCode = req.query.control_center_code || req.panel_session?.control_center_code || "CC-VINA";
 
     const ccResult = await pool.query(
       `
-      SELECT id, code, name, latitude, longitude
+      SELECT id, code, name,
+             COALESCE(map_center_lat, latitude) AS latitude,
+             COALESCE(map_center_lon, longitude) AS longitude,
+             boundary_geojson,
+             geofence_buffer_meters,
+             map_center_lat,
+             map_center_lon,
+             map_zoom
       FROM control_centers
       WHERE code = $1
       LIMIT 1
@@ -4579,6 +4935,8 @@ app.get("/dashboard/analytics", async (req, res) => {
         COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')::int AS tickets_last_24h,
         COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS tickets_last_7d,
         COUNT(*) FILTER (WHERE priority <= 2)::int AS tickets_high_priority,
+        COUNT(*) FILTER (WHERE COALESCE(jurisdiction_status, 'IN_JURISDICTION') = 'OUT_OF_JURISDICTION')::int AS tickets_out_of_jurisdiction,
+        COUNT(*) FILTER (WHERE COALESCE(jurisdiction_status, 'IN_JURISDICTION') = 'IN_JURISDICTION_BUFFER')::int AS tickets_near_boundary,
         ROUND(AVG(EXTRACT(EPOCH FROM (acknowledged_at - created_at)) / 60.0) FILTER (WHERE acknowledged_at IS NOT NULL)::numeric, 1) AS avg_ack_minutes,
         ROUND(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at)) / 60.0) FILTER (WHERE assigned_at IS NOT NULL)::numeric, 1) AS avg_assign_minutes,
         ROUND(AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 60.0) FILTER (WHERE resolved_at IS NOT NULL)::numeric, 1) AS avg_resolve_minutes,
@@ -4997,9 +5355,12 @@ app.get("/dashboard/analytics", async (req, res) => {
       },
       geo: {
         center: {
-          latitude: controlCenter.latitude,
-          longitude: controlCenter.longitude
+          latitude: controlCenter.map_center_lat || controlCenter.latitude,
+          longitude: controlCenter.map_center_lon || controlCenter.longitude
         },
+        boundary_geojson: controlCenter.boundary_geojson || null,
+        geofence_buffer_meters: controlCenter.geofence_buffer_meters || 0,
+        map_zoom: controlCenter.map_zoom || 13,
         event_points: geoTicketsResult.rows.map((row) => ({
           ...row,
           latitude: row.latitude == null ? null : Number(row.latitude),
@@ -5045,7 +5406,14 @@ app.get("/dashboard/map-state", async (req, res) => {
 
     const ccResult = await pool.query(
       `
-      SELECT id, code, name, latitude, longitude
+      SELECT id, code, name,
+             COALESCE(map_center_lat, latitude) AS latitude,
+             COALESCE(map_center_lon, longitude) AS longitude,
+             boundary_geojson,
+             geofence_buffer_meters,
+             map_center_lat,
+             map_center_lon,
+             map_zoom
       FROM control_centers
       WHERE code = $1
       `,
