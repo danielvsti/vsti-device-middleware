@@ -1059,62 +1059,150 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-async function autoAssignResolver(ticket) {
-  if (!ticket.latitude || !ticket.longitude) {
+async function autoAssignResolver(ticket, options = {}) {
+  const force = options.force === true;
+
+  if (!ticket || !ticket.id) {
     return null;
   }
 
-  const result = await pool.query(
-    `
-    SELECT
-      u.id,
-      u.full_name,
-      rl.latitude,
-      rl.longitude,
-      rl.status
-    FROM resolver_locations rl
-    JOIN users u ON u.id = rl.user_id
-    WHERE rl.control_center_id = $1
-      AND rl.status = 'AVAILABLE'
-      AND u.role = 'RESOLVER'
-      AND u.is_active = true
-    `,
-    [ticket.control_center_id]
-  );
+  if (!force && ticket.assigned_resolver_id) {
+    return {
+      ticket,
+      resolver: null,
+      skipped: true,
+      reason: "Ticket ya tenía resolutor asignado"
+    };
+  }
 
-  if (result.rows.length === 0) {
+  if (ticket.latitude == null || ticket.longitude == null) {
     await pool.query(
       `
       INSERT INTO ticket_actions (
         ticket_id,
         actor_role,
         action_type,
-        description
+        description,
+        metadata
       )
-      VALUES ($1,'SYSTEM','NO_RESOLVER_AVAILABLE',$2)
+      VALUES ($1,'SYSTEM','AUTO_ASSIGN_SKIPPED',$2,$3)
       `,
       [
         ticket.id,
-        "No hay resolutores disponibles para asignación automática"
+        "No se pudo asignar automáticamente: ticket sin coordenadas",
+        JSON.stringify({ reason: "MISSING_TICKET_LOCATION" })
+      ]
+    );
+    return null;
+  }
+
+  const candidateResult = await pool.query(
+    `
+    SELECT
+      u.id,
+      u.full_name,
+      u.phone,
+      u.role,
+      u.is_active,
+      u.validation_status,
+      u.control_center_id,
+      rl.latitude,
+      rl.longitude,
+      rl.status,
+      rl.updated_at,
+      CASE
+        WHEN rl.updated_at IS NULL THEN NULL
+        ELSE EXTRACT(EPOCH FROM (NOW() - rl.updated_at))
+      END AS location_age_seconds
+    FROM users u
+    LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+    WHERE u.control_center_id = $1
+      AND u.role = 'RESOLVER'
+    `,
+    [ticket.control_center_id]
+  );
+
+  const maxAgeSeconds = Number(process.env.AUTO_ASSIGN_MAX_LOCATION_AGE_SECONDS || 0);
+
+  const candidates = candidateResult.rows.map((resolver) => {
+    const lat = Number(resolver.latitude);
+    const lon = Number(resolver.longitude);
+    const age = resolver.location_age_seconds == null ? null : Number(resolver.location_age_seconds);
+    const hasLocation = Number.isFinite(lat) && Number.isFinite(lon);
+    const isStale = maxAgeSeconds > 0 && age != null && age > maxAgeSeconds;
+
+    const rejection_reasons = [];
+    if (resolver.is_active !== true) rejection_reasons.push("USER_INACTIVE");
+    if (String(resolver.status || "").toUpperCase() !== "AVAILABLE") rejection_reasons.push(`STATUS_${resolver.status || "NO_STATUS"}`);
+    if (!hasLocation) rejection_reasons.push("NO_LOCATION");
+    if (isStale) rejection_reasons.push("STALE_LOCATION");
+
+    return {
+      ...resolver,
+      latitude: hasLocation ? lat : null,
+      longitude: hasLocation ? lon : null,
+      location_age_seconds: age,
+      distance_meters: hasLocation
+        ? distanceMeters(Number(ticket.latitude), Number(ticket.longitude), lat, lon)
+        : null,
+      eligible: rejection_reasons.length === 0,
+      rejection_reasons
+    };
+  });
+
+  const eligible = candidates
+    .filter((resolver) => resolver.eligible)
+    .sort((a, b) => Number(a.distance_meters || Infinity) - Number(b.distance_meters || Infinity));
+
+  if (eligible.length === 0) {
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,'SYSTEM','NO_RESOLVER_AVAILABLE',$2,$3)
+      `,
+      [
+        ticket.id,
+        "No hay resolutores disponibles para asignación automática",
+        JSON.stringify({
+          reason: "NO_ELIGIBLE_RESOLVER",
+          total_resolvers_in_center: candidates.length,
+          candidates: candidates.map((r) => ({
+            resolver_user_id: r.id,
+            resolver_name: r.full_name,
+            status: r.status,
+            is_active: r.is_active,
+            validation_status: r.validation_status,
+            has_location: r.latitude != null && r.longitude != null,
+            location_age_seconds: r.location_age_seconds == null ? null : Math.round(r.location_age_seconds),
+            distance_meters: r.distance_meters == null ? null : Math.round(r.distance_meters),
+            rejection_reasons: r.rejection_reasons
+          }))
+        })
       ]
     );
 
     return null;
   }
 
-  const ranked = result.rows
-    .map((resolver) => ({
-      ...resolver,
-      distance_meters: distanceMeters(
-        Number(ticket.latitude),
-        Number(ticket.longitude),
-        Number(resolver.latitude),
-        Number(resolver.longitude)
-      )
-    }))
-    .sort((a, b) => a.distance_meters - b.distance_meters);
+  const selected = eligible[0];
 
-  const selected = ranked[0];
+  if (force) {
+    await pool.query(
+      `
+      UPDATE ticket_assignments
+      SET state = 'SUPERSEDED', updated_at = NOW()
+      WHERE ticket_id = $1
+        AND state = 'PENDING'
+      `,
+      [ticket.id]
+    ).catch(() => null);
+  }
 
   await pool.query(
     `
@@ -1169,7 +1257,9 @@ async function autoAssignResolver(ticket) {
       JSON.stringify({
         resolver_user_id: selected.id,
         resolver_name: selected.full_name,
-        distance_meters: Math.round(selected.distance_meters)
+        distance_meters: Math.round(selected.distance_meters),
+        location_age_seconds: selected.location_age_seconds == null ? null : Math.round(selected.location_age_seconds),
+        force
       })
     ]
   );
@@ -1258,8 +1348,8 @@ async function createTicket({
       metadata
     ]
   );
-await autoAssignResolver(ticket);
-  return ticket;
+const assignment = await autoAssignResolver(ticket);
+  return assignment?.ticket || ticket;
 }
 
 async function syncMobileEventStateFromTicket(ticketId, mobileState) {
@@ -4344,6 +4434,59 @@ app.post("/tickets/:id/reject", async (req, res) => {
   } catch (error) {
     console.error("[REJECT TICKET ERROR]", error);
 
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+
+app.post("/tickets/:id/auto-assign", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const ticketResult = await pool.query(
+      `
+      SELECT *
+      FROM tickets
+      WHERE id = $1
+        AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+      LIMIT 1
+      `,
+      [id]
+    );
+
+    if (!ticketResult.rows.length) {
+      return res.status(404).json({
+        status: "error",
+        message: "Ticket no encontrado o ya cerrado"
+      });
+    }
+
+    const assignment = await autoAssignResolver(ticketResult.rows[0], { force: true });
+
+    if (!assignment || !assignment.ticket) {
+      return res.status(409).json({
+        status: "no_resolver_available",
+        message: "No hay resolutores AVAILABLE elegibles para este ticket. Revisa estado, centro de control y ubicación GPS del resolutor."
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Ticket asignado automáticamente",
+      ticket: assignment.ticket,
+      resolver: {
+        id: assignment.resolver.id,
+        full_name: assignment.resolver.full_name,
+        phone: assignment.resolver.phone,
+        status: assignment.resolver.status,
+        distance_meters: Math.round(assignment.resolver.distance_meters || 0)
+      }
+    });
+  } catch (error) {
+    console.error("[AUTO ASSIGN TICKET ERROR]", error);
     res.status(500).json({
       status: "error",
       message: error.message
