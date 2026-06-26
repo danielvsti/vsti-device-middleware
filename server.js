@@ -1937,6 +1937,96 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
   }
 });
 
+
+app.get("/public/mobile/active", async (req, res) => {
+  try {
+    const { user_id } = req.query;
+
+    if (!user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "user_id is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        m.*,
+        t.id AS ticket_id,
+        t.state AS ticket_state,
+        t.title AS ticket_title,
+        t.alert_type AS ticket_alert_type,
+        t.priority AS ticket_priority,
+        t.created_at AS ticket_created_at,
+        t.acknowledged_at AS ticket_acknowledged_at,
+        t.assigned_at AS ticket_assigned_at,
+        t.resolved_at AS ticket_resolved_at,
+        t.closed_at AS ticket_closed_at,
+        t.assigned_resolver_id,
+        r.full_name AS resolver_name,
+        r.phone AS resolver_phone
+      FROM mobile_events m
+      LEFT JOIN tickets t
+        ON t.source_type = 'MOBILE_APP'
+       AND t.source_event_id = m.id
+      LEFT JOIN users r
+        ON r.id = t.assigned_resolver_id
+      WHERE m.user_id = $1
+        AND (
+          (
+            t.id IS NOT NULL
+            AND t.state NOT IN ('RESOLVED','CLOSED','CANCELLED')
+          )
+          OR (
+            t.id IS NULL
+            AND m.state IN ('ACTIVE','ACKNOWLEDGED')
+          )
+        )
+      ORDER BY COALESCE(t.created_at, m.created_at) DESC
+      LIMIT 1
+      `,
+      [user_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        status: "ok",
+        active: false,
+        event: null,
+        ticket_id: null,
+        neighbor_progress: null
+      });
+    }
+
+    const event = result.rows[0];
+    const terminalTicketStates = ["RESOLVED", "CLOSED", "CANCELLED"];
+    const effectiveState = terminalTicketStates.includes(event.ticket_state)
+      ? event.ticket_state
+      : (event.ticket_state || event.state);
+
+    event.effective_state = effectiveState;
+
+    res.json({
+      status: "ok",
+      active: true,
+      event,
+      ticket_id: event.ticket_id || null,
+      ticket_state: event.ticket_state || null,
+      effective_state: effectiveState,
+      neighbor_progress: buildNeighborProgress(event)
+    });
+
+  } catch (error) {
+    console.error("[MOBILE ACTIVE CASE ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: "Database error getting active mobile case"
+    });
+  }
+});
+
 app.post("/auth/register", async (req, res) => {
   try {
     const {
