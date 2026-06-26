@@ -4780,6 +4780,86 @@ app.get("/dashboard/analytics", async (req, res) => {
       [ccId, days]
     );
 
+    const geoTicketsResult = await pool.query(
+      `
+      SELECT
+        t.id,
+        t.title,
+        t.alert_type,
+        t.source_type,
+        t.state,
+        t.priority,
+        t.latitude,
+        t.longitude,
+        t.created_at,
+        citizen.full_name AS citizen_name,
+        CASE
+          WHEN t.priority <= 1 THEN 1.00
+          WHEN t.priority = 2 THEN 0.90
+          WHEN t.state NOT IN ('CLOSED','CANCELLED','RESOLVED') THEN 0.85
+          ELSE 0.62
+        END::float AS weight
+      FROM tickets t
+      LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+      WHERE t.control_center_id = $1
+        AND t.created_at >= NOW() - ($2::int || ' days')::interval
+        AND t.latitude IS NOT NULL
+        AND t.longitude IS NOT NULL
+      ORDER BY t.created_at DESC
+      LIMIT 500
+      `,
+      [ccId, days]
+    );
+
+    const geoZonesResult = await pool.query(
+      `
+      WITH geo AS (
+        SELECT
+          id,
+          alert_type,
+          state,
+          latitude,
+          longitude,
+          created_at,
+          ROUND(latitude::numeric, 4) AS lat_key,
+          ROUND(longitude::numeric, 4) AS lon_key
+        FROM tickets
+        WHERE control_center_id = $1
+          AND created_at >= NOW() - ($2::int || ' days')::interval
+          AND latitude IS NOT NULL
+          AND longitude IS NOT NULL
+      ), zones AS (
+        SELECT
+          lat_key,
+          lon_key,
+          COUNT(*)::int AS tickets_count,
+          COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS open_count,
+          MAX(created_at) AS last_ticket_at
+        FROM geo
+        GROUP BY lat_key, lon_key
+      )
+      SELECT
+        lat_key::float AS latitude,
+        lon_key::float AS longitude,
+        tickets_count,
+        open_count,
+        last_ticket_at,
+        COALESCE((
+          SELECT g.alert_type
+          FROM geo g
+          WHERE g.lat_key = z.lat_key
+            AND g.lon_key = z.lon_key
+          GROUP BY g.alert_type
+          ORDER BY COUNT(*) DESC
+          LIMIT 1
+        ), 'SIN_TIPO') AS top_alert_type
+      FROM zones z
+      ORDER BY tickets_count DESC, last_ticket_at DESC NULLS LAST
+      LIMIT 12
+      `,
+      [ccId, days]
+    );
+
     const hourly = Array.from({ length: 24 }, (_, hour) => {
       const found = hourlyResult.rows.find((item) => Number(item.hour) === hour);
       return { hour, label: `${String(hour).padStart(2, "0")}:00`, value: found ? Number(found.value) : 0 };
@@ -4831,6 +4911,28 @@ app.get("/dashboard/analytics", async (req, res) => {
         recent_tickets: recentTicketsResult.rows,
         pending_validation_neighbors: pendingValidationResult.rows,
         resolver_status: resolverStatusResult.rows
+      },
+      geo: {
+        center: {
+          latitude: controlCenter.latitude,
+          longitude: controlCenter.longitude
+        },
+        event_points: geoTicketsResult.rows.map((row) => ({
+          ...row,
+          latitude: row.latitude == null ? null : Number(row.latitude),
+          longitude: row.longitude == null ? null : Number(row.longitude),
+          weight: row.weight == null ? 0.65 : Number(row.weight)
+        })),
+        heatmap_points: geoTicketsResult.rows.map((row) => [
+          Number(row.latitude),
+          Number(row.longitude),
+          row.weight == null ? 0.65 : Number(row.weight)
+        ]),
+        top_zones: geoZonesResult.rows.map((row) => ({
+          ...row,
+          latitude: row.latitude == null ? null : Number(row.latitude),
+          longitude: row.longitude == null ? null : Number(row.longitude)
+        }))
       }
     });
   } catch (error) {
