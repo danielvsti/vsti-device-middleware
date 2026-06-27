@@ -6212,6 +6212,11 @@ function luciaLimit(question, fallback = 10) {
 
 function luciaIntent(question) {
   const q = normalizeLuciaText(question);
+
+  // Inventario operacional. Se acepta “siren” como typo de sirena/sirenas.
+  if (/siren|sirena|sirenas/.test(q)) return "sirens_summary";
+  if (/(cuant|cantidad|total|inventario|estado de plataforma).*(usuario|usuarios|vecino|vecinos|resolutor|resolutores|dispositivo|dispositivos)/.test(q)) return "platform_inventory";
+
   if (/rechaz/.test(q) && /resolutor|funcionario|movil|equipo/.test(q)) return "resolver_rejections";
   if (/(top|ranking|mas|mayor|mejor).*(resolutor|funcionario|movil|equipo)|resolutor.*(atend|gestion|cerr|resolv)/.test(q)) return "resolver_performance";
   if (/sin asignar|no asignad|pendiente de asign|disponible.*ticket|ticket.*disponible/.test(q)) return "unassigned_tickets";
@@ -6221,7 +6226,9 @@ function luciaIntent(question) {
   if (/zona|sector|barrio|calor|recurren|concentr/.test(q)) return "critical_zones";
   if (/tipo|categoria|emergencia/.test(q) && /(cuanto|cantidad|distrib|resumen|ranking)/.test(q)) return "ticket_types";
   if (/informe|resumen|ejecutivo|reporte|situacion|estado/.test(q)) return "executive_summary";
-  return "executive_summary";
+
+  // Antes caía al resumen ejecutivo. Eso confundía: ahora Luc-IA reconoce que no entendió.
+  return "unknown";
 }
 
 function luciaBuildSafeQuery(question, ccId) {
@@ -6229,6 +6236,63 @@ function luciaBuildSafeQuery(question, ccId) {
   const days = luciaPeriodDays(question);
   const limit = luciaLimit(question, 10);
   const baseParams = [ccId, days, limit];
+
+  if (intent === "sirens_summary") {
+    return {
+      intent, days: 0, limit: 1,
+      title: "Sirenas de la comuna",
+      params: [ccId],
+      sql: `
+        SELECT
+          COUNT(*)::int AS sirenas_total,
+          COUNT(*) FILTER (WHERE COALESCE(UPPER(state), 'OFF') IN ('ON','ACTIVE','ACTIVA'))::int AS sirenas_activas,
+          COUNT(*) FILTER (WHERE last_seen IS NOT NULL AND last_seen >= NOW() - INTERVAL '2 minutes')::int AS sirenas_online,
+          COUNT(*) FILTER (WHERE last_seen IS NULL OR last_seen < NOW() - INTERVAL '2 minutes')::int AS sirenas_offline,
+          STRING_AGG(name, ', ' ORDER BY name) AS nombres
+        FROM sirens
+        WHERE control_center_id = $1
+        LIMIT 1
+      `
+    };
+  }
+
+  if (intent === "platform_inventory") {
+    return {
+      intent, days: 0, limit: 1,
+      title: "Inventario operacional",
+      params: [ccId],
+      sql: `
+        SELECT
+          (SELECT COUNT(*)::int FROM users WHERE control_center_id = $1) AS usuarios_total,
+          (SELECT COUNT(*)::int FROM users WHERE control_center_id = $1 AND role = 'NEIGHBOR') AS vecinos,
+          (SELECT COUNT(*)::int FROM users WHERE control_center_id = $1 AND role = 'RESOLVER') AS resolutores,
+          (SELECT COUNT(*)::int FROM users WHERE control_center_id = $1 AND role = 'OPERATOR') AS operadores,
+          (SELECT COUNT(*)::int FROM users WHERE control_center_id = $1 AND role = 'ADMIN') AS admins,
+          (SELECT COUNT(*)::int FROM sirens WHERE control_center_id = $1) AS sirenas,
+          (SELECT COUNT(*)::int FROM devices WHERE control_center_id = $1) AS dispositivos,
+          (SELECT COUNT(*)::int FROM tickets WHERE control_center_id = $1 AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')) AS tickets_abiertos
+        FROM control_centers cc
+        WHERE cc.id = $1
+        LIMIT 1
+      `
+    };
+  }
+
+  if (intent === "unknown") {
+    return {
+      intent, days: 0, limit: 1,
+      title: "Pregunta no reconocida",
+      params: [ccId],
+      sql: `
+        SELECT
+          code AS centro_control,
+          name AS comuna
+        FROM control_centers cc
+        WHERE cc.id = $1
+        LIMIT 1
+      `
+    };
+  }
 
   if (intent === "resolver_performance") {
     return {
@@ -6394,13 +6458,23 @@ function luciaBuildSafeQuery(question, ccId) {
   if (intent === "critical_zones") {
     return {
       intent, days, limit,
-      title: "Zonas críticas",
+      title: "Zonas críticas por sector",
       params: baseParams,
       sql: `
         WITH geo AS (
           SELECT
-            ROUND(latitude::numeric, 4) AS lat_key,
-            ROUND(longitude::numeric, 4) AS lon_key,
+            latitude::numeric AS lat,
+            longitude::numeric AS lon,
+            CASE
+              WHEN latitude > -32.9800 AND longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
+              WHEN latitude > -33.0000 AND longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
+              WHEN latitude > -33.0020 AND longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
+              WHEN latitude BETWEEN -33.0300 AND -33.0100 AND longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
+              WHEN latitude BETWEEN -33.0300 AND -33.0050 AND longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
+              WHEN latitude < -33.0350 AND longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
+              WHEN latitude < -33.0300 AND longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
+              ELSE 'Sector por determinar dentro de la comuna'
+            END AS sector_aproximado,
             alert_type,
             state,
             created_at
@@ -6410,23 +6484,24 @@ function luciaBuildSafeQuery(question, ccId) {
             AND latitude IS NOT NULL
             AND longitude IS NOT NULL
             AND COALESCE(jurisdiction_status, 'IN_JURISDICTION') <> 'OUT_OF_JURISDICTION'
+        ), typed AS (
+          SELECT
+            sector_aproximado,
+            alert_type,
+            COUNT(*)::int AS tipo_count,
+            ROW_NUMBER() OVER (PARTITION BY sector_aproximado ORDER BY COUNT(*) DESC, alert_type ASC) AS rn
+          FROM geo
+          GROUP BY sector_aproximado, alert_type
         )
         SELECT
-          lat_key::float AS latitud,
-          lon_key::float AS longitud,
+          g.sector_aproximado AS zona_critica,
           COUNT(*)::int AS eventos,
-          COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS abiertos,
-          COALESCE((
-            SELECT g2.alert_type
-            FROM geo g2
-            WHERE g2.lat_key = geo.lat_key AND g2.lon_key = geo.lon_key
-            GROUP BY g2.alert_type
-            ORDER BY COUNT(*) DESC
-            LIMIT 1
-          ), 'SIN_TIPO') AS tipo_principal,
-          MAX(created_at) AS ultimo_evento
-        FROM geo
-        GROUP BY lat_key, lon_key
+          COUNT(*) FILTER (WHERE g.state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS abiertos,
+          COALESCE(t.alert_type, 'SIN_TIPO') AS tipo_principal,
+          MAX(g.created_at) AS ultimo_evento
+        FROM geo g
+        LEFT JOIN typed t ON t.sector_aproximado = g.sector_aproximado AND t.rn = 1
+        GROUP BY g.sector_aproximado, t.alert_type
         ORDER BY eventos DESC, ultimo_evento DESC
         LIMIT $3
       `
@@ -6482,7 +6557,12 @@ function validateLuciaSql(sql) {
   if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY|CALL|DO|VACUUM|ANALYZE)\b/i.test(compact)) {
     throw new Error("Consulta bloqueada por política de solo lectura.");
   }
-  if (!/control_center_id\s*=\s*\$1/i.test(compact) && !/control_center_id\s*=\s*u\.control_center_id/i.test(compact)) {
+  const hasTenantFilter =
+    /control_center_id\s*=\s*\$1/i.test(compact) ||
+    /control_center_id\s*=\s*u\.control_center_id/i.test(compact) ||
+    /FROM\s+control_centers\s+(?:cc\s+)?WHERE\s+(?:cc\.)?id\s*=\s*\$1/i.test(compact);
+
+  if (!hasTenantFilter) {
     throw new Error("Consulta bloqueada: debe estar filtrada por centro de control.");
   }
   if (!/\bLIMIT\b/i.test(compact)) throw new Error("Consulta bloqueada: debe incluir LIMIT.");
@@ -6531,6 +6611,17 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
   if (queryDef.intent === "sla_risks") return n ? `Detecté ${n} tickets con riesgo o vencimiento SLA. Conviene revisar asignación y resolución.` : "No encontré tickets fuera de SLA en el período.";
   if (queryDef.intent === "critical_zones") return n ? `Estas son las principales zonas de recurrencia. La agrupación es aproximada por coordenada para análisis preventivo.` : "No hay puntos suficientes para identificar zonas críticas en ese período.";
   if (queryDef.intent === "ticket_types") return n ? `Distribución de tickets por tipo de emergencia para los últimos ${days} días.` : "No hay tickets clasificados por tipo en ese período.";
+  if (queryDef.intent === "sirens_summary") {
+    const r = rows[0] || {};
+    return `En ${controlCenterCode} hay ${r.sirenas_total || 0} sirena(s) registradas: ${r.sirenas_online || 0} online, ${r.sirenas_offline || 0} offline y ${r.sirenas_activas || 0} activas en este momento.`;
+  }
+  if (queryDef.intent === "platform_inventory") {
+    const r = rows[0] || {};
+    return `Inventario de ${controlCenterCode}: ${r.usuarios_total || 0} usuarios, ${r.vecinos || 0} vecinos, ${r.resolutores || 0} resolutores, ${r.operadores || 0} operadores, ${r.admins || 0} administradores, ${r.sirenas || 0} sirenas, ${r.dispositivos || 0} dispositivos y ${r.tickets_abiertos || 0} tickets abiertos.`;
+  }
+  if (queryDef.intent === "unknown") {
+    return "No entendí con suficiente precisión la pregunta para convertirla en una consulta segura. Puedes preguntarme, por ejemplo: ¿cuántas sirenas hay en la comuna?, tickets sin asignar, zonas críticas, top resolutores del mes o tickets fuera de SLA.";
+  }
   return `Luc-IA procesó la consulta sobre ${controlCenterCode} y encontró ${n} filas.`;
 }
 
