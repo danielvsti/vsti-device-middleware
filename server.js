@@ -5468,6 +5468,7 @@ app.get("/debug/resolver-status-summary", async (req, res) => {
     if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Unknown control_center_code" });
 
     const ccId = cc.rows[0].id;
+    const resolverGpsMaxAccuracy = maxResolverGpsAccuracyMeters();
     await reconcileResolverStatesForControlCenter(ccId);
 
     const rows = await pool.query(
@@ -5498,6 +5499,7 @@ app.get("/debug/resolver-status-summary", async (req, res) => {
         CASE
           WHEN is_active IS NOT TRUE THEN 'INACTIVE'
           WHEN updated_at IS NULL THEN 'NO_GPS'
+          WHEN accuracy IS NOT NULL AND (accuracy::numeric) > $3::numeric THEN 'GPS_INVALID'
           WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
@@ -5511,7 +5513,7 @@ app.get("/debug/resolver-status-summary", async (req, res) => {
       FROM resolver_base
       ORDER BY full_name
       `,
-      [ccId, ACTIVE_RESOLVER_TICKET_STATES]
+      [ccId, ACTIVE_RESOLVER_TICKET_STATES, resolverGpsMaxAccuracy]
     );
 
     res.json({ status: "ok", control_center: cc.rows[0], resolvers: rows.rows });
@@ -5560,6 +5562,7 @@ app.get("/dashboard/analytics", async (req, res) => {
     // BUSY / EN_ROUTE / ON_SITE without an active assigned ticket.
     // This does not touch GPS freshness timestamps.
     const resolverReconciliation = await reconcileResolverStatesForControlCenter(ccId);
+    const resolverGpsMaxAccuracy = maxResolverGpsAccuracyMeters();
 
     const summaryResult = await pool.query(
       `
@@ -5660,6 +5663,7 @@ app.get("/dashboard/analytics", async (req, res) => {
           CASE
             WHEN is_active IS NOT TRUE THEN 'INACTIVE'
             WHEN updated_at IS NULL THEN 'NO_GPS'
+            WHEN accuracy IS NOT NULL AND (accuracy::numeric) > $3::numeric THEN 'GPS_INVALID'
             WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
             WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
             WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
@@ -5672,6 +5676,7 @@ app.get("/dashboard/analytics", async (req, res) => {
           END AS operational_state,
           CASE
             WHEN updated_at IS NULL THEN 'NO_GPS'
+            WHEN accuracy IS NOT NULL AND (accuracy::numeric) > $3::numeric THEN 'INVALID_ACCURACY'
             WHEN updated_at >= NOW() - INTERVAL '3 minutes' THEN 'FRESH'
             WHEN updated_at >= NOW() - INTERVAL '10 minutes' THEN 'STALE'
             ELSE 'EXPIRED'
@@ -5686,7 +5691,7 @@ app.get("/dashboard/analytics", async (req, res) => {
         COUNT(*) FILTER (WHERE updated_at IS NULL)::int AS resolvers_without_location,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('AVAILABLE','BUSY','EN_ROUTE','ON_SITE','BLOCKED_NO_TICKET'))::int AS resolvers_online,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'STALE_GPS')::int AS resolvers_stale,
-        COUNT(*) FILTER (WHERE is_active IS NOT true OR operational_state IN ('OFFLINE','NO_GPS'))::int AS resolvers_offline,
+        COUNT(*) FILTER (WHERE is_active IS NOT true OR operational_state IN ('OFFLINE','NO_GPS','GPS_INVALID'))::int AS resolvers_offline,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'AVAILABLE')::int AS resolvers_available_now,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('BUSY','EN_ROUTE','ON_SITE'))::int AS resolvers_busy,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'EN_ROUTE')::int AS resolvers_en_route,
@@ -5695,10 +5700,10 @@ app.get("/dashboard/analytics", async (req, res) => {
         COUNT(*) FILTER (WHERE is_active = true AND active_tickets_count > 0)::int AS resolvers_with_active_ticket,
         COUNT(*) FILTER (WHERE is_active = true AND gps_state = 'FRESH')::int AS resolvers_gps_fresh,
         COUNT(*) FILTER (WHERE is_active = true AND gps_state = 'STALE')::int AS resolvers_gps_stale,
-        COUNT(*) FILTER (WHERE is_active = true AND gps_state IN ('EXPIRED','NO_GPS'))::int AS resolvers_gps_expired
+        COUNT(*) FILTER (WHERE is_active = true AND gps_state IN ('EXPIRED','NO_GPS','INVALID_ACCURACY'))::int AS resolvers_gps_expired
       FROM classified
       `,
-      [ccId, ACTIVE_RESOLVER_TICKET_STATES]
+      [ccId, ACTIVE_RESOLVER_TICKET_STATES, resolverGpsMaxAccuracy]
     );
 
     const sirensSummaryResult = await pool.query(
@@ -5917,6 +5922,7 @@ app.get("/dashboard/analytics", async (req, res) => {
         CASE
           WHEN is_active IS NOT TRUE THEN 'INACTIVE'
           WHEN updated_at IS NULL THEN 'NO_GPS'
+          WHEN accuracy IS NOT NULL AND (accuracy::numeric) > $3::numeric THEN 'GPS_INVALID'
           WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
@@ -5929,6 +5935,7 @@ app.get("/dashboard/analytics", async (req, res) => {
         END AS operational_state,
         CASE
           WHEN updated_at IS NULL THEN 'SIN_UBICACION'
+          WHEN accuracy IS NOT NULL AND (accuracy::numeric) > $3::numeric THEN 'GPS_INVALIDO'
           WHEN updated_at >= NOW() - INTERVAL '3 minutes' THEN 'ONLINE'
           WHEN updated_at >= NOW() - INTERVAL '10 minutes' THEN 'DESACTUALIZADO'
           ELSE 'OFFLINE'
@@ -5936,7 +5943,7 @@ app.get("/dashboard/analytics", async (req, res) => {
       FROM resolver_base
       ORDER BY full_name ASC
       `,
-      [ccId, ACTIVE_RESOLVER_TICKET_STATES]
+      [ccId, ACTIVE_RESOLVER_TICKET_STATES, resolverGpsMaxAccuracy]
     );
 
     const actionsResult = await pool.query(
@@ -6211,24 +6218,74 @@ app.get("/dashboard/map-state", async (req, res) => {
       [controlCenter.id]
     );
 
+    const resolverGpsMaxAccuracy = maxResolverGpsAccuracyMeters();
+    await reconcileResolverStatesForControlCenter(controlCenter.id);
+
     const resolversResult = await pool.query(
       `
+      WITH resolver_base AS (
+        SELECT
+          u.id,
+          u.full_name,
+          u.phone,
+          u.is_active,
+          COALESCE(UPPER(rl.status), 'SIN_UBICACION') AS raw_status,
+          rl.latitude,
+          rl.longitude,
+          rl.accuracy,
+          rl.updated_at,
+          COUNT(t.id)::int AS active_tickets_count
+        FROM users u
+        LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+        LEFT JOIN tickets t ON t.assigned_resolver_id = u.id
+          AND t.control_center_id = u.control_center_id
+          AND t.state = ANY($2::text[])
+        WHERE u.control_center_id = $1
+          AND u.role = 'RESOLVER'
+          AND u.is_active = true
+        GROUP BY u.id, u.full_name, u.phone, u.is_active, rl.status, rl.latitude, rl.longitude, rl.accuracy, rl.updated_at
+      )
       SELECT
-        u.id,
-        u.full_name,
-        u.phone,
-        rl.latitude,
-        rl.longitude,
-        rl.accuracy,
-        rl.status,
-        rl.updated_at
-      FROM resolver_locations rl
-      JOIN users u ON u.id = rl.user_id
-      WHERE rl.control_center_id = $1
-        AND u.role = 'RESOLVER'
-        AND u.is_active = true
+        id,
+        full_name,
+        phone,
+        latitude,
+        longitude,
+        accuracy,
+        raw_status AS status,
+        raw_status,
+        updated_at,
+        active_tickets_count,
+        CASE
+          WHEN is_active IS NOT TRUE THEN 'INACTIVE'
+          WHEN updated_at IS NULL THEN 'NO_GPS'
+          WHEN accuracy IS NOT NULL AND (accuracy::numeric) > $3::numeric THEN 'GPS_INVALID'
+          WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
+          WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
+          WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
+          WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+          WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
+          WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
+          WHEN active_tickets_count > 0 THEN 'BUSY'
+          WHEN raw_status = 'AVAILABLE' THEN 'AVAILABLE'
+          ELSE raw_status
+        END AS operational_state,
+        CASE
+          WHEN updated_at IS NULL THEN 'NO_GPS'
+          WHEN accuracy IS NOT NULL AND (accuracy::numeric) > $3::numeric THEN 'INVALID_ACCURACY'
+          WHEN updated_at >= NOW() - INTERVAL '3 minutes' THEN 'FRESH'
+          WHEN updated_at >= NOW() - INTERVAL '10 minutes' THEN 'STALE'
+          ELSE 'EXPIRED'
+        END AS gps_state,
+        CASE
+          WHEN updated_at IS NULL THEN NULL
+          ELSE ROUND(EXTRACT(EPOCH FROM (NOW() - updated_at)) / 60.0)::int
+        END AS gps_age_minutes,
+        $3::numeric AS max_allowed_accuracy_meters
+      FROM resolver_base
+      ORDER BY full_name ASC
       `,
-      [controlCenter.id]
+      [controlCenter.id, ACTIVE_RESOLVER_TICKET_STATES, resolverGpsMaxAccuracy]
     );
 
     const sirensResult = await pool.query(
