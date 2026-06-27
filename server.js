@@ -1439,6 +1439,187 @@ async function syncMobileEventStateFromTicket(ticketId, mobileState) {
 }
 
 
+const ACTIVE_RESOLVER_TICKET_STATES = [
+  "ASSIGNED",
+  "ACCEPTED_BY_RESOLVER",
+  "EN_ROUTE",
+  "ON_SITE"
+];
+
+async function getActiveTicketsForResolver(resolverUserId) {
+  const result = await pool.query(
+    `
+    SELECT
+      id,
+      state,
+      title,
+      alert_type,
+      priority,
+      created_at,
+      updated_at
+    FROM tickets
+    WHERE assigned_resolver_id = $1
+      AND state = ANY($2::text[])
+    ORDER BY created_at DESC
+    `,
+    [resolverUserId, ACTIVE_RESOLVER_TICKET_STATES]
+  );
+  return result.rows || [];
+}
+
+async function releaseResolverIfNoActiveTicket(resolverUserId, options = {}) {
+  if (!resolverUserId) return { released: false, reason: "NO_RESOLVER_ID" };
+
+  const activeTickets = await getActiveTicketsForResolver(resolverUserId);
+  if (activeTickets.length > 0 && !options.force) {
+    return {
+      released: false,
+      reason: "HAS_ACTIVE_TICKET",
+      active_tickets: activeTickets
+    };
+  }
+
+  const targetStatus = options.status || "AVAILABLE";
+  const allowedTarget = ["AVAILABLE", "OFFLINE", "BUSY"].includes(targetStatus)
+    ? targetStatus
+    : "AVAILABLE";
+
+  const update = await pool.query(
+    `
+    UPDATE resolver_locations
+    SET
+      status = $2,
+      updated_at = NOW()
+    WHERE user_id = $1
+      AND (
+        status IN ('BUSY','EN_ROUTE','ON_SITE')
+        OR $3::boolean = true
+      )
+    RETURNING *
+    `,
+    [resolverUserId, allowedTarget, options.force === true]
+  );
+
+  return {
+    released: update.rows.length > 0,
+    reason: update.rows.length > 0 ? "RELEASED" : "NO_STATUS_CHANGE",
+    status: allowedTarget,
+    resolver_location: update.rows[0] || null,
+    active_tickets: activeTickets
+  };
+}
+
+async function reconcileResolverOperationalStatus(resolverUserId, options = {}) {
+  const userResult = await pool.query(
+    `
+    SELECT
+      u.id,
+      u.full_name,
+      u.role,
+      u.is_active,
+      u.control_center_id,
+      cc.code AS control_center_code,
+      rl.status AS resolver_status,
+      rl.updated_at AS resolver_updated_at,
+      rl.latitude,
+      rl.longitude
+    FROM users u
+    JOIN control_centers cc ON cc.id = u.control_center_id
+    LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+    WHERE u.id = $1
+    LIMIT 1
+    `,
+    [resolverUserId]
+  );
+
+  if (!userResult.rows.length) {
+    return { status: "error", message: "Resolver not found" };
+  }
+
+  const resolver = userResult.rows[0];
+  if (resolver.role !== "RESOLVER") {
+    return { status: "error", message: "User is not a resolver", resolver };
+  }
+
+  const activeTickets = await getActiveTicketsForResolver(resolverUserId);
+  const currentStatus = String(resolver.resolver_status || "OFFLINE").toUpperCase();
+
+  if (activeTickets.length === 0 && ["BUSY", "EN_ROUTE", "ON_SITE"].includes(currentStatus)) {
+    const targetStatus = options.offline === true ? "OFFLINE" : "AVAILABLE";
+    const release = await releaseResolverIfNoActiveTicket(resolverUserId, {
+      force: true,
+      status: targetStatus
+    });
+    return {
+      status: "ok",
+      reconciled: true,
+      action: "RELEASED_STALE_RESOLVER_STATUS",
+      previous_status: currentStatus,
+      new_status: targetStatus,
+      resolver,
+      active_tickets: [],
+      release
+    };
+  }
+
+  return {
+    status: "ok",
+    reconciled: false,
+    action: "NO_CHANGE_REQUIRED",
+    current_status: currentStatus,
+    resolver,
+    active_tickets: activeTickets
+  };
+}
+
+async function releaseResolverFromTicket(ticketId, reason = "TICKET_TERMINATED") {
+  const ticketResult = await pool.query(
+    `
+    SELECT id, assigned_resolver_id, state
+    FROM tickets
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [ticketId]
+  );
+
+  const ticket = ticketResult.rows[0];
+  if (!ticket || !ticket.assigned_resolver_id) {
+    return { released: false, reason: "NO_ASSIGNED_RESOLVER" };
+  }
+
+  const release = await releaseResolverIfNoActiveTicket(ticket.assigned_resolver_id, {
+    status: "AVAILABLE"
+  });
+
+  if (release.released) {
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,'SYSTEM','RESOLVER_RELEASED',$2,$3)
+      `,
+      [
+        ticketId,
+        "Resolutor liberado automáticamente al finalizar/liberar el caso",
+        JSON.stringify({
+          reason,
+          resolver_user_id: ticket.assigned_resolver_id,
+          new_status: release.status
+        })
+      ]
+    ).catch(() => null);
+  }
+
+  return release;
+}
+
+
 
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
 const OTP_LENGTH = Number(process.env.OTP_LENGTH || 6);
@@ -2625,7 +2806,7 @@ app.post("/public/mobile/cancel", async (req, res) => {
       [event_id]
     );
 
-    await pool.query(
+    const cancelledTickets = await pool.query(
       `
       UPDATE tickets
       SET
@@ -2635,9 +2816,16 @@ app.post("/public/mobile/cancel", async (req, res) => {
       WHERE source_type = 'MOBILE_APP'
         AND source_event_id = $1
         AND state NOT IN ('CLOSED','RESOLVED','CANCELLED')
+      RETURNING id, assigned_resolver_id
       `,
       [event_id]
     );
+
+    for (const cancelledTicket of cancelledTickets.rows || []) {
+      await releaseResolverFromTicket(cancelledTicket.id, "TICKET_CANCELLED_BY_NEIGHBOR").catch((error) => {
+        console.warn("[RESOLVER RELEASE WARNING] mobile cancel:", error.message);
+      });
+    }
 
     console.log("[MOBILE SOS CANCELLED DB]", update.rows[0]);
 
@@ -4363,6 +4551,9 @@ app.post("/tickets/:id/close", async (req, res) => {
     }
 
     await syncMobileEventStateFromTicket(id, "CLOSED");
+    await releaseResolverFromTicket(id, "TICKET_CLOSED_BY_OPERATOR").catch((error) => {
+      console.warn("[RESOLVER RELEASE WARNING] close:", error.message);
+    });
 
     await pool.query(
       `
@@ -6033,6 +6224,67 @@ app.get("/tickets/:id", async (req, res) => {
 
 
 
+
+app.post("/resolvers/:id/reconcile-status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { offline = false } = req.body || {};
+
+    const result = await reconcileResolverOperationalStatus(id, { offline: offline === true });
+    if (result.status === "error") {
+      return res.status(404).json(result);
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error("[RECONCILE RESOLVER STATUS ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/resolvers/reconcile-states", async (req, res) => {
+  try {
+    const { control_center_code = null } = req.body || {};
+    const params = [];
+    let where = "u.role = 'RESOLVER' AND u.is_active = true";
+    if (control_center_code) {
+      params.push(control_center_code);
+      where += ` AND cc.code = $${params.length}`;
+    }
+
+    const resolvers = await pool.query(
+      `
+      SELECT u.id
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE ${where}
+      `,
+      params
+    );
+
+    const results = [];
+    for (const row of resolvers.rows || []) {
+      results.push(await reconcileResolverOperationalStatus(row.id));
+    }
+
+    res.json({
+      status: "ok",
+      count: results.length,
+      reconciled: results.filter((r) => r.reconciled).length,
+      results
+    });
+  } catch (error) {
+    console.error("[RECONCILE RESOLVERS ERROR]", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
 /*
    =========================================================
    RESOLVER MOBILE APP - DEMO / MVP ENDPOINTS
@@ -6104,6 +6356,14 @@ app.post("/resolver/location", async (req, res) => {
       });
     }
 
+    let effectiveStatus = status;
+    if (["BUSY", "EN_ROUTE", "ON_SITE"].includes(String(status).toUpperCase())) {
+      const activeTickets = await getActiveTicketsForResolver(user.id);
+      if (activeTickets.length === 0) {
+        effectiveStatus = "AVAILABLE";
+      }
+    }
+
     const result = await pool.query(
       `
       INSERT INTO resolver_locations (
@@ -6131,13 +6391,15 @@ app.post("/resolver/location", async (req, res) => {
         Number(latitude),
         Number(longitude),
         accuracy,
-        status
+        effectiveStatus
       ]
     );
 
     res.json({
       status: "ok",
-      message: "Resolver location updated",
+      message: effectiveStatus !== status ? "Resolver location updated; stale operational status auto-corrected" : "Resolver location updated",
+      requested_status: status,
+      effective_status: effectiveStatus,
       resolver_location: result.rows[0]
     });
 
@@ -6191,6 +6453,11 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         message: "User is not a resolver"
       });
     }
+
+    const reconciliation = await reconcileResolverOperationalStatus(user_id).catch((error) => ({
+      status: "warning",
+      message: error.message
+    }));
 
     const locationResult = await pool.query(
       `
@@ -6269,6 +6536,7 @@ app.get("/resolver/:user_id/state", async (req, res) => {
       updated_at: nowChile(),
       resolver,
       location: locationResult.rows[0] || null,
+      reconciliation,
       tickets: ticketsResult.rows,
       counts: {
         tickets: ticketsResult.rows.length,
