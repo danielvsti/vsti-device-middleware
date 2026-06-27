@@ -6248,6 +6248,47 @@ function luciaRequestedAlertType(question) {
   return null;
 }
 
+function luciaGuidedSuggestions(kind = "general") {
+  const catalog = {
+    general: [
+      { label: "Tickets sin asignar", question: "Qué tickets siguen sin asignar" },
+      { label: "Tickets incendio", question: "Muéstrame tickets de incendio de los últimos 30 días" },
+      { label: "Zonas críticas", question: "Identifica zonas críticas de los últimos 30 días" },
+      { label: "Resolutores con más rechazos", question: "Qué resolutores han rechazado más tickets este mes" },
+      { label: "Estado de plataforma", question: "Cuántos usuarios, resolutores, sirenas y dispositivos hay en la comuna" },
+      { label: "PDF operativo", question: "Entrégame un reporte en PDF de los tickets abiertos" }
+    ],
+    severity: [
+      { label: "Fuera de SLA", question: "Muéstrame tickets fuera de SLA" },
+      { label: "Alta prioridad", question: "Muéstrame tickets abiertos de alta prioridad" },
+      { label: "Sin asignar", question: "Qué tickets siguen sin asignar" },
+      { label: "VIF", question: "Cuántos casos VIF hay esta semana" }
+    ],
+    inventory: [
+      { label: "Sirenas", question: "Cuántas sirenas hay en la comuna" },
+      { label: "Resolutores", question: "Cuántos resolutores hay en la comuna" },
+      { label: "Vecinos", question: "Cuántos vecinos hay registrados" },
+      { label: "Dispositivos", question: "Cuántos dispositivos hay en la comuna" }
+    ],
+    tickets: [
+      { label: "Incendio", question: "Muéstrame tickets de incendio" },
+      { label: "Médica", question: "Muéstrame tickets médicos" },
+      { label: "Seguridad", question: "Muéstrame tickets de seguridad" },
+      { label: "VIF", question: "Muéstrame tickets VIF" },
+      { label: "Sin asignar", question: "Qué tickets siguen sin asignar" }
+    ]
+  };
+  return catalog[kind] || catalog.general;
+}
+
+function luciaSuggestionKind(question, intent) {
+  const q = normalizeLuciaText(question);
+  if (intent === "ambiguous_severity") return "severity";
+  if (/usuario|vecino|resolutor|sirena|dispositivo|inventario|plataforma/.test(q)) return "inventory";
+  if (/ticket|caso|emergencia|evento/.test(q)) return "tickets";
+  return "general";
+}
+
 function luciaPdfAscii(value) {
   return String(value ?? "")
     .replace(/\r/g, " ")
@@ -6384,6 +6425,10 @@ function luciaIntent(question) {
   const q = normalizeLuciaText(question);
   const requestedAlertType = luciaRequestedAlertType(question);
 
+  if (/^(hola|buenas|ayuda|que puedes hacer|como me ayudas|opciones|menu)\b/.test(q)) return "guided_help";
+  if (/grave|graves|complicad|critico|criticos|importante|urgente/.test(q) && !/zona|sector|barrio/.test(q)) return "ambiguous_severity";
+  if (/alta prioridad|prioridad alta|prioritarios|prioritarias/.test(q) && /(ticket|tickets|caso|casos|emergencia|emergencias)/.test(q)) return "high_priority_tickets";
+
   // Inventario operacional. Se acepta “siren” como typo de sirena/sirenas.
   if (/siren|sirena|sirenas/.test(q)) return "sirens_summary";
   if (/(cuant|cantidad|total|inventario|estado de plataforma).*(usuario|usuarios|vecino|vecinos|resolutor|resolutores|dispositivo|dispositivos)/.test(q)) return "platform_inventory";
@@ -6453,10 +6498,10 @@ function luciaBuildSafeQuery(question, ccId) {
     };
   }
 
-  if (intent === "unknown") {
+  if (intent === "unknown" || intent === "guided_help" || intent === "ambiguous_severity") {
     return {
       intent, days: 0, limit: 1,
-      title: "Pregunta no reconocida",
+      title: intent === "ambiguous_severity" ? "Aclaración necesaria" : "Guía Luc-IA",
       params: [ccId],
       sql: `
         SELECT
@@ -6465,6 +6510,46 @@ function luciaBuildSafeQuery(question, ccId) {
         FROM control_centers cc
         WHERE cc.id = $1
         LIMIT 1
+      `
+    };
+  }
+
+  if (intent === "high_priority_tickets") {
+    return {
+      intent, days, limit,
+      title: "Tickets de alta prioridad",
+      params: baseParams,
+      sql: `
+        SELECT
+          t.id,
+          t.title AS titulo,
+          t.alert_type AS tipo,
+          t.state AS estado,
+          t.priority AS prioridad,
+          CASE
+            WHEN t.latitude > -32.9800 AND t.longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
+            WHEN t.latitude > -33.0000 AND t.longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
+            WHEN t.latitude > -33.0020 AND t.longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
+            WHEN t.latitude BETWEEN -33.0300 AND -33.0100 AND t.longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
+            WHEN t.latitude BETWEEN -33.0300 AND -33.0050 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
+            WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
+            WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
+            ELSE 'Sector estimado por coordenada'
+          END AS sector_estimado,
+          'Estimación por coordenada; no cartografía oficial de barrios' AS metodo_sector,
+          citizen.full_name AS vecino,
+          resolver.full_name AS resolutor,
+          ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
+          t.created_at
+        FROM tickets t
+        LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+        LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+        WHERE t.control_center_id = $1
+          AND t.created_at >= NOW() - ($2::int || ' days')::interval
+          AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+          AND t.priority <= 2
+        ORDER BY t.priority ASC, t.created_at ASC
+        LIMIT $3
       `
     };
   }
@@ -6669,10 +6754,11 @@ function luciaBuildSafeQuery(question, ccId) {
           GROUP BY sector_aproximado, alert_type
         )
         SELECT
-          g.sector_aproximado AS zona_critica,
+          g.sector_aproximado AS sector_estimado,
           COUNT(*)::int AS eventos,
           COUNT(*) FILTER (WHERE g.state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS abiertos,
           COALESCE(t.alert_type, 'SIN_TIPO') AS tipo_principal,
+          'Estimación por coordenada; no cartografía oficial de barrios' AS metodo_sector,
           MAX(g.created_at) AS ultimo_evento
         FROM geo g
         LEFT JOIN typed t ON t.sector_aproximado = g.sector_aproximado AND t.rn = 1
@@ -6706,7 +6792,8 @@ function luciaBuildSafeQuery(question, ccId) {
             WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
             WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
             ELSE 'Sector por determinar'
-          END AS sector,
+          END AS sector_estimado,
+          'Estimación por coordenada; no cartografía oficial de barrios' AS metodo_sector,
           citizen.full_name AS vecino,
           resolver.full_name AS resolutor,
           ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
@@ -6815,6 +6902,15 @@ function luciaColumns(rows) {
 function luciaAnswer(queryDef, rows, controlCenterCode) {
   const n = rows.length;
   const days = queryDef.days;
+  if (queryDef.intent === "guided_help") {
+    return `Puedo ayudarte a consultar la operación de ${controlCenterCode} con datos reales y solo de lectura. Elige una opción sugerida o pregúntame por tickets, resolutores, sirenas, zonas críticas, SLA o reportes PDF.`;
+  }
+  if (queryDef.intent === "ambiguous_severity") {
+    return `Puedo revisar “casos graves”, pero necesito que lo definamos operacionalmente. Puedes verlo como tickets fuera de SLA, alta prioridad, sin asignar, VIF o con más rechazos.`;
+  }
+  if (queryDef.intent === "unknown") {
+    return `No entendí con suficiente precisión la pregunta para convertirla en una consulta segura. Puedo guiarte con opciones operacionales: tickets, resolutores, sirenas, zonas críticas, SLA o reportes PDF.`;
+  }
   if (queryDef.intent === "executive_summary") {
     const r = rows[0] || {};
     return `Resumen de ${controlCenterCode} para los últimos ${days} días: ${r.tickets_periodo || 0} tickets, ${r.tickets_abiertos || 0} abiertos, ${r.tickets_24h || 0} en las últimas 24 horas y ${r.alta_prioridad || 0} de alta prioridad. Tiempo promedio de asignación: ${r.min_promedio_asignacion ?? '—'} min. Tiempo promedio de resolución: ${r.min_promedio_resolucion ?? '—'} min.`;
@@ -6828,7 +6924,8 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
     return `En VIF, para los últimos ${days} días, hay ${r.eventos_vif || 0} eventos, ${r.abiertos || 0} abiertos y ${r.alta_prioridad || 0} de alta prioridad. Promedio de asignación: ${r.min_promedio_asignacion ?? '—'} min.`;
   }
   if (queryDef.intent === "sla_risks") return n ? `Detecté ${n} tickets con riesgo o vencimiento SLA. Conviene revisar asignación y resolución.` : "No encontré tickets fuera de SLA en el período.";
-  if (queryDef.intent === "critical_zones") return n ? `Estas son las principales zonas de recurrencia. La agrupación es aproximada por coordenada para análisis preventivo.` : "No hay puntos suficientes para identificar zonas críticas en ese período.";
+  if (queryDef.intent === "critical_zones") return n ? `Estas son las principales zonas de recurrencia. Ojo: el sector es una estimación calculada desde la coordenada del ticket; no corresponde todavía a una cartografía oficial de barrios o unidades vecinales.` : "No hay puntos suficientes para identificar zonas críticas en ese período.";
+  if (queryDef.intent === "high_priority_tickets") return n ? `Estos son los tickets abiertos de alta prioridad en los últimos ${days} días, con sector estimado desde la coordenada.` : "No encontré tickets abiertos de alta prioridad en ese período.";
   if (queryDef.intent === "tickets_by_alert_type") {
     const requested = queryDef.requested_alert_type?.label || "tipo solicitado";
     const total = rows[0]?.total_en_periodo ?? n;
@@ -6843,10 +6940,38 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
     const r = rows[0] || {};
     return `Inventario de ${controlCenterCode}: ${r.usuarios_total || 0} usuarios, ${r.vecinos || 0} vecinos, ${r.resolutores || 0} resolutores, ${r.operadores || 0} operadores, ${r.admins || 0} administradores, ${r.sirenas || 0} sirenas, ${r.dispositivos || 0} dispositivos y ${r.tickets_abiertos || 0} tickets abiertos.`;
   }
-  if (queryDef.intent === "unknown") {
-    return "No entendí con suficiente precisión la pregunta para convertirla en una consulta segura. Puedes preguntarme, por ejemplo: ¿cuántas sirenas hay en la comuna?, tickets sin asignar, zonas críticas, top resolutores del mes o tickets fuera de SLA.";
-  }
+
   return `Luc-IA procesó la consulta sobre ${controlCenterCode} y encontró ${n} filas.`;
+}
+
+function luciaSuggestionsForIntent(question, queryDef) {
+  const q = normalizeLuciaText(question);
+  const kind = luciaSuggestionKind(question, queryDef.intent);
+  if (queryDef.intent === "unknown" || queryDef.intent === "guided_help" || queryDef.intent === "ambiguous_severity") {
+    return luciaGuidedSuggestions(kind);
+  }
+  if (queryDef.intent === "critical_zones") {
+    return [
+      { label: "PDF zonas críticas", question: `Entrégame un reporte en PDF de zonas críticas de los últimos ${queryDef.days || 30} días` },
+      { label: "Tickets sin asignar", question: "Qué tickets siguen sin asignar" },
+      { label: "Tickets por tipo", question: "Distribución de tickets por tipo de emergencia" }
+    ];
+  }
+  if (queryDef.intent === "resolver_rejections") {
+    return [
+      { label: "Top resolutores", question: "Muéstrame los resolutores que más tickets atendieron este mes" },
+      { label: "Tickets sin asignar", question: "Qué tickets siguen sin asignar" },
+      { label: "Fuera de SLA", question: "Muéstrame tickets fuera de SLA" }
+    ];
+  }
+  if (/pdf/.test(q) || queryDef.intent === "tickets_by_alert_type" || queryDef.intent === "open_tickets") {
+    return [
+      { label: "Descargar PDF", question: q.includes("pdf") ? question : `${question} en PDF` },
+      { label: "Sin asignar", question: "Qué tickets siguen sin asignar" },
+      { label: "Fuera de SLA", question: "Muéstrame tickets fuera de SLA" }
+    ];
+  }
+  return [];
 }
 
 app.post("/dashboard/lucia/ask", async (req, res) => {
@@ -6870,6 +6995,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     const sqlPreview = validateLuciaSql(queryDef.sql);
     const result = await runLuciaReadOnly(queryDef.sql, queryDef.params);
     const answerText = luciaAnswer(queryDef, result.rows, cc.rows[0].code);
+    const suggestions = luciaSuggestionsForIntent(question, queryDef);
     let report = null;
     if (luciaWantsPdf(question)) {
       report = await createLuciaPdfReport({
@@ -6925,6 +7051,9 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         },
         columns: luciaColumns(result.rows),
         rows: result.rows,
+        suggestions,
+        clarification: ["unknown", "guided_help", "ambiguous_severity"].includes(queryDef.intent),
+        sector_method: ["critical_zones", "tickets_by_alert_type", "high_priority_tickets"].includes(queryDef.intent) ? "Estimación por coordenada; no cartografía oficial de barrios/unidades vecinales" : null,
         report,
         sql_preview: process.env.LUCIA_SHOW_SQL === "true" ? sqlPreview : null,
         audit_id: auditId
@@ -6932,7 +7061,11 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     });
   } catch (error) {
     console.error("[LUCIA ASK ERROR]", error);
-    res.status(500).json({ status: "error", message: error.message || "No se pudo procesar la consulta de Luc-IA" });
+    res.status(500).json({
+      status: "error",
+      message: "Tuve un problema técnico al procesar la consulta. Prueba con una sugerencia o intenta nuevamente.",
+      technical_message: process.env.NODE_ENV === "development" ? (error.message || String(error)) : undefined
+    });
   }
 });
 
