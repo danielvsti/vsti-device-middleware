@@ -2490,6 +2490,28 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    const latNum = Number(latitude);
+    const lonNum = Number(longitude);
+    const accuracyNum = accuracy == null || accuracy === "" ? null : Number(accuracy);
+
+    if (!Number.isFinite(latNum) || !Number.isFinite(lonNum) || Math.abs(latNum) > 90 || Math.abs(lonNum) > 180) {
+      return res.status(400).json({
+        status: "error",
+        message: "Coordenadas GPS inválidas"
+      });
+    }
+
+    const maxAccuracy = maxResolverGpsAccuracyMeters();
+    if (accuracyNum != null && Number.isFinite(accuracyNum) && accuracyNum > maxAccuracy) {
+      return res.status(422).json({
+        status: "error",
+        code: "LOW_ACCURACY_GPS",
+        message: `Ubicación demasiado imprecisa (${Math.round(accuracyNum)} m). No se actualizó la posición del resolutor.`,
+        accuracy: accuracyNum,
+        max_accuracy_meters: maxAccuracy
+      });
+    }
+
     const userResult = await pool.query(
       `
       SELECT
@@ -4092,6 +4114,21 @@ app.get("/debug/users", async (req, res) => {
     });
   }
 });
+
+
+function requireAdminTokenIfConfigured(req, res) {
+  const configured = process.env.ADMIN_TOKEN;
+  if (!configured) return true;
+  const provided = req.headers["x-admin-token"] || req.headers["authorization"]?.replace(/^Bearer\s+/i, "");
+  if (provided === configured) return true;
+  res.status(401).json({ status: "error", message: "ADMIN_TOKEN requerido" });
+  return false;
+}
+
+function maxResolverGpsAccuracyMeters() {
+  return Number(process.env.RESOLVER_GPS_MAX_ACCURACY_METERS || 150);
+}
+
 app.post("/debug/resolver-location", async (req, res) => {
   try {
     const {
@@ -6298,7 +6335,8 @@ app.post("/resolver/location", async (req, res) => {
       latitude,
       longitude,
       accuracy = null,
-      status = "AVAILABLE"
+      status = "AVAILABLE",
+      source = "unknown"
     } = req.body;
 
     const validStatuses = [
@@ -6327,6 +6365,28 @@ app.post("/resolver/location", async (req, res) => {
       return res.status(400).json({
         status: "error",
         message: "latitude and longitude are required"
+      });
+    }
+
+    const latNum = Number(latitude);
+    const lonNum = Number(longitude);
+    const accuracyNum = accuracy == null || accuracy === "" ? null : Number(accuracy);
+
+    if (!Number.isFinite(latNum) || !Number.isFinite(lonNum) || Math.abs(latNum) > 90 || Math.abs(lonNum) > 180) {
+      return res.status(400).json({
+        status: "error",
+        message: "Coordenadas GPS inválidas"
+      });
+    }
+
+    const maxAccuracy = maxResolverGpsAccuracyMeters();
+    if (accuracyNum != null && Number.isFinite(accuracyNum) && accuracyNum > maxAccuracy) {
+      return res.status(422).json({
+        status: "error",
+        code: "LOW_ACCURACY_GPS",
+        message: `Ubicación demasiado imprecisa (${Math.round(accuracyNum)} m). No se actualizó la posición del resolutor.`,
+        accuracy: accuracyNum,
+        max_accuracy_meters: maxAccuracy
       });
     }
 
@@ -6388,9 +6448,9 @@ app.post("/resolver/location", async (req, res) => {
       [
         user.id,
         user.control_center_id,
-        Number(latitude),
-        Number(longitude),
-        accuracy,
+        latNum,
+        lonNum,
+        accuracyNum,
         effectiveStatus
       ]
     );
@@ -6400,7 +6460,8 @@ app.post("/resolver/location", async (req, res) => {
       message: effectiveStatus !== status ? "Resolver location updated; stale operational status auto-corrected" : "Resolver location updated",
       requested_status: status,
       effective_status: effectiveStatus,
-      resolver_location: result.rows[0]
+      resolver_location: result.rows[0],
+      source
     });
 
   } catch (error) {
@@ -6410,6 +6471,109 @@ app.post("/resolver/location", async (req, res) => {
       status: "error",
       message: error.message
     });
+  }
+});
+
+
+
+app.get("/debug/resolver-locations", async (req, res) => {
+  try {
+    if (!requireAdminTokenIfConfigured(req, res)) return;
+
+    const { control_center_code = "CC-VINA" } = req.query;
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.full_name,
+        u.phone,
+        cc.code AS control_center_code,
+        rl.latitude,
+        rl.longitude,
+        rl.accuracy,
+        rl.status,
+        rl.updated_at,
+        COALESCE(active_tickets.total, 0)::int AS active_tickets
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS total
+        FROM tickets t
+        WHERE t.assigned_resolver_id = u.id
+          AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+      ) active_tickets ON true
+      WHERE u.role = 'RESOLVER'
+        AND cc.code = $1
+      ORDER BY u.full_name ASC
+      `,
+      [control_center_code]
+    );
+
+    res.json({ status: "ok", control_center_code, resolvers: result.rows });
+  } catch (error) {
+    console.error("[DEBUG RESOLVER LOCATIONS ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/resolvers/:id/location/clear", async (req, res) => {
+  try {
+    if (!requireAdminTokenIfConfigured(req, res)) return;
+
+    const { id } = req.params;
+    const before = await pool.query(
+      `
+      SELECT u.id, u.full_name, rl.latitude, rl.longitude, rl.status, rl.updated_at
+      FROM users u
+      LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+      WHERE u.id = $1 AND u.role = 'RESOLVER'
+      `,
+      [id]
+    );
+
+    if (before.rows.length === 0) {
+      return res.status(404).json({ status: "error", message: "Resolutor no encontrado" });
+    }
+
+    await pool.query(`DELETE FROM resolver_locations WHERE user_id = $1`, [id]);
+    res.json({ status: "ok", message: "Ubicación del resolutor eliminada", resolver: before.rows[0] });
+  } catch (error) {
+    console.error("[CLEAR RESOLVER LOCATION ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/resolvers/:id/status/offline", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const userResult = await pool.query(
+      `SELECT id, full_name, control_center_id, role FROM users WHERE id = $1 AND is_active = true`,
+      [id]
+    );
+    if (userResult.rows.length === 0 || userResult.rows[0].role !== 'RESOLVER') {
+      return res.status(404).json({ status: "error", message: "Resolutor no encontrado o inactivo" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE resolver_locations
+      SET status = 'OFFLINE', updated_at = NOW()
+      WHERE user_id = $1
+      RETURNING *
+      `,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      message: result.rows.length ? "Resolutor fuera de turno" : "Resolutor fuera de turno; no había ubicación registrada",
+      resolver_location: result.rows[0] || null
+    });
+  } catch (error) {
+    console.error("[RESOLVER OFFLINE ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
   }
 });
 
