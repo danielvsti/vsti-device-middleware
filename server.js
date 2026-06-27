@@ -5689,9 +5689,11 @@ app.get("/dashboard/analytics", async (req, res) => {
         COUNT(*) FILTER (WHERE is_active = true)::int AS resolvers_active,
         COUNT(*) FILTER (WHERE is_active IS NOT true)::int AS resolvers_inactive,
         COUNT(*) FILTER (WHERE updated_at IS NULL)::int AS resolvers_without_location,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('AVAILABLE','BUSY','EN_ROUTE','ON_SITE'))::int AS resolvers_operational,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('AVAILABLE','BUSY','EN_ROUTE','ON_SITE','BLOCKED_NO_TICKET'))::int AS resolvers_online,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'STALE_GPS')::int AS resolvers_stale,
-        COUNT(*) FILTER (WHERE is_active IS NOT true OR operational_state IN ('OFFLINE','NO_GPS','GPS_INVALID'))::int AS resolvers_offline,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('STALE_GPS','GPS_INVALID','OFFLINE','NO_GPS'))::int AS resolvers_unavailable_gps,
+        COUNT(*) FILTER (WHERE is_active IS NOT true OR operational_state IN ('OFFLINE','NO_GPS','GPS_INVALID','STALE_GPS'))::int AS resolvers_offline,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'AVAILABLE')::int AS resolvers_available_now,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('BUSY','EN_ROUTE','ON_SITE'))::int AS resolvers_busy,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'EN_ROUTE')::int AS resolvers_en_route,
@@ -6210,8 +6212,177 @@ function luciaLimit(question, fallback = 10) {
   return fallback;
 }
 
+
+const LUCIA_PDF_DIR = path.join(UPLOAD_DIR, "lucia_reports");
+fs.mkdirSync(LUCIA_PDF_DIR, { recursive: true });
+
+function luciaWantsPdf(question) {
+  const q = normalizeLuciaText(question);
+  return /\bpdf\b|descargable|descargar|exportar|imprimir/.test(q);
+}
+
+function luciaRequestedAlertType(question) {
+  const q = normalizeLuciaText(question);
+  const candidates = [
+    { key: "FIRE", label: "Incendio", aliases: ["incendio", "incendios", "fuego", "fire", "inc"] },
+    { key: "MEDICAL", label: "Médica", aliases: ["medica", "medico", "salud", "ambulancia", "medical", "emergencia medica"] },
+    { key: "VIF", label: "VIF", aliases: ["vif", "violencia", "silenciosa", "silencioso"] },
+    { key: "SECURITY", label: "Seguridad", aliases: ["seguridad", "delito", "robo", "asalto", "seg", "security"] },
+    { key: "FALL_DETECTED", label: "Caída", aliases: ["caida", "caidas", "fall", "fall_detected", "accidente"] },
+    { key: "SOS_MANUAL", label: "SOS general", aliases: ["sos", "sos manual", "general", "manual"] },
+    { key: "RISK", label: "Riesgo", aliases: ["riesgo", "risk", "peligro"] },
+    { key: "OTHER", label: "Otro", aliases: ["otro", "otros", "other"] }
+  ];
+
+  for (const item of candidates) {
+    if (item.aliases.some(alias => q.includes(alias))) {
+      const sqlTypes = [item.key, item.label.toUpperCase(), item.label.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase()];
+      if (item.key === "FIRE") sqlTypes.push("INCENDIO", "INCENDIOS", "INC");
+      if (item.key === "MEDICAL") sqlTypes.push("MEDICA", "MÉDICA", "MEDICO", "SALUD");
+      if (item.key === "SECURITY") sqlTypes.push("SEGURIDAD", "SEG");
+      if (item.key === "FALL_DETECTED") sqlTypes.push("CAIDA", "CAÍDA", "FALL", "ACCIDENTE");
+      if (item.key === "SOS_MANUAL") sqlTypes.push("SOS", "SOS GENERAL");
+      return { key: item.key, label: item.label, sqlTypes: [...new Set(sqlTypes.map(x => String(x).toUpperCase()))] };
+    }
+  }
+  return null;
+}
+
+function luciaPdfAscii(value) {
+  return String(value ?? "")
+    .replace(/\r/g, " ")
+    .replace(/\n/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—]/g, "-")
+    .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, "")
+    .trim();
+}
+
+function luciaWrapLine(text, max = 98) {
+  const words = luciaPdfAscii(text).split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    if ((line + " " + word).trim().length > max) {
+      if (line) lines.push(line);
+      line = word;
+    } else {
+      line = (line + " " + word).trim();
+    }
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [""];
+}
+
+function pdfEscape(text) {
+  return luciaPdfAscii(text).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function buildSimpleLuciaPdf({ title, subtitle, lines, columns, rows }) {
+  const pageLineLimit = 58;
+  const allLines = [];
+  allLines.push(title || "Reporte Luc-IA");
+  if (subtitle) allLines.push(subtitle);
+  allLines.push(`Generado: ${new Date().toLocaleString("es-CL", { timeZone: "America/Santiago" })}`);
+  allLines.push("");
+  for (const line of (lines || [])) {
+    allLines.push(...luciaWrapLine(line, 105));
+  }
+  allLines.push("");
+  const safeColumns = (columns || []).slice(0, 7).map(c => luciaPdfAscii(c).slice(0, 18));
+  if (safeColumns.length && rows && rows.length) {
+    allLines.push(safeColumns.join(" | "));
+    allLines.push("-".repeat(Math.min(110, safeColumns.join(" | ").length)));
+    for (const row of rows.slice(0, Number(process.env.LUCIA_MAX_PDF_ROWS || 40))) {
+      allLines.push(safeColumns.map(c => luciaPdfAscii(row[c]).slice(0, 18).padEnd(18)).join(" | "));
+    }
+    if (rows.length > Number(process.env.LUCIA_MAX_PDF_ROWS || 40)) {
+      allLines.push(`... ${rows.length - Number(process.env.LUCIA_MAX_PDF_ROWS || 40)} filas adicionales no incluidas en este PDF.`);
+    }
+  } else {
+    allLines.push("Sin tabla de resultados para este reporte.");
+  }
+
+  const pages = [];
+  for (let i = 0; i < allLines.length; i += pageLineLimit) {
+    pages.push(allLines.slice(i, i + pageLineLimit));
+  }
+
+  const objects = [];
+  function addObject(content) {
+    objects.push(content);
+    return objects.length;
+  }
+
+  const catalogId = addObject("<< /Type /Catalog /Pages 2 0 R >>");
+  const pagesId = addObject("PAGES_PLACEHOLDER");
+  const fontId = addObject("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>");
+  const pageIds = [];
+
+  for (const pageLines of pages) {
+    let stream = "BT\n/F1 10 Tf\n12 TL\n50 792 Td\n";
+    pageLines.forEach((line, idx) => {
+      const text = pdfEscape(line).slice(0, 130);
+      if (idx === 0) stream += `(${text}) Tj\n`;
+      else stream += `T* (${text}) Tj\n`;
+    });
+    stream += "ET\n";
+    const streamBytes = Buffer.from(stream, "latin1");
+    const contentId = addObject(`<< /Length ${streamBytes.length} >>\nstream\n${stream}\nendstream`);
+    const pageId = addObject(`<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 ${fontId} 0 R >> >> /Contents ${contentId} 0 R >>`);
+    pageIds.push(pageId);
+  }
+
+  objects[pagesId - 1] = `<< /Type /Pages /Kids [${pageIds.map(id => `${id} 0 R`).join(" ")}] /Count ${pageIds.length} >>`;
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((obj, i) => {
+    offsets.push(Buffer.byteLength(pdf, "latin1"));
+    pdf += `${i + 1} 0 obj\n${obj}\nendobj\n`;
+  });
+  const xrefOffset = Buffer.byteLength(pdf, "latin1");
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  for (let i = 1; i < offsets.length; i++) pdf += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root ${catalogId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(pdf, "latin1");
+}
+
+async function createLuciaPdfReport({ question, queryDef, rows, answer, controlCenter }) {
+  const reportId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+  const columns = luciaColumns(rows);
+  const title = `Reporte Luc-IA - ${queryDef.title || queryDef.intent}`;
+  const subtitle = `${controlCenter.code} - ${controlCenter.name || "Centro de control"}`;
+  const pdf = buildSimpleLuciaPdf({
+    title,
+    subtitle,
+    lines: [
+      `Pregunta: ${question}`,
+      `Respuesta: ${answer}`,
+      `Modo: solo lectura, restringido al centro de control autorizado.`,
+      `Intent: ${queryDef.intent}. Periodo: ${queryDef.days || 0} dias. Filas: ${rows.length}.`
+    ],
+    columns,
+    rows
+  });
+  const filename = `lucia_${controlCenter.code}_${reportId}.pdf`.replace(/[^A-Za-z0-9_.-]/g, "_");
+  const filepath = path.join(LUCIA_PDF_DIR, filename);
+  fs.writeFileSync(filepath, pdf);
+  return {
+    id: reportId,
+    filename,
+    url: `/uploads/lucia_reports/${filename}`,
+    generated_at: new Date().toISOString()
+  };
+}
+
 function luciaIntent(question) {
   const q = normalizeLuciaText(question);
+  const requestedAlertType = luciaRequestedAlertType(question);
 
   // Inventario operacional. Se acepta “siren” como typo de sirena/sirenas.
   if (/siren|sirena|sirenas/.test(q)) return "sirens_summary";
@@ -6220,6 +6391,10 @@ function luciaIntent(question) {
   if (/rechaz/.test(q) && /resolutor|funcionario|movil|equipo/.test(q)) return "resolver_rejections";
   if (/(top|ranking|mas|mayor|mejor).*(resolutor|funcionario|movil|equipo)|resolutor.*(atend|gestion|cerr|resolv)/.test(q)) return "resolver_performance";
   if (/sin asignar|no asignad|pendiente de asign|disponible.*ticket|ticket.*disponible/.test(q)) return "unassigned_tickets";
+  if (requestedAlertType && (
+    /(ticket|tickets|caso|casos|evento|eventos|emergencia|emergencias|muestra|mostrar|muestrame|muéstrame|lista|listado|cuanto|cantidad|reporte|pdf)/.test(q) ||
+    !/(resolutor|resolutores|sirena|sirenas|usuario|usuarios|vecino|vecinos|dispositivo|dispositivos)/.test(q)
+  )) return "tickets_by_alert_type";
   if (/abiert|activo|en curso|pendiente|sin cerrar/.test(q) && /ticket|caso|emergencia/.test(q)) return "open_tickets";
   if (/vif|violencia|silencios/.test(q)) return "vif_summary";
   if (/sla|atras|atrasad|vencid|demora|fuera de plazo|tiempo/.test(q)) return "sla_risks";
@@ -6508,6 +6683,50 @@ function luciaBuildSafeQuery(question, ccId) {
     };
   }
 
+  if (intent === "tickets_by_alert_type") {
+    const requested = luciaRequestedAlertType(question) || { key: "UNKNOWN", label: "tipo solicitado", sqlTypes: ["UNKNOWN"] };
+    return {
+      intent, days, limit,
+      title: `Tickets de ${requested.label}`,
+      requested_alert_type: requested,
+      params: [ccId, days, limit, requested.sqlTypes],
+      sql: `
+        SELECT
+          t.id,
+          t.title AS titulo,
+          t.alert_type AS tipo,
+          t.state AS estado,
+          t.priority AS prioridad,
+          CASE
+            WHEN t.latitude > -32.9800 AND t.longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
+            WHEN t.latitude > -33.0000 AND t.longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
+            WHEN t.latitude > -33.0020 AND t.longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
+            WHEN t.latitude BETWEEN -33.0300 AND -33.0100 AND t.longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
+            WHEN t.latitude BETWEEN -33.0300 AND -33.0050 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
+            WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
+            WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
+            ELSE 'Sector por determinar'
+          END AS sector,
+          citizen.full_name AS vecino,
+          resolver.full_name AS resolutor,
+          ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
+          COUNT(*) OVER()::int AS total_en_periodo,
+          t.created_at
+        FROM tickets t
+        LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+        LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+        WHERE t.control_center_id = $1
+          AND t.created_at >= NOW() - ($2::int || ' days')::interval
+          AND UPPER(COALESCE(t.alert_type, '')) = ANY($4::text[])
+        ORDER BY
+          CASE WHEN t.state NOT IN ('CLOSED','CANCELLED','RESOLVED') THEN 0 ELSE 1 END,
+          t.priority ASC,
+          t.created_at DESC
+        LIMIT $3
+      `
+    };
+  }
+
   if (intent === "ticket_types") {
     return {
       intent, days, limit,
@@ -6610,6 +6829,11 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
   }
   if (queryDef.intent === "sla_risks") return n ? `Detecté ${n} tickets con riesgo o vencimiento SLA. Conviene revisar asignación y resolución.` : "No encontré tickets fuera de SLA en el período.";
   if (queryDef.intent === "critical_zones") return n ? `Estas son las principales zonas de recurrencia. La agrupación es aproximada por coordenada para análisis preventivo.` : "No hay puntos suficientes para identificar zonas críticas en ese período.";
+  if (queryDef.intent === "tickets_by_alert_type") {
+    const requested = queryDef.requested_alert_type?.label || "tipo solicitado";
+    const total = rows[0]?.total_en_periodo ?? n;
+    return total ? `Encontré ${total} ticket(s) de ${requested} en los últimos ${days} días dentro de ${controlCenterCode}. Muestro hasta ${queryDef.limit} registros, priorizando abiertos y más críticos.` : `No encontré tickets de ${requested} en los últimos ${days} días para ${controlCenterCode}.`;
+  }
   if (queryDef.intent === "ticket_types") return n ? `Distribución de tickets por tipo de emergencia para los últimos ${days} días.` : "No hay tickets clasificados por tipo en ese período.";
   if (queryDef.intent === "sirens_summary") {
     const r = rows[0] || {};
@@ -6645,6 +6869,17 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     const queryDef = luciaBuildSafeQuery(question, cc.rows[0].id);
     const sqlPreview = validateLuciaSql(queryDef.sql);
     const result = await runLuciaReadOnly(queryDef.sql, queryDef.params);
+    const answerText = luciaAnswer(queryDef, result.rows, cc.rows[0].code);
+    let report = null;
+    if (luciaWantsPdf(question)) {
+      report = await createLuciaPdfReport({
+        question,
+        queryDef,
+        rows: result.rows,
+        answer: answerText,
+        controlCenter: cc.rows[0]
+      });
+    }
     const auditId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
 
     await pool.query(
@@ -6674,7 +6909,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         name: "Luc-IA",
         mode: "SELECT restringido por centro de control",
         question,
-        answer: luciaAnswer(queryDef, result.rows, cc.rows[0].code),
+        answer: answerText,
         intent: queryDef.intent,
         title: queryDef.title,
         period_days: queryDef.days,
@@ -6690,6 +6925,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         },
         columns: luciaColumns(result.rows),
         rows: result.rows,
+        report,
         sql_preview: process.env.LUCIA_SHOW_SQL === "true" ? sqlPreview : null,
         audit_id: auditId
       }
