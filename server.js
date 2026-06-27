@@ -7223,6 +7223,6 @@ startFlespiMqtt();
 
 
 app.listen(PORT, () => {
-		console.log(`VS&TI Device Middleware v2.0 running on port ${PORT}`);
+		console.log(`VS&TI SOS Middleware v27.4 WebRTC-ready running on port ${PORT}`);
 		});
 
