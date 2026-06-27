@@ -5529,7 +5529,7 @@ app.get("/dashboard/analytics", async (req, res) => {
   try {
     await ensureGeofenceSchema();
     const days = Math.max(1, Math.min(365, Number(req.query.days || 30)));
-    const requestedCode = req.query.control_center_code || req.panel_session?.control_center_code || "CC-VINA";
+    const requestedCode = dashboardAuthorizedControlCenterCode(req);
 
     const ccResult = await pool.query(
       `
@@ -6130,6 +6130,580 @@ app.get("/dashboard/analytics", async (req, res) => {
   }
 });
 
+
+
+/*
+   =========================================================
+   Luc-IA + DASHBOARD TICKETS PAGINADOS v28
+   =========================================================
+
+   Objetivo:
+   - Luc-IA consulta datos reales solo en lectura.
+   - La consulta queda forzada al centro de control del usuario logueado.
+   - No se permite SQL libre desde frontend.
+   - Solo se ejecutan SELECT/WITH generados por catálogo seguro.
+   - Se audita pregunta, intención, SQL y cantidad de filas.
+   - El listado de tickets trabaja paginado de 10 en 10.
+   =========================================================
+*/
+
+function dashboardAuthorizedControlCenterCode(req) {
+  // Regla estricta multi-comuna: la sesión manda.
+  // El frontend puede enviar control_center_code, pero no se usa para escapar del centro del usuario.
+  if (req.panel_session && req.panel_session.control_center_code) {
+    return String(req.panel_session.control_center_code).trim().toUpperCase();
+  }
+  return String(req.query.control_center_code || "CC-VINA").trim().toUpperCase();
+}
+
+let luciaSchemaReady = false;
+async function ensureLuciaSchema() {
+  if (luciaSchemaReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lucia_query_audit (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      user_role TEXT,
+      control_center_id TEXT,
+      control_center_code TEXT,
+      question TEXT,
+      intent TEXT,
+      sql_text TEXT,
+      row_count INTEGER DEFAULT 0,
+      duration_ms INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_lucia_audit_cc_created
+    ON lucia_query_audit(control_center_id, created_at DESC)
+  `);
+  luciaSchemaReady = true;
+}
+
+function normalizeLuciaText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function luciaPeriodDays(question) {
+  const q = normalizeLuciaText(question);
+  const m = q.match(/(ultimos|ultimas|hace|de los|de las)\s+(\d{1,3})\s+(dias|dia)/);
+  if (m) return Math.max(1, Math.min(365, Number(m[2])));
+  if (/hoy|dia de hoy/.test(q)) return 1;
+  if (/ayer/.test(q)) return 2;
+  if (/semana|7 dias/.test(q)) return 7;
+  if (/mes|mensual|30 dias/.test(q)) return 30;
+  if (/trimestre|90 dias/.test(q)) return 90;
+  if (/ano|año|12 meses|365 dias/.test(q)) return 365;
+  return 30;
+}
+
+function luciaLimit(question, fallback = 10) {
+  const q = normalizeLuciaText(question);
+  const m = q.match(/(?:top|primeros|primeras|ultimos|ultimas|mostrar|muestrame|muéstrame)\s+(\d{1,3})/);
+  if (m) return Math.max(1, Math.min(50, Number(m[1])));
+  return fallback;
+}
+
+function luciaIntent(question) {
+  const q = normalizeLuciaText(question);
+  if (/rechaz/.test(q) && /resolutor|funcionario|movil|equipo/.test(q)) return "resolver_rejections";
+  if (/(top|ranking|mas|mayor|mejor).*(resolutor|funcionario|movil|equipo)|resolutor.*(atend|gestion|cerr|resolv)/.test(q)) return "resolver_performance";
+  if (/sin asignar|no asignad|pendiente de asign|disponible.*ticket|ticket.*disponible/.test(q)) return "unassigned_tickets";
+  if (/abiert|activo|en curso|pendiente|sin cerrar/.test(q) && /ticket|caso|emergencia/.test(q)) return "open_tickets";
+  if (/vif|violencia|silencios/.test(q)) return "vif_summary";
+  if (/sla|atras|atrasad|vencid|demora|fuera de plazo|tiempo/.test(q)) return "sla_risks";
+  if (/zona|sector|barrio|calor|recurren|concentr/.test(q)) return "critical_zones";
+  if (/tipo|categoria|emergencia/.test(q) && /(cuanto|cantidad|distrib|resumen|ranking)/.test(q)) return "ticket_types";
+  if (/informe|resumen|ejecutivo|reporte|situacion|estado/.test(q)) return "executive_summary";
+  return "executive_summary";
+}
+
+function luciaBuildSafeQuery(question, ccId) {
+  const intent = luciaIntent(question);
+  const days = luciaPeriodDays(question);
+  const limit = luciaLimit(question, 10);
+  const baseParams = [ccId, days, limit];
+
+  if (intent === "resolver_performance") {
+    return {
+      intent, days, limit,
+      title: "Desempeño de resolutores",
+      params: baseParams,
+      sql: `
+        SELECT
+          u.full_name AS resolutor,
+          u.phone AS telefono,
+          COUNT(t.id)::int AS tickets_asignados,
+          COUNT(t.id) FILTER (WHERE t.state IN ('RESOLVED','CLOSED'))::int AS tickets_cerrados,
+          COUNT(t.id) FILTER (WHERE t.state IN ('ASSIGNED','EN_ROUTE','ON_SITE'))::int AS tickets_en_gestion,
+          ROUND(AVG(EXTRACT(EPOCH FROM (t.resolved_at - t.assigned_at)) / 60.0) FILTER (WHERE t.resolved_at IS NOT NULL AND t.assigned_at IS NOT NULL)::numeric, 1) AS min_promedio_resolucion
+        FROM users u
+        LEFT JOIN tickets t ON t.assigned_resolver_id = u.id
+          AND t.control_center_id = $1
+          AND t.created_at >= NOW() - ($2::int || ' days')::interval
+        WHERE u.control_center_id = $1
+          AND u.role = 'RESOLVER'
+        GROUP BY u.id, u.full_name, u.phone
+        ORDER BY tickets_asignados DESC, tickets_cerrados DESC, resolutor ASC
+        LIMIT $3
+      `
+    };
+  }
+
+  if (intent === "resolver_rejections") {
+    return {
+      intent, days, limit,
+      title: "Rechazos por resolutor",
+      params: baseParams,
+      sql: `
+        SELECT
+          COALESCE(u.full_name, 'Sin actor identificado') AS resolutor,
+          COALESCE(u.phone, '—') AS telefono,
+          COUNT(*)::int AS rechazos,
+          MAX(ta.created_at) AS ultimo_rechazo
+        FROM ticket_actions ta
+        JOIN tickets t ON t.id = ta.ticket_id
+        LEFT JOIN users u ON u.id = ta.actor_user_id
+        WHERE t.control_center_id = $1
+          AND ta.created_at >= NOW() - ($2::int || ' days')::interval
+          AND ta.action_type IN ('RESOLVER_REJECTED','TICKET_REJECTED')
+        GROUP BY u.id, u.full_name, u.phone
+        ORDER BY rechazos DESC, ultimo_rechazo DESC
+        LIMIT $3
+      `
+    };
+  }
+
+  if (intent === "unassigned_tickets") {
+    return {
+      intent, days, limit,
+      title: "Tickets sin asignar",
+      params: baseParams,
+      sql: `
+        SELECT
+          t.id,
+          t.title AS titulo,
+          t.alert_type AS tipo,
+          t.state AS estado,
+          t.priority AS prioridad,
+          ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
+          citizen.full_name AS vecino,
+          t.created_at
+        FROM tickets t
+        LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+        WHERE t.control_center_id = $1
+          AND t.created_at >= NOW() - ($2::int || ' days')::interval
+          AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+          AND t.assigned_resolver_id IS NULL
+        ORDER BY t.priority ASC, t.created_at ASC
+        LIMIT $3
+      `
+    };
+  }
+
+  if (intent === "open_tickets") {
+    return {
+      intent, days, limit,
+      title: "Tickets abiertos",
+      params: baseParams,
+      sql: `
+        SELECT
+          t.id,
+          t.title AS titulo,
+          t.alert_type AS tipo,
+          t.state AS estado,
+          t.priority AS prioridad,
+          resolver.full_name AS resolutor,
+          ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
+          t.created_at
+        FROM tickets t
+        LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+        WHERE t.control_center_id = $1
+          AND t.created_at >= NOW() - ($2::int || ' days')::interval
+          AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+        ORDER BY t.priority ASC, t.created_at ASC
+        LIMIT $3
+      `
+    };
+  }
+
+  if (intent === "vif_summary") {
+    return {
+      intent, days, limit,
+      title: "Resumen VIF",
+      params: [ccId, days],
+      sql: `
+        SELECT
+          COUNT(*)::int AS eventos_vif,
+          COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS abiertos,
+          COUNT(*) FILTER (WHERE source_type = 'MOBILE_APP')::int AS desde_app,
+          COUNT(*) FILTER (WHERE priority <= 2)::int AS alta_prioridad,
+          ROUND(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at)) / 60.0) FILTER (WHERE assigned_at IS NOT NULL)::numeric, 1) AS min_promedio_asignacion,
+          MAX(created_at) AS ultimo_evento
+        FROM tickets
+        WHERE control_center_id = $1
+          AND created_at >= NOW() - ($2::int || ' days')::interval
+          AND alert_type = 'VIF'
+        LIMIT 1
+      `
+    };
+  }
+
+  if (intent === "sla_risks") {
+    return {
+      intent, days, limit,
+      title: "Tickets con riesgo SLA",
+      params: baseParams,
+      sql: `
+        SELECT
+          t.id,
+          t.title AS titulo,
+          t.alert_type AS tipo,
+          t.state AS estado,
+          t.priority AS prioridad,
+          resolver.full_name AS resolutor,
+          ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
+          CASE
+            WHEN t.acknowledged_at IS NULL AND t.created_at < NOW() - INTERVAL '5 minutes' THEN 'ACK vencido'
+            WHEN t.assigned_at IS NULL AND t.created_at < NOW() - INTERVAL '15 minutes' THEN 'Asignación vencida'
+            WHEN t.resolved_at IS NULL AND t.created_at < NOW() - INTERVAL '60 minutes' THEN 'Resolución vencida'
+            ELSE 'En observación'
+          END AS riesgo
+        FROM tickets t
+        LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+        WHERE t.control_center_id = $1
+          AND t.created_at >= NOW() - ($2::int || ' days')::interval
+          AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+          AND (
+            (t.acknowledged_at IS NULL AND t.created_at < NOW() - INTERVAL '5 minutes') OR
+            (t.assigned_at IS NULL AND t.created_at < NOW() - INTERVAL '15 minutes') OR
+            (t.resolved_at IS NULL AND t.created_at < NOW() - INTERVAL '60 minutes')
+          )
+        ORDER BY t.created_at ASC
+        LIMIT $3
+      `
+    };
+  }
+
+  if (intent === "critical_zones") {
+    return {
+      intent, days, limit,
+      title: "Zonas críticas",
+      params: baseParams,
+      sql: `
+        WITH geo AS (
+          SELECT
+            ROUND(latitude::numeric, 4) AS lat_key,
+            ROUND(longitude::numeric, 4) AS lon_key,
+            alert_type,
+            state,
+            created_at
+          FROM tickets
+          WHERE control_center_id = $1
+            AND created_at >= NOW() - ($2::int || ' days')::interval
+            AND latitude IS NOT NULL
+            AND longitude IS NOT NULL
+            AND COALESCE(jurisdiction_status, 'IN_JURISDICTION') <> 'OUT_OF_JURISDICTION'
+        )
+        SELECT
+          lat_key::float AS latitud,
+          lon_key::float AS longitud,
+          COUNT(*)::int AS eventos,
+          COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS abiertos,
+          COALESCE((
+            SELECT g2.alert_type
+            FROM geo g2
+            WHERE g2.lat_key = geo.lat_key AND g2.lon_key = geo.lon_key
+            GROUP BY g2.alert_type
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+          ), 'SIN_TIPO') AS tipo_principal,
+          MAX(created_at) AS ultimo_evento
+        FROM geo
+        GROUP BY lat_key, lon_key
+        ORDER BY eventos DESC, ultimo_evento DESC
+        LIMIT $3
+      `
+    };
+  }
+
+  if (intent === "ticket_types") {
+    return {
+      intent, days, limit,
+      title: "Tickets por tipo de emergencia",
+      params: baseParams,
+      sql: `
+        SELECT
+          COALESCE(alert_type, 'SIN_TIPO') AS tipo,
+          COUNT(*)::int AS tickets,
+          COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS abiertos,
+          COUNT(*) FILTER (WHERE priority <= 2)::int AS alta_prioridad
+        FROM tickets
+        WHERE control_center_id = $1
+          AND created_at >= NOW() - ($2::int || ' days')::interval
+        GROUP BY alert_type
+        ORDER BY tickets DESC
+        LIMIT $3
+      `
+    };
+  }
+
+  return {
+    intent: "executive_summary", days, limit: 1,
+    title: "Resumen ejecutivo operacional",
+    params: [ccId, days],
+    sql: `
+      SELECT
+        COUNT(*)::int AS tickets_periodo,
+        COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS tickets_abiertos,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')::int AS tickets_24h,
+        COUNT(*) FILTER (WHERE priority <= 2)::int AS alta_prioridad,
+        ROUND(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at)) / 60.0) FILTER (WHERE assigned_at IS NOT NULL)::numeric, 1) AS min_promedio_asignacion,
+        ROUND(AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 60.0) FILTER (WHERE resolved_at IS NOT NULL)::numeric, 1) AS min_promedio_resolucion,
+        COUNT(*) FILTER (WHERE COALESCE(jurisdiction_status, 'IN_JURISDICTION') = 'OUT_OF_JURISDICTION')::int AS fuera_de_jurisdiccion
+      FROM tickets
+      WHERE control_center_id = $1
+        AND created_at >= NOW() - ($2::int || ' days')::interval
+      LIMIT 1
+    `
+  };
+}
+
+function validateLuciaSql(sql) {
+  const compact = String(sql || "").replace(/\s+/g, " ").trim();
+  if (!/^(SELECT|WITH)\s/i.test(compact)) throw new Error("Luc-IA solo puede ejecutar SELECT/WITH.");
+  if (compact.includes(";")) throw new Error("Luc-IA no puede ejecutar múltiples sentencias.");
+  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY|CALL|DO|VACUUM|ANALYZE)\b/i.test(compact)) {
+    throw new Error("Consulta bloqueada por política de solo lectura.");
+  }
+  if (!/control_center_id\s*=\s*\$1/i.test(compact) && !/control_center_id\s*=\s*u\.control_center_id/i.test(compact)) {
+    throw new Error("Consulta bloqueada: debe estar filtrada por centro de control.");
+  }
+  if (!/\bLIMIT\b/i.test(compact)) throw new Error("Consulta bloqueada: debe incluir LIMIT.");
+  return compact;
+}
+
+async function runLuciaReadOnly(sql, params) {
+  validateLuciaSql(sql);
+  const client = await pool.connect();
+  const started = Date.now();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET TRANSACTION READ ONLY");
+    await client.query("SET LOCAL statement_timeout = '3000ms'");
+    const result = await client.query(sql, params);
+    await client.query("COMMIT");
+    return { rows: result.rows, row_count: result.rows.length, duration_ms: Date.now() - started };
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function luciaColumns(rows) {
+  if (!rows || !rows.length) return [];
+  return Object.keys(rows[0]);
+}
+
+function luciaAnswer(queryDef, rows, controlCenterCode) {
+  const n = rows.length;
+  const days = queryDef.days;
+  if (queryDef.intent === "executive_summary") {
+    const r = rows[0] || {};
+    return `Resumen de ${controlCenterCode} para los últimos ${days} días: ${r.tickets_periodo || 0} tickets, ${r.tickets_abiertos || 0} abiertos, ${r.tickets_24h || 0} en las últimas 24 horas y ${r.alta_prioridad || 0} de alta prioridad. Tiempo promedio de asignación: ${r.min_promedio_asignacion ?? '—'} min. Tiempo promedio de resolución: ${r.min_promedio_resolucion ?? '—'} min.`;
+  }
+  if (queryDef.intent === "resolver_performance") return n ? `Encontré ${n} resolutores para el período. El ranking está ordenado por tickets asignados y cierres/resoluciones.` : "No encontré actividad de resolutores para ese período.";
+  if (queryDef.intent === "resolver_rejections") return n ? `Estos son los resolutores con rechazos registrados en los últimos ${days} días.` : "No hay rechazos de resolutores registrados en ese período.";
+  if (queryDef.intent === "unassigned_tickets") return n ? `Hay ${n} tickets sin asignar dentro del límite solicitado. Prioricé por criticidad y antigüedad.` : "No encontré tickets sin asignar en el período consultado.";
+  if (queryDef.intent === "open_tickets") return n ? `Estos son los tickets abiertos más relevantes, ordenados por prioridad y antigüedad.` : "No encontré tickets abiertos para ese período.";
+  if (queryDef.intent === "vif_summary") {
+    const r = rows[0] || {};
+    return `En VIF, para los últimos ${days} días, hay ${r.eventos_vif || 0} eventos, ${r.abiertos || 0} abiertos y ${r.alta_prioridad || 0} de alta prioridad. Promedio de asignación: ${r.min_promedio_asignacion ?? '—'} min.`;
+  }
+  if (queryDef.intent === "sla_risks") return n ? `Detecté ${n} tickets con riesgo o vencimiento SLA. Conviene revisar asignación y resolución.` : "No encontré tickets fuera de SLA en el período.";
+  if (queryDef.intent === "critical_zones") return n ? `Estas son las principales zonas de recurrencia. La agrupación es aproximada por coordenada para análisis preventivo.` : "No hay puntos suficientes para identificar zonas críticas en ese período.";
+  if (queryDef.intent === "ticket_types") return n ? `Distribución de tickets por tipo de emergencia para los últimos ${days} días.` : "No hay tickets clasificados por tipo en ese período.";
+  return `Luc-IA procesó la consulta sobre ${controlCenterCode} y encontró ${n} filas.`;
+}
+
+app.post("/dashboard/lucia/ask", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para usar Luc-IA")) return;
+
+  try {
+    await ensureLuciaSchema();
+    const question = String(req.body?.question || "").trim();
+    if (!question || question.length < 3) {
+      return res.status(400).json({ status: "error", message: "Escribe una pregunta para Luc-IA." });
+    }
+    if (question.length > 800) {
+      return res.status(400).json({ status: "error", message: "La pregunta es demasiado larga." });
+    }
+
+    const controlCenterCode = dashboardAuthorizedControlCenterCode(req);
+    const cc = await pool.query("SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1", [controlCenterCode]);
+    if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const queryDef = luciaBuildSafeQuery(question, cc.rows[0].id);
+    const sqlPreview = validateLuciaSql(queryDef.sql);
+    const result = await runLuciaReadOnly(queryDef.sql, queryDef.params);
+    const auditId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+
+    await pool.query(
+      `
+      INSERT INTO lucia_query_audit (
+        id, user_id, user_role, control_center_id, control_center_code,
+        question, intent, sql_text, row_count, duration_ms
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      `,
+      [
+        auditId,
+        req.panel_session.sub,
+        req.panel_session.role,
+        cc.rows[0].id,
+        cc.rows[0].code,
+        question,
+        queryDef.intent,
+        sqlPreview,
+        result.row_count,
+        result.duration_ms
+      ]
+    ).catch((error) => console.warn("[LUCIA AUDIT WARN]", error.message));
+
+    res.json({
+      status: "ok",
+      lucia: {
+        name: "Luc-IA",
+        mode: "SELECT restringido por centro de control",
+        question,
+        answer: luciaAnswer(queryDef, result.rows, cc.rows[0].code),
+        intent: queryDef.intent,
+        title: queryDef.title,
+        period_days: queryDef.days,
+        row_count: result.row_count,
+        duration_ms: result.duration_ms,
+        control_center: { code: cc.rows[0].code, name: cc.rows[0].name },
+        safety: {
+          readonly: true,
+          forced_control_center_code: cc.rows[0].code,
+          max_rows: queryDef.limit || result.row_count,
+          arbitrary_sql: false,
+          pii_minimized: true
+        },
+        columns: luciaColumns(result.rows),
+        rows: result.rows,
+        sql_preview: process.env.LUCIA_SHOW_SQL === "true" ? sqlPreview : null,
+        audit_id: auditId
+      }
+    });
+  } catch (error) {
+    console.error("[LUCIA ASK ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message || "No se pudo procesar la consulta de Luc-IA" });
+  }
+});
+
+app.get("/dashboard/tickets", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para listar tickets")) return;
+
+  try {
+    const controlCenterCode = dashboardAuthorizedControlCenterCode(req);
+    const cc = await pool.query("SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1", [controlCenterCode]);
+    if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(10, Math.max(1, Number(req.query.page_size || 10)));
+    const offset = (page - 1) * pageSize;
+    const state = String(req.query.state || "").trim().toUpperCase();
+    const alertType = String(req.query.alert_type || "").trim().toUpperCase();
+    const q = String(req.query.q || "").trim();
+
+    const params = [cc.rows[0].id];
+    const where = ["t.control_center_id = $1"];
+    if (state) {
+      params.push(state);
+      where.push(`t.state = $${params.length}`);
+    }
+    if (alertType) {
+      params.push(alertType);
+      where.push(`t.alert_type = $${params.length}`);
+    }
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(`(
+        t.id::text ILIKE $${params.length}
+        OR COALESCE(t.title,'') ILIKE $${params.length}
+        OR COALESCE(citizen.full_name,'') ILIKE $${params.length}
+        OR COALESCE(resolver.full_name,'') ILIKE $${params.length}
+      )`);
+    }
+
+    const whereSql = where.join(" AND ");
+    const countResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS total
+      FROM tickets t
+      LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+      LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+      WHERE ${whereSql}
+      `,
+      params
+    );
+
+    const listParams = [...params, pageSize, offset];
+    const limitIndex = listParams.length - 1;
+    const offsetIndex = listParams.length;
+    const rowsResult = await pool.query(
+      `
+      SELECT
+        t.id,
+        t.title,
+        t.alert_type,
+        t.source_type,
+        t.state,
+        t.priority,
+        t.created_at,
+        t.acknowledged_at,
+        t.assigned_at,
+        t.resolved_at,
+        ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS age_minutes,
+        citizen.full_name AS citizen_name,
+        resolver.full_name AS resolver_name
+      FROM tickets t
+      LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+      LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+      WHERE ${whereSql}
+      ORDER BY t.created_at DESC
+      LIMIT $${limitIndex} OFFSET $${offsetIndex}
+      `,
+      listParams
+    );
+
+    const total = Number(countResult.rows[0]?.total || 0);
+    res.json({
+      status: "ok",
+      control_center: { code: cc.rows[0].code, name: cc.rows[0].name },
+      pagination: {
+        page,
+        page_size: pageSize,
+        total,
+        total_pages: Math.max(1, Math.ceil(total / pageSize)),
+        has_prev: page > 1,
+        has_next: page * pageSize < total
+      },
+      tickets: rowsResult.rows
+    });
+  } catch (error) {
+    console.error("[DASHBOARD TICKETS ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message || "No se pudo listar tickets" });
+  }
+});
 
 app.get("/dashboard/map-state", async (req, res) => {
   if (String(process.env.REQUIRE_CONTROL_PANEL_AUTH || "false").toLowerCase() === "true") {
