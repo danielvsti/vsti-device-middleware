@@ -1489,7 +1489,7 @@ async function releaseResolverIfNoActiveTicket(resolverUserId, options = {}) {
     UPDATE resolver_locations
     SET
       status = $2,
-      updated_at = NOW()
+      updated_at = CASE WHEN $4::boolean = true THEN NOW() ELSE updated_at END
     WHERE user_id = $1
       AND (
         status IN ('BUSY','EN_ROUTE','ON_SITE')
@@ -1497,7 +1497,7 @@ async function releaseResolverIfNoActiveTicket(resolverUserId, options = {}) {
       )
     RETURNING *
     `,
-    [resolverUserId, allowedTarget, options.force === true]
+    [resolverUserId, allowedTarget, options.force === true, options.touch === true]
   );
 
   return {
@@ -1506,6 +1506,44 @@ async function releaseResolverIfNoActiveTicket(resolverUserId, options = {}) {
     status: allowedTarget,
     resolver_location: update.rows[0] || null,
     active_tickets: activeTickets
+  };
+}
+
+function isResolverOnlineFromLocation(row) {
+  if (!row) return false;
+  const status = String(row.status || row.resolver_status || "").toUpperCase();
+  const updatedAt = row.updated_at || row.resolver_updated_at;
+  if (!updatedAt) return false;
+  if (status === "OFFLINE") return false;
+  const ageMs = Date.now() - new Date(updatedAt).getTime();
+  return Number.isFinite(ageMs) && ageMs <= 3 * 60 * 1000;
+}
+
+async function reconcileResolverStatesForControlCenter(controlCenterId) {
+  if (!controlCenterId) return { checked: 0, reconciled: 0, results: [] };
+
+  const candidates = await pool.query(
+    `
+    SELECT u.id
+    FROM users u
+    LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+    WHERE u.control_center_id = $1
+      AND u.role = 'RESOLVER'
+      AND u.is_active = true
+      AND COALESCE(rl.status, '') IN ('BUSY','EN_ROUTE','ON_SITE')
+    `,
+    [controlCenterId]
+  );
+
+  const results = [];
+  for (const row of candidates.rows || []) {
+    results.push(await reconcileResolverOperationalStatus(row.id, { touch: false }));
+  }
+
+  return {
+    checked: candidates.rows.length,
+    reconciled: results.filter((r) => r.reconciled).length,
+    results
   };
 }
 
@@ -1548,7 +1586,8 @@ async function reconcileResolverOperationalStatus(resolverUserId, options = {}) 
     const targetStatus = options.offline === true ? "OFFLINE" : "AVAILABLE";
     const release = await releaseResolverIfNoActiveTicket(resolverUserId, {
       force: true,
-      status: targetStatus
+      status: targetStatus,
+      touch: options.touch === true
     });
     return {
       status: "ok",
@@ -5417,6 +5456,71 @@ function minutesToHuman(minutes) {
   return m ? `${h} h ${m} min` : `${h} h`;
 }
 
+app.get("/debug/resolver-status-summary", async (req, res) => {
+  try {
+    const adminToken = req.headers["x-admin-token"] || req.query.admin_token;
+    if (process.env.ADMIN_TOKEN && adminToken !== process.env.ADMIN_TOKEN) {
+      return res.status(401).json({ status: "error", message: "Invalid admin token" });
+    }
+
+    const controlCenterCode = req.query.control_center_code || "CC-VINA";
+    const cc = await pool.query("SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1", [controlCenterCode]);
+    if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Unknown control_center_code" });
+
+    const ccId = cc.rows[0].id;
+    await reconcileResolverStatesForControlCenter(ccId);
+
+    const rows = await pool.query(
+      `
+      WITH resolver_base AS (
+        SELECT
+          u.id,
+          u.full_name,
+          u.phone,
+          u.is_active,
+          COALESCE(UPPER(rl.status), 'SIN_UBICACION') AS raw_status,
+          rl.latitude,
+          rl.longitude,
+          rl.accuracy,
+          rl.updated_at,
+          COUNT(t.id)::int AS active_tickets_count
+        FROM users u
+        LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+        LEFT JOIN tickets t ON t.assigned_resolver_id = u.id
+          AND t.control_center_id = u.control_center_id
+          AND t.state = ANY($2::text[])
+        WHERE u.control_center_id = $1
+          AND u.role = 'RESOLVER'
+        GROUP BY u.id, u.full_name, u.phone, u.is_active, rl.status, rl.latitude, rl.longitude, rl.accuracy, rl.updated_at
+      )
+      SELECT
+        *,
+        CASE
+          WHEN is_active IS NOT TRUE THEN 'INACTIVE'
+          WHEN updated_at IS NULL THEN 'NO_GPS'
+          WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
+          WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
+          WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
+          WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+          WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
+          WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
+          WHEN active_tickets_count > 0 THEN 'BUSY'
+          WHEN raw_status = 'AVAILABLE' THEN 'AVAILABLE'
+          ELSE raw_status
+        END AS operational_state
+      FROM resolver_base
+      ORDER BY full_name
+      `,
+      [ccId, ACTIVE_RESOLVER_TICKET_STATES]
+    );
+
+    res.json({ status: "ok", control_center: cc.rows[0], resolvers: rows.rows });
+  } catch (error) {
+    console.error("[DEBUG RESOLVER STATUS SUMMARY ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
 app.get("/dashboard/analytics", async (req, res) => {
   if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al dashboard")) return;
 
@@ -5451,6 +5555,11 @@ app.get("/dashboard/analytics", async (req, res) => {
 
     const controlCenter = ccResult.rows[0];
     const ccId = controlCenter.id;
+
+    // Before calculating dashboard KPIs, reconcile impossible resolver states:
+    // BUSY / EN_ROUTE / ON_SITE without an active assigned ticket.
+    // This does not touch GPS freshness timestamps.
+    const resolverReconciliation = await reconcileResolverStatesForControlCenter(ccId);
 
     const summaryResult = await pool.query(
       `
@@ -5525,23 +5634,71 @@ app.get("/dashboard/analytics", async (req, res) => {
 
     const resolversSummaryResult = await pool.query(
       `
+      WITH resolver_base AS (
+        SELECT
+          u.id,
+          u.full_name,
+          u.phone,
+          u.is_active,
+          COALESCE(UPPER(rl.status), 'SIN_UBICACION') AS raw_status,
+          rl.latitude,
+          rl.longitude,
+          rl.accuracy,
+          rl.updated_at,
+          COUNT(t.id)::int AS active_tickets_count
+        FROM users u
+        LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+        LEFT JOIN tickets t ON t.assigned_resolver_id = u.id
+          AND t.control_center_id = u.control_center_id
+          AND t.state = ANY($2::text[])
+        WHERE u.control_center_id = $1
+          AND u.role = 'RESOLVER'
+        GROUP BY u.id, u.full_name, u.phone, u.is_active, rl.status, rl.latitude, rl.longitude, rl.accuracy, rl.updated_at
+      ), classified AS (
+        SELECT
+          *,
+          CASE
+            WHEN is_active IS NOT TRUE THEN 'INACTIVE'
+            WHEN updated_at IS NULL THEN 'NO_GPS'
+            WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
+            WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
+            WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
+            WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+            WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
+            WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
+            WHEN active_tickets_count > 0 THEN 'BUSY'
+            WHEN raw_status = 'AVAILABLE' THEN 'AVAILABLE'
+            ELSE raw_status
+          END AS operational_state,
+          CASE
+            WHEN updated_at IS NULL THEN 'NO_GPS'
+            WHEN updated_at >= NOW() - INTERVAL '3 minutes' THEN 'FRESH'
+            WHEN updated_at >= NOW() - INTERVAL '10 minutes' THEN 'STALE'
+            ELSE 'EXPIRED'
+          END AS gps_state
+        FROM resolver_base
+      )
       SELECT
         COUNT(*)::int AS resolvers_total,
-        COUNT(*) FILTER (WHERE u.is_active = true)::int AS resolvers_active,
-        COUNT(*) FILTER (WHERE rl.user_id IS NULL)::int AS resolvers_without_location,
-        COUNT(*) FILTER (WHERE rl.updated_at >= NOW() - INTERVAL '3 minutes')::int AS resolvers_online,
-        COUNT(*) FILTER (WHERE rl.updated_at < NOW() - INTERVAL '3 minutes' AND rl.updated_at >= NOW() - INTERVAL '10 minutes')::int AS resolvers_stale,
-        COUNT(*) FILTER (WHERE rl.updated_at < NOW() - INTERVAL '10 minutes' OR rl.user_id IS NULL)::int AS resolvers_offline,
-        COUNT(*) FILTER (WHERE rl.status = 'AVAILABLE' AND rl.updated_at >= NOW() - INTERVAL '5 minutes')::int AS resolvers_available_now,
-        COUNT(*) FILTER (WHERE rl.status = 'BUSY')::int AS resolvers_busy,
-        COUNT(*) FILTER (WHERE rl.status = 'EN_ROUTE')::int AS resolvers_en_route,
-        COUNT(*) FILTER (WHERE rl.status = 'ON_SITE')::int AS resolvers_on_site
-      FROM users u
-      LEFT JOIN resolver_locations rl ON rl.user_id = u.id
-      WHERE u.control_center_id = $1
-        AND u.role = 'RESOLVER'
+        COUNT(*)::int AS resolvers_registered_total,
+        COUNT(*) FILTER (WHERE is_active = true)::int AS resolvers_active,
+        COUNT(*) FILTER (WHERE is_active IS NOT true)::int AS resolvers_inactive,
+        COUNT(*) FILTER (WHERE updated_at IS NULL)::int AS resolvers_without_location,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('AVAILABLE','BUSY','EN_ROUTE','ON_SITE','BLOCKED_NO_TICKET'))::int AS resolvers_online,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'STALE_GPS')::int AS resolvers_stale,
+        COUNT(*) FILTER (WHERE is_active IS NOT true OR operational_state IN ('OFFLINE','NO_GPS'))::int AS resolvers_offline,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'AVAILABLE')::int AS resolvers_available_now,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('BUSY','EN_ROUTE','ON_SITE'))::int AS resolvers_busy,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'EN_ROUTE')::int AS resolvers_en_route,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'ON_SITE')::int AS resolvers_on_site,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'BLOCKED_NO_TICKET')::int AS resolvers_blocked_without_ticket,
+        COUNT(*) FILTER (WHERE is_active = true AND active_tickets_count > 0)::int AS resolvers_with_active_ticket,
+        COUNT(*) FILTER (WHERE is_active = true AND gps_state = 'FRESH')::int AS resolvers_gps_fresh,
+        COUNT(*) FILTER (WHERE is_active = true AND gps_state = 'STALE')::int AS resolvers_gps_stale,
+        COUNT(*) FILTER (WHERE is_active = true AND gps_state IN ('EXPIRED','NO_GPS'))::int AS resolvers_gps_expired
+      FROM classified
       `,
-      [ccId]
+      [ccId, ACTIVE_RESOLVER_TICKET_STATES]
     );
 
     const sirensSummaryResult = await pool.query(
@@ -5725,26 +5882,61 @@ app.get("/dashboard/analytics", async (req, res) => {
 
     const resolverStatusResult = await pool.query(
       `
+      WITH resolver_base AS (
+        SELECT
+          u.id,
+          u.full_name,
+          u.phone,
+          u.is_active,
+          COALESCE(UPPER(rl.status), 'SIN_UBICACION') AS raw_status,
+          rl.latitude,
+          rl.longitude,
+          rl.accuracy,
+          rl.updated_at,
+          COUNT(t.id)::int AS active_tickets_count
+        FROM users u
+        LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+        LEFT JOIN tickets t ON t.assigned_resolver_id = u.id
+          AND t.control_center_id = u.control_center_id
+          AND t.state = ANY($2::text[])
+        WHERE u.control_center_id = $1
+          AND u.role = 'RESOLVER'
+        GROUP BY u.id, u.full_name, u.phone, u.is_active, rl.status, rl.latitude, rl.longitude, rl.accuracy, rl.updated_at
+      )
       SELECT
-        u.id,
-        u.full_name,
-        u.phone,
-        u.is_active,
-        COALESCE(rl.status, 'SIN_UBICACION') AS status,
-        rl.updated_at,
+        id,
+        full_name,
+        phone,
+        is_active,
+        raw_status AS status,
+        latitude,
+        longitude,
+        accuracy,
+        updated_at,
+        active_tickets_count,
         CASE
-          WHEN rl.updated_at IS NULL THEN 'SIN_UBICACION'
-          WHEN rl.updated_at >= NOW() - INTERVAL '3 minutes' THEN 'ONLINE'
-          WHEN rl.updated_at >= NOW() - INTERVAL '10 minutes' THEN 'DESACTUALIZADO'
+          WHEN is_active IS NOT TRUE THEN 'INACTIVE'
+          WHEN updated_at IS NULL THEN 'NO_GPS'
+          WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
+          WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
+          WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
+          WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+          WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
+          WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
+          WHEN active_tickets_count > 0 THEN 'BUSY'
+          WHEN raw_status = 'AVAILABLE' THEN 'AVAILABLE'
+          ELSE raw_status
+        END AS operational_state,
+        CASE
+          WHEN updated_at IS NULL THEN 'SIN_UBICACION'
+          WHEN updated_at >= NOW() - INTERVAL '3 minutes' THEN 'ONLINE'
+          WHEN updated_at >= NOW() - INTERVAL '10 minutes' THEN 'DESACTUALIZADO'
           ELSE 'OFFLINE'
         END AS heartbeat
-      FROM users u
-      LEFT JOIN resolver_locations rl ON rl.user_id = u.id
-      WHERE u.control_center_id = $1
-        AND u.role = 'RESOLVER'
-      ORDER BY u.full_name ASC
+      FROM resolver_base
+      ORDER BY full_name ASC
       `,
-      [ccId]
+      [ccId, ACTIVE_RESOLVER_TICKET_STATES]
     );
 
     const actionsResult = await pool.query(
@@ -5893,7 +6085,8 @@ app.get("/dashboard/analytics", async (req, res) => {
       operations: {
         recent_tickets: recentTicketsResult.rows,
         pending_validation_neighbors: pendingValidationResult.rows,
-        resolver_status: resolverStatusResult.rows
+        resolver_status: resolverStatusResult.rows,
+        resolver_reconciliation: resolverReconciliation
       },
       geo: {
         center: {
