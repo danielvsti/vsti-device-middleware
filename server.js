@@ -1388,7 +1388,12 @@ async function createTicket({
     ]
   );
 
-  const ticket = ticketResult.rows[0];
+  let ticket = ticketResult.rows[0];
+
+  ticket = await classifyAndPersistTicketSector(ticket).catch((error) => {
+    console.warn('[CREATE TICKET SECTOR WARNING]', error.message);
+    return ticket;
+  });
 
   await pool.query(
     `
@@ -3976,20 +3981,22 @@ app.get("/tickets", async (req, res) => {
         t.latitude,
         t.longitude,
 
-        CASE
-          WHEN t.latitude IS NULL OR t.longitude IS NULL THEN 'Sector no informado'
-          WHEN t.latitude > -32.981 AND t.longitude < -71.532 THEN 'Reñaca Bajo / Jardín del Mar'
-          WHEN t.latitude > -32.982 AND t.longitude >= -71.532 THEN 'Reñaca Alto'
-          WHEN t.latitude > -32.999 AND t.longitude > -71.510 THEN 'Gómez Carreño / Glorias Navales'
-          WHEN t.latitude > -33.007 AND t.longitude > -71.522 THEN 'Achupallas / Santa Julia'
-          WHEN t.latitude > -33.009 AND t.longitude <= -71.522 THEN 'Santa Inés / Población Vergara'
-          WHEN t.latitude > -33.024 AND t.longitude < -71.545 THEN 'Plan Viña / Libertad'
-          WHEN t.latitude > -33.026 AND t.longitude >= -71.545 THEN 'Miraflores / Chorrillos'
-          WHEN t.latitude <= -33.035 AND t.longitude < -71.545 THEN 'Recreo / Agua Santa'
-          WHEN t.latitude <= -33.035 AND t.longitude >= -71.545 THEN 'Forestal / Nueva Aurora'
-          ELSE 'Viña del Mar'
-        END AS incident_sector,
-        'Estimación por coordenada; pendiente cartografía oficial de sectores' AS sector_method,
+        COALESCE(t.event_sector_name,
+          CASE
+            WHEN t.latitude IS NULL OR t.longitude IS NULL THEN 'Sector no informado'
+            WHEN t.latitude > -32.981 AND t.longitude < -71.532 THEN 'Reñaca Bajo / Jardín del Mar'
+            WHEN t.latitude > -32.982 AND t.longitude >= -71.532 THEN 'Reñaca Alto'
+            WHEN t.latitude > -32.999 AND t.longitude > -71.510 THEN 'Gómez Carreño / Glorias Navales'
+            WHEN t.latitude > -33.007 AND t.longitude > -71.522 THEN 'Achupallas / Santa Julia'
+            WHEN t.latitude > -33.009 AND t.longitude <= -71.522 THEN 'Santa Inés / Población Vergara'
+            WHEN t.latitude > -33.024 AND t.longitude < -71.545 THEN 'Plan Viña / Libertad'
+            WHEN t.latitude > -33.026 AND t.longitude >= -71.545 THEN 'Miraflores / Chorrillos'
+            WHEN t.latitude <= -33.035 AND t.longitude < -71.545 THEN 'Recreo / Agua Santa'
+            WHEN t.latitude <= -33.035 AND t.longitude >= -71.545 THEN 'Forestal / Nueva Aurora'
+            ELSE 'Viña del Mar'
+          END
+        ) AS incident_sector,
+        COALESCE(t.event_sector_method, 'Estimación por coordenada; pendiente cartografía oficial de sectores') AS sector_method,
         t.accuracy,
         t.created_at,
         t.acknowledged_at,
@@ -6541,17 +6548,19 @@ function luciaBuildSafeQuery(question, ccId) {
           t.alert_type AS tipo,
           t.state AS estado,
           t.priority AS prioridad,
-          CASE
-            WHEN t.latitude > -32.9800 AND t.longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
-            WHEN t.latitude > -33.0000 AND t.longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
-            WHEN t.latitude > -33.0020 AND t.longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
-            WHEN t.latitude BETWEEN -33.0300 AND -33.0100 AND t.longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
-            WHEN t.latitude BETWEEN -33.0300 AND -33.0050 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
-            WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
-            WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
-            ELSE 'Sector estimado por coordenada'
-          END AS sector_estimado,
-          'Estimación por coordenada; no cartografía oficial de barrios' AS metodo_sector,
+          COALESCE(t.event_sector_name,
+            CASE
+              WHEN t.latitude > -32.9800 AND t.longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
+              WHEN t.latitude > -33.0000 AND t.longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
+              WHEN t.latitude > -33.0020 AND t.longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
+              WHEN t.latitude BETWEEN -33.0300 AND -33.0100 AND t.longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
+              WHEN t.latitude BETWEEN -33.0300 AND -33.0050 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
+              WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
+              WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
+              ELSE 'Sector estimado por coordenada'
+            END
+          ) AS sector_estimado,
+          COALESCE(t.event_sector_method, 'Estimación por coordenada; no cartografía oficial de barrios') AS metodo_sector,
           citizen.full_name AS vecino,
           resolver.full_name AS resolutor,
           ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
@@ -6740,16 +6749,18 @@ function luciaBuildSafeQuery(question, ccId) {
           SELECT
             latitude::numeric AS lat,
             longitude::numeric AS lon,
-            CASE
-              WHEN latitude > -32.9800 AND longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
-              WHEN latitude > -33.0000 AND longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
-              WHEN latitude > -33.0020 AND longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
-              WHEN latitude BETWEEN -33.0300 AND -33.0100 AND longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
-              WHEN latitude BETWEEN -33.0300 AND -33.0050 AND longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
-              WHEN latitude < -33.0350 AND longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
-              WHEN latitude < -33.0300 AND longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
-              ELSE 'Sector por determinar dentro de la comuna'
-            END AS sector_aproximado,
+            COALESCE(event_sector_name,
+              CASE
+                WHEN latitude > -32.9800 AND longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
+                WHEN latitude > -33.0000 AND longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
+                WHEN latitude > -33.0020 AND longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
+                WHEN latitude BETWEEN -33.0300 AND -33.0100 AND longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
+                WHEN latitude BETWEEN -33.0300 AND -33.0050 AND longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
+                WHEN latitude < -33.0350 AND longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
+                WHEN latitude < -33.0300 AND longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
+                ELSE 'Sector por determinar dentro de la comuna'
+              END
+            ) AS sector_aproximado,
             alert_type,
             state,
             created_at
@@ -6773,7 +6784,7 @@ function luciaBuildSafeQuery(question, ccId) {
           COUNT(*)::int AS eventos,
           COUNT(*) FILTER (WHERE g.state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS abiertos,
           COALESCE(t.alert_type, 'SIN_TIPO') AS tipo_principal,
-          'Estimación por coordenada; no cartografía oficial de barrios' AS metodo_sector,
+          'Zonificación oficial UV si está disponible; fallback por coordenada' AS metodo_sector,
           MAX(g.created_at) AS ultimo_evento
         FROM geo g
         LEFT JOIN typed t ON t.sector_aproximado = g.sector_aproximado AND t.rn = 1
@@ -6798,17 +6809,19 @@ function luciaBuildSafeQuery(question, ccId) {
           t.alert_type AS tipo,
           t.state AS estado,
           t.priority AS prioridad,
-          CASE
-            WHEN t.latitude > -32.9800 AND t.longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
-            WHEN t.latitude > -33.0000 AND t.longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
-            WHEN t.latitude > -33.0020 AND t.longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
-            WHEN t.latitude BETWEEN -33.0300 AND -33.0100 AND t.longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
-            WHEN t.latitude BETWEEN -33.0300 AND -33.0050 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
-            WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
-            WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
-            ELSE 'Sector por determinar'
-          END AS sector_estimado,
-          'Estimación por coordenada; no cartografía oficial de barrios' AS metodo_sector,
+          COALESCE(t.event_sector_name,
+            CASE
+              WHEN t.latitude > -32.9800 AND t.longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
+              WHEN t.latitude > -33.0000 AND t.longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
+              WHEN t.latitude > -33.0020 AND t.longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
+              WHEN t.latitude BETWEEN -33.0300 AND -33.0100 AND t.longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
+              WHEN t.latitude BETWEEN -33.0300 AND -33.0050 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
+              WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
+              WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
+              ELSE 'Sector por determinar'
+            END
+          ) AS sector_estimado,
+          COALESCE(t.event_sector_method, 'Zonificación oficial UV si está disponible; fallback por coordenada') AS metodo_sector,
           citizen.full_name AS vecino,
           resolver.full_name AS resolutor,
           ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
@@ -6939,8 +6952,8 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
     return `En VIF, para los últimos ${days} días, hay ${r.eventos_vif || 0} eventos, ${r.abiertos || 0} abiertos y ${r.alta_prioridad || 0} de alta prioridad. Promedio de asignación: ${r.min_promedio_asignacion ?? '—'} min.`;
   }
   if (queryDef.intent === "sla_risks") return n ? `Detecté ${n} tickets con riesgo o vencimiento SLA. Conviene revisar asignación y resolución.` : "No encontré tickets fuera de SLA en el período.";
-  if (queryDef.intent === "critical_zones") return n ? `Estas son las principales zonas de recurrencia. Ojo: el sector es una estimación calculada desde la coordenada del ticket; no corresponde todavía a una cartografía oficial de barrios o unidades vecinales.` : "No hay puntos suficientes para identificar zonas críticas en ese período.";
-  if (queryDef.intent === "high_priority_tickets") return n ? `Estos son los tickets abiertos de alta prioridad en los últimos ${days} días, con sector estimado desde la coordenada.` : "No encontré tickets abiertos de alta prioridad en ese período.";
+  if (queryDef.intent === "critical_zones") return n ? `Estas son las principales zonas de recurrencia. El sector se calcula contra la capa oficial cargada de unidades vecinales/sectores; si un ticket no intersecta la capa, se marca sin sector oficial.` : "No hay puntos suficientes para identificar zonas críticas en ese período.";
+  if (queryDef.intent === "high_priority_tickets") return n ? `Estos son los tickets abiertos de alta prioridad en los últimos ${days} días, con sector del evento según la zonificación cargada.` : "No encontré tickets abiertos de alta prioridad en ese período.";
   if (queryDef.intent === "tickets_by_alert_type") {
     const requested = queryDef.requested_alert_type?.label || "tipo solicitado";
     const total = rows[0]?.total_en_periodo ?? n;
@@ -7068,7 +7081,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         rows: result.rows,
         suggestions,
         clarification: ["unknown", "guided_help", "ambiguous_severity"].includes(queryDef.intent),
-        sector_method: ["critical_zones", "tickets_by_alert_type", "high_priority_tickets"].includes(queryDef.intent) ? "Estimación por coordenada; no cartografía oficial de barrios/unidades vecinales" : null,
+        sector_method: ["critical_zones", "tickets_by_alert_type", "high_priority_tickets"].includes(queryDef.intent) ? "Zonificación oficial UV si está disponible; fallback por coordenada" : null,
         report,
         sql_preview: process.env.LUCIA_SHOW_SQL === "true" ? sqlPreview : null,
         audit_id: auditId
@@ -7234,6 +7247,10 @@ app.get("/dashboard/map-state", async (req, res) => {
         t.latitude,
         t.longitude,
         t.accuracy,
+        t.event_sector_code,
+        t.event_sector_name AS incident_sector,
+        t.event_sector_method AS sector_method,
+        t.event_sector_source AS sector_source,
         t.created_at,
         t.acknowledged_at,
         t.assigned_at,
@@ -7946,20 +7963,22 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         t.latitude,
         t.longitude,
 
-        CASE
-          WHEN t.latitude IS NULL OR t.longitude IS NULL THEN 'Sector no informado'
-          WHEN t.latitude > -32.981 AND t.longitude < -71.532 THEN 'Reñaca Bajo / Jardín del Mar'
-          WHEN t.latitude > -32.982 AND t.longitude >= -71.532 THEN 'Reñaca Alto'
-          WHEN t.latitude > -32.999 AND t.longitude > -71.510 THEN 'Gómez Carreño / Glorias Navales'
-          WHEN t.latitude > -33.007 AND t.longitude > -71.522 THEN 'Achupallas / Santa Julia'
-          WHEN t.latitude > -33.009 AND t.longitude <= -71.522 THEN 'Santa Inés / Población Vergara'
-          WHEN t.latitude > -33.024 AND t.longitude < -71.545 THEN 'Plan Viña / Libertad'
-          WHEN t.latitude > -33.026 AND t.longitude >= -71.545 THEN 'Miraflores / Chorrillos'
-          WHEN t.latitude <= -33.035 AND t.longitude < -71.545 THEN 'Recreo / Agua Santa'
-          WHEN t.latitude <= -33.035 AND t.longitude >= -71.545 THEN 'Forestal / Nueva Aurora'
-          ELSE 'Viña del Mar'
-        END AS incident_sector,
-        'Estimación por coordenada; pendiente cartografía oficial de sectores' AS sector_method,
+        COALESCE(t.event_sector_name,
+          CASE
+            WHEN t.latitude IS NULL OR t.longitude IS NULL THEN 'Sector no informado'
+            WHEN t.latitude > -32.981 AND t.longitude < -71.532 THEN 'Reñaca Bajo / Jardín del Mar'
+            WHEN t.latitude > -32.982 AND t.longitude >= -71.532 THEN 'Reñaca Alto'
+            WHEN t.latitude > -32.999 AND t.longitude > -71.510 THEN 'Gómez Carreño / Glorias Navales'
+            WHEN t.latitude > -33.007 AND t.longitude > -71.522 THEN 'Achupallas / Santa Julia'
+            WHEN t.latitude > -33.009 AND t.longitude <= -71.522 THEN 'Santa Inés / Población Vergara'
+            WHEN t.latitude > -33.024 AND t.longitude < -71.545 THEN 'Plan Viña / Libertad'
+            WHEN t.latitude > -33.026 AND t.longitude >= -71.545 THEN 'Miraflores / Chorrillos'
+            WHEN t.latitude <= -33.035 AND t.longitude < -71.545 THEN 'Recreo / Agua Santa'
+            WHEN t.latitude <= -33.035 AND t.longitude >= -71.545 THEN 'Forestal / Nueva Aurora'
+            ELSE 'Viña del Mar'
+          END
+        ) AS incident_sector,
+        COALESCE(t.event_sector_method, 'Estimación por coordenada; pendiente cartografía oficial de sectores') AS sector_method,
         t.accuracy,
         t.assigned_resolver_id,
         t.created_at,
@@ -8964,46 +8983,246 @@ app.post("/admin/users/:id/contacts", async (req, res) => {
 });
 
 
-/* kotto insertamos endpoints todo antes de ir a Flespi */ 
-startFlespiMqtt();
-
-
-app.listen(PORT, () => {
-		console.log(`VS&TI SOS Middleware v27.4 WebRTC-ready running on port ${PORT}`);
-		});
-
-
 
 /* =========================================================
-   CONTROL CENTER SECTORS - PREPARACIÓN PARA ZONIFICACIÓN OFICIAL
+   CONTROL CENTER SECTORS v28.8 - PERSISTENCIA + CLASIFICACIÓN OFICIAL UV
    ========================================================= */
 
 let sectorSchemaReady = false;
+let sectorCache = new Map();
+const SECTOR_CACHE_TTL_MS = Number(process.env.SECTOR_CACHE_TTL_MS || 60000);
+
 async function ensureSectorSchema() {
   if (sectorSchemaReady) return;
+
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS control_center_sectors (
-      id TEXT PRIMARY KEY,
-      control_center_id TEXT NOT NULL,
-      code TEXT,
-      name TEXT NOT NULL,
-      sector_type TEXT DEFAULT 'SECTOR',
-      geometry_geojson JSONB,
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      control_center_code TEXT NOT NULL,
+      sector_code TEXT NOT NULL,
+      sector_name TEXT NOT NULL,
+      source TEXT,
+      official_level TEXT,
+      geometry_geojson JSONB NOT NULL,
+      properties JSONB DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(control_center_code, sector_code)
     )
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_cc_sectors_center ON control_center_sectors(control_center_id)`);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_control_center_sectors_code ON control_center_sectors(control_center_code)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_control_center_sectors_sector_code ON control_center_sectors(control_center_code, sector_code)`);
+
+  await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS event_sector_code TEXT`).catch(() => null);
+  await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS event_sector_name TEXT`).catch(() => null);
+  await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS event_sector_method TEXT`).catch(() => null);
+  await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS event_sector_source TEXT`).catch(() => null);
+  await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS event_sector_updated_at TIMESTAMPTZ`).catch(() => null);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_event_sector_code ON tickets(control_center_id, event_sector_code)`).catch(() => null);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_event_sector_name ON tickets(control_center_id, event_sector_name)`).catch(() => null);
+
   sectorSchemaReady = true;
 }
 
-app.post('/admin/control-centers/:code/sectors/bulk', async (req, res) => {
-  if (!requireAdminToken(req, res)) return;
+function clearSectorCache(controlCenterCode) {
+  if (controlCenterCode) sectorCache.delete(String(controlCenterCode).toUpperCase());
+  else sectorCache.clear();
+}
+
+async function getControlCenterByCode(code) {
+  const result = await pool.query(
+    `SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1`,
+    [code]
+  );
+  return result.rows[0] || null;
+}
+
+async function getControlCenterCodeById(controlCenterId) {
+  const result = await pool.query(`SELECT code FROM control_centers WHERE id = $1 LIMIT 1`, [controlCenterId]);
+  return result.rows[0]?.code || null;
+}
+
+async function loadSectorsForControlCenter(controlCenterCode, { force = false } = {}) {
+  await ensureSectorSchema();
+  const key = String(controlCenterCode || '').toUpperCase();
+  const cached = sectorCache.get(key);
+  if (!force && cached && (Date.now() - cached.loadedAt) < SECTOR_CACHE_TTL_MS) return cached.sectors;
+
+  const result = await pool.query(
+    `
+    SELECT
+      id,
+      control_center_code,
+      sector_code,
+      sector_name,
+      source,
+      official_level,
+      geometry_geojson,
+      properties
+    FROM control_center_sectors
+    WHERE control_center_code = $1
+    ORDER BY sector_name ASC
+    `,
+    [key]
+  );
+
+  const sectors = result.rows.map((row) => ({
+    ...row,
+    geometry_geojson: typeof row.geometry_geojson === 'string' ? JSON.parse(row.geometry_geojson) : row.geometry_geojson,
+    properties: typeof row.properties === 'string' ? JSON.parse(row.properties) : (row.properties || {})
+  }));
+
+  sectorCache.set(key, { loadedAt: Date.now(), sectors });
+  return sectors;
+}
+
+function pointInRing(lon, lat, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = Number(ring[i][0]);
+    const yi = Number(ring[i][1]);
+    const xj = Number(ring[j][0]);
+    const yj = Number(ring[j][1]);
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lon < (xj - xi) * (lat - yi) / ((yj - yi) || Number.EPSILON) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function pointInPolygonGeometry(lat, lon, geometry) {
+  if (!geometry || lat == null || lon == null) return false;
+  const type = geometry.type;
+  const coordinates = geometry.coordinates;
+  if (!coordinates) return false;
+
+  const inPolygon = (polygon) => {
+    if (!Array.isArray(polygon) || !polygon.length) return false;
+    const outer = polygon[0];
+    if (!pointInRing(lon, lat, outer)) return false;
+    for (let h = 1; h < polygon.length; h++) {
+      if (pointInRing(lon, lat, polygon[h])) return false;
+    }
+    return true;
+  };
+
+  if (type === 'Polygon') return inPolygon(coordinates);
+  if (type === 'MultiPolygon') return coordinates.some((polygon) => inPolygon(polygon));
+  return false;
+}
+
+async function classifySectorForPoint(controlCenterCode, latitude, longitude) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return {
+      event_sector_code: null,
+      event_sector_name: 'Sector no informado',
+      event_sector_method: 'Sin coordenadas de evento',
+      event_sector_source: null
+    };
+  }
+
+  const sectors = await loadSectorsForControlCenter(controlCenterCode);
+  for (const sector of sectors) {
+    if (pointInPolygonGeometry(lat, lon, sector.geometry_geojson)) {
+      return {
+        event_sector_code: sector.sector_code,
+        event_sector_name: sector.sector_name,
+        event_sector_method: sector.official_level || 'point_in_polygon_sector',
+        event_sector_source: sector.source || 'control_center_sectors',
+        properties: sector.properties || {}
+      };
+    }
+  }
+
+  return {
+    event_sector_code: null,
+    event_sector_name: 'Dentro de la comuna, sin unidad vecinal identificada',
+    event_sector_method: 'No intersecta sectores cargados',
+    event_sector_source: 'control_center_sectors'
+  };
+}
+
+async function classifyAndPersistTicketSector(ticket) {
+  if (!ticket || !ticket.id || !ticket.control_center_id) return ticket;
   try {
     await ensureSectorSchema();
-    const { code } = req.params;
-    const cc = await pool.query(`SELECT id, code, name FROM control_centers WHERE code = $1`, [code]);
-    if (!cc.rows.length) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+    const controlCenterCode = ticket.control_center_code || await getControlCenterCodeById(ticket.control_center_id);
+    if (!controlCenterCode) return ticket;
+    const sector = await classifySectorForPoint(controlCenterCode, ticket.latitude, ticket.longitude);
+    const result = await pool.query(
+      `
+      UPDATE tickets
+      SET
+        event_sector_code = $2,
+        event_sector_name = $3,
+        event_sector_method = $4,
+        event_sector_source = $5,
+        event_sector_updated_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [
+        ticket.id,
+        sector.event_sector_code,
+        sector.event_sector_name,
+        sector.event_sector_method,
+        sector.event_sector_source
+      ]
+    );
+    return result.rows[0] || ticket;
+  } catch (error) {
+    console.warn('[TICKET SECTOR CLASSIFY WARNING]', ticket?.id, error.message);
+    return ticket;
+  }
+}
+
+function getFeatureProperty(props, names, fallback = null) {
+  for (const name of names) {
+    if (props && props[name] != null && String(props[name]).trim() !== '') return String(props[name]).trim();
+  }
+  return fallback;
+}
+
+app.get('/admin/control-centers/:code/sectors', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const code = String(req.params.code || '').toUpperCase();
+    await ensureSectorSchema();
+    const sectors = await loadSectorsForControlCenter(code, { force: true });
+    res.json({
+      status: 'ok',
+      control_center_code: code,
+      count: sectors.length,
+      sectors: sectors.map((s) => ({
+        id: s.id,
+        sector_code: s.sector_code,
+        sector_name: s.sector_name,
+        source: s.source,
+        official_level: s.official_level,
+        geometry_type: s.geometry_geojson?.type || null,
+        properties: s.properties || {}
+      }))
+    });
+  } catch (error) {
+    console.error('[SECTORS LIST ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/admin/control-centers/:code/sectors/bulk', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const code = String(req.params.code || '').toUpperCase();
+    await ensureSectorSchema();
+    const cc = await getControlCenterByCode(code);
+    if (!cc) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
 
     const geojson = req.body;
     if (!geojson || geojson.type !== 'FeatureCollection' || !Array.isArray(geojson.features)) {
@@ -9011,23 +9230,64 @@ app.post('/admin/control-centers/:code/sectors/bulk', async (req, res) => {
     }
 
     let inserted = 0;
+    let skipped = 0;
     await pool.query('BEGIN');
-    await pool.query(`DELETE FROM control_center_sectors WHERE control_center_id = $1`, [cc.rows[0].id]);
-    for (const feature of geojson.features) {
+    await pool.query(`DELETE FROM control_center_sectors WHERE control_center_code = $1`, [code]);
+
+    for (const [idx, feature] of geojson.features.entries()) {
       const props = feature.properties || {};
-      const name = props.name || props.NOMBRE || props.nombre || props.SECTOR || props.sector || props.UNIDAD || props.unidad || props.barrio;
-      if (!name || !feature.geometry) continue;
-      const sectorCode = props.code || props.CODIGO || props.codigo || props.ID || props.id || String(inserted + 1).padStart(3, '0');
-      const sectorType = props.type || props.tipo || props.TIPO || 'SECTOR';
+      if (!feature.geometry) { skipped++; continue; }
+
+      const sectorCode = getFeatureProperty(props, ['sector_code','code','CODIGO','codigo','ID','id','uv_carto','UV_CARTO'], `SEC-${String(idx + 1).padStart(3, '0')}`);
+      const sectorName = getFeatureProperty(props, ['sector_name','name','NOMBRE','nombre','SECTOR','sector','UNIDAD','unidad','barrio'], sectorCode);
+      const source = getFeatureProperty(props, ['source','FUENTE','fuente'], 'GeoJSON cargado por administrador');
+      const officialLevel = getFeatureProperty(props, ['official_level','nivel_oficial','type','tipo','TIPO'], 'sector_operativo');
+
       await pool.query(
-        `INSERT INTO control_center_sectors (id, control_center_id, code, name, sector_type, geometry_geojson, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6::jsonb,NOW())`,
-        [crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'), cc.rows[0].id, String(sectorCode), String(name), String(sectorType), JSON.stringify(feature.geometry)]
+        `
+        INSERT INTO control_center_sectors (
+          control_center_code,
+          sector_code,
+          sector_name,
+          source,
+          official_level,
+          geometry_geojson,
+          properties,
+          updated_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,NOW())
+        ON CONFLICT (control_center_code, sector_code)
+        DO UPDATE SET
+          sector_name = EXCLUDED.sector_name,
+          source = EXCLUDED.source,
+          official_level = EXCLUDED.official_level,
+          geometry_geojson = EXCLUDED.geometry_geojson,
+          properties = EXCLUDED.properties,
+          updated_at = NOW()
+        `,
+        [
+          code,
+          String(sectorCode),
+          String(sectorName),
+          source,
+          officialLevel,
+          JSON.stringify(feature.geometry),
+          JSON.stringify(props)
+        ]
       );
       inserted++;
     }
+
     await pool.query('COMMIT');
-    res.json({ status: 'ok', control_center: cc.rows[0], inserted, message: 'Sectores cargados. Las respuestas pueden usar sectores oficiales en futuras consultas.' });
+    clearSectorCache(code);
+
+    res.json({
+      status: 'ok',
+      control_center_code: code,
+      inserted,
+      skipped,
+      message: 'Sectores persistidos en PostgreSQL. Ejecuta reclassify-tickets para actualizar tickets existentes.'
+    });
   } catch (error) {
     try { await pool.query('ROLLBACK'); } catch (_) {}
     console.error('[SECTORS BULK ERROR]', error);
@@ -9035,22 +9295,90 @@ app.post('/admin/control-centers/:code/sectors/bulk', async (req, res) => {
   }
 });
 
-app.get('/admin/control-centers/:code/sectors', async (req, res) => {
-  if (!requireAdminToken(req, res)) return;
+app.post('/admin/control-centers/:code/sectors/reclassify-tickets', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
   try {
+    const code = String(req.params.code || '').toUpperCase();
+    const limit = Math.min(Number(req.body?.limit || req.query?.limit || 500), 5000);
     await ensureSectorSchema();
-    const { code } = req.params;
-    const result = await pool.query(`
-      SELECT s.id, s.code, s.name, s.sector_type, s.geometry_geojson
-      FROM control_center_sectors s
-      JOIN control_centers cc ON cc.id = s.control_center_id
-      WHERE cc.code = $1
-      ORDER BY s.name ASC
-    `, [code]);
-    res.json({ status: 'ok', control_center_code: code, sectors: result.rows });
+
+    const cc = await getControlCenterByCode(code);
+    if (!cc) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+
+    const tickets = await pool.query(
+      `
+      SELECT id, control_center_id, latitude, longitude, alert_type, state, created_at
+      FROM tickets
+      WHERE control_center_id = $1
+        AND latitude IS NOT NULL
+        AND longitude IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT $2
+      `,
+      [cc.id, limit]
+    );
+
+    let updated = 0;
+    let withoutSector = 0;
+    const sample = [];
+
+    for (const ticket of tickets.rows) {
+      const before = ticket;
+      const after = await classifyAndPersistTicketSector({ ...ticket, control_center_code: code });
+      if (after?.event_sector_name) updated++;
+      if (!after?.event_sector_code) withoutSector++;
+      if (sample.length < 10) {
+        sample.push({
+          id: before.id,
+          alert_type: before.alert_type,
+          state: before.state,
+          latitude: before.latitude,
+          longitude: before.longitude,
+          event_sector_code: after?.event_sector_code || null,
+          event_sector_name: after?.event_sector_name || null,
+          event_sector_method: after?.event_sector_method || null
+        });
+      }
+    }
+
+    res.json({
+      status: 'ok',
+      control_center_code: code,
+      scanned: tickets.rows.length,
+      updated,
+      without_sector: withoutSector,
+      sample
+    });
   } catch (error) {
-    console.error('[SECTORS LIST ERROR]', error);
+    console.error('[SECTORS RECLASSIFY ERROR]', error);
     res.status(500).json({ status: 'error', message: error.message });
   }
 });
 
+app.post('/debug/sector/lookup', async (req, res) => {
+  if (!requireAdminTokenIfConfigured(req, res)) return;
+  try {
+    const { control_center_code = 'CC-VINA', latitude, longitude } = req.body || {};
+    await ensureSectorSchema();
+    const sector = await classifySectorForPoint(String(control_center_code).toUpperCase(), latitude, longitude);
+    res.json({ status: 'ok', control_center_code, latitude, longitude, sector });
+  } catch (error) {
+    console.error('[SECTOR LOOKUP ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+
+
+// Preparar esquema de sectores al iniciar para que /tickets, mapa y Luc-IA puedan leer columnas event_sector_*.
+ensureSectorSchema().catch((error) => {
+  console.warn('[SECTOR SCHEMA STARTUP WARNING]', error.message);
+});
+
+/* kotto insertamos endpoints todo antes de ir a Flespi */ 
+startFlespiMqtt();
+
+
+app.listen(PORT, () => {
+		console.log(`VS&TI SOS Middleware v28.8 persistent sectors running on port ${PORT}`);
+		});
