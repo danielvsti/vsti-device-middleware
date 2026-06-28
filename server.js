@@ -6038,6 +6038,9 @@ app.get("/dashboard/analytics", async (req, res) => {
         t.latitude,
         t.longitude,
         t.created_at,
+        t.event_sector_name,
+        t.event_sector_method,
+        t.jurisdiction_status,
         citizen.full_name AS citizen_name,
         CASE
           WHEN t.priority <= 1 THEN 1.00
@@ -6067,40 +6070,46 @@ app.get("/dashboard/analytics", async (req, res) => {
           latitude,
           longitude,
           created_at,
-          ROUND(latitude::numeric, 4) AS lat_key,
-          ROUND(longitude::numeric, 4) AS lon_key
+          COALESCE(NULLIF(TRIM(event_sector_name), ''), 'Sector no clasificado') AS sector_name,
+          COALESCE(NULLIF(TRIM(event_sector_method), ''), 'Sector oficial/precargado del ticket') AS sector_method
         FROM tickets
         WHERE control_center_id = $1
           AND created_at >= NOW() - ($2::int || ' days')::interval
           AND latitude IS NOT NULL
           AND longitude IS NOT NULL
+          AND COALESCE(jurisdiction_status, 'IN_JURISDICTION') <> 'OUT_OF_JURISDICTION'
+      ), typed AS (
+        SELECT
+          sector_name,
+          alert_type,
+          COUNT(*)::int AS type_count,
+          ROW_NUMBER() OVER (PARTITION BY sector_name ORDER BY COUNT(*) DESC, MAX(created_at) DESC, alert_type ASC) AS rn
+        FROM geo
+        GROUP BY sector_name, alert_type
       ), zones AS (
         SELECT
-          lat_key,
-          lon_key,
+          sector_name,
+          MIN(sector_method) AS sector_method,
+          AVG(latitude)::float AS latitude,
+          AVG(longitude)::float AS longitude,
           COUNT(*)::int AS tickets_count,
           COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::int AS open_count,
           MAX(created_at) AS last_ticket_at
         FROM geo
-        GROUP BY lat_key, lon_key
+        GROUP BY sector_name
       )
       SELECT
-        lat_key::float AS latitude,
-        lon_key::float AS longitude,
-        tickets_count,
-        open_count,
-        last_ticket_at,
-        COALESCE((
-          SELECT g.alert_type
-          FROM geo g
-          WHERE g.lat_key = z.lat_key
-            AND g.lon_key = z.lon_key
-          GROUP BY g.alert_type
-          ORDER BY COUNT(*) DESC
-          LIMIT 1
-        ), 'SIN_TIPO') AS top_alert_type
+        z.sector_name AS sector_aproximado,
+        z.sector_method,
+        z.latitude,
+        z.longitude,
+        z.tickets_count,
+        z.open_count,
+        z.last_ticket_at,
+        COALESCE(t.alert_type, 'SIN_TIPO') AS top_alert_type
       FROM zones z
-      ORDER BY tickets_count DESC, last_ticket_at DESC NULLS LAST
+      LEFT JOIN typed t ON t.sector_name = z.sector_name AND t.rn = 1
+      ORDER BY z.tickets_count DESC, z.open_count DESC, z.last_ticket_at DESC NULLS LAST
       LIMIT 12
       `,
       [ccId, days]
