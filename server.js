@@ -1349,7 +1349,288 @@ async function autoAssignResolver(ticket, options = {}) {
   };
 }
 
+async function countActiveTicketsForResolver(resolverUserId) {
+  if (!resolverUserId) return 0;
+  try {
+    const result = await pool.query(
+      `
+      SELECT COUNT(*)::int AS total
+      FROM tickets
+      WHERE assigned_resolver_id = $1
+        AND state = ANY($2::text[])
+      `,
+      [resolverUserId, ACTIVE_RESOLVER_TICKET_STATES]
+    );
+    return Number(result.rows?.[0]?.total || 0);
+  } catch (error) {
+    console.warn('[COUNT ACTIVE TICKETS FOR RESOLVER ERROR]', error.message);
+    return 0;
+  }
+}
 
+async function assignTicketToResolverManually(ticketId, resolverUserId, options = {}) {
+  const force = options.force === true;
+  const operatorUserId = options.operator_user_id || options.operatorUserId || null;
+  const reason = String(options.reason || '').trim() || 'Asignación manual desde mapa operacional';
+
+  const ticketResult = await pool.query(
+    `
+    SELECT *
+    FROM tickets
+    WHERE id = $1
+      AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+    LIMIT 1
+    `,
+    [ticketId]
+  );
+
+  if (!ticketResult.rows.length) {
+    const error = new Error('Ticket no encontrado o ya cerrado');
+    error.statusCode = 404;
+    error.code = 'TICKET_NOT_ASSIGNABLE';
+    throw error;
+  }
+
+  const ticket = ticketResult.rows[0];
+
+  const resolverResult = await pool.query(
+    `
+    SELECT
+      u.id,
+      u.full_name,
+      u.phone,
+      u.role,
+      u.is_active,
+      u.control_center_id,
+      rl.status,
+      rl.latitude,
+      rl.longitude,
+      rl.accuracy,
+      rl.updated_at,
+      CASE
+        WHEN rl.updated_at IS NULL THEN NULL
+        ELSE EXTRACT(EPOCH FROM (NOW() - rl.updated_at))
+      END AS location_age_seconds
+    FROM users u
+    LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+    WHERE u.id = $1
+    LIMIT 1
+    `,
+    [resolverUserId]
+  );
+
+  if (!resolverResult.rows.length) {
+    const error = new Error('Resolutor no encontrado');
+    error.statusCode = 404;
+    error.code = 'RESOLVER_NOT_FOUND';
+    throw error;
+  }
+
+  const resolver = resolverResult.rows[0];
+
+  if (resolver.role !== 'RESOLVER' || resolver.is_active !== true) {
+    const error = new Error('Usuario no es un resolutor activo');
+    error.statusCode = 409;
+    error.code = 'RESOLVER_NOT_ACTIVE';
+    throw error;
+  }
+
+  if (String(resolver.control_center_id) !== String(ticket.control_center_id)) {
+    const error = new Error('El resolutor pertenece a otro centro de control');
+    error.statusCode = 409;
+    error.code = 'RESOLVER_CONTROL_CENTER_MISMATCH';
+    throw error;
+  }
+
+  const activeTicketsCount = await countActiveTicketsForResolver(resolver.id);
+  const resolverStatus = String(resolver.status || 'OFFLINE').toUpperCase();
+  const hasOperationalWarning = activeTicketsCount > 0 || resolverStatus !== 'AVAILABLE';
+
+  if (hasOperationalWarning && !force) {
+    const error = new Error('El resolutor no está libre. Para asignar igualmente, use force=true.');
+    error.statusCode = 409;
+    error.code = 'RESOLVER_NOT_FREE_REQUIRES_FORCE';
+    error.details = {
+      resolver_user_id: resolver.id,
+      resolver_name: resolver.full_name,
+      resolver_status: resolver.status,
+      active_tickets_count: activeTicketsCount
+    };
+    throw error;
+  }
+
+  if (ticket.assigned_resolver_id) {
+    await pool.query(
+      `
+      UPDATE ticket_assignments
+      SET state = 'SUPERSEDED', updated_at = NOW()
+      WHERE ticket_id = $1
+        AND state IN ('PENDING','ACCEPTED')
+      `,
+      [ticket.id]
+    ).catch((error) => console.warn('[MANUAL ASSIGN SUPERSEDE ERROR]', error.message));
+  }
+
+  const distance = (ticket.latitude != null && ticket.longitude != null && resolver.latitude != null && resolver.longitude != null)
+    ? distanceMeters(Number(ticket.latitude), Number(ticket.longitude), Number(resolver.latitude), Number(resolver.longitude))
+    : null;
+
+  await pool.query(
+    `
+    INSERT INTO ticket_assignments (
+      ticket_id,
+      resolver_user_id,
+      assignment_type,
+      state,
+      distance_meters,
+      notified_at
+    )
+    VALUES ($1,$2,'MANUAL','PENDING',$3,NOW())
+    `,
+    [ticket.id, resolver.id, distance]
+  );
+
+  const update = await pool.query(
+    `
+    UPDATE tickets
+    SET
+      assigned_resolver_id = $1,
+      state = 'ASSIGNED',
+      assigned_at = NOW(),
+      updated_at = NOW()
+    WHERE id = $2
+    RETURNING *
+    `,
+    [resolver.id, ticket.id]
+  );
+
+  await pool.query(
+    `
+    UPDATE resolver_locations
+    SET status = CASE WHEN status = 'ON_SITE' THEN 'ON_SITE' WHEN status = 'EN_ROUTE' THEN 'EN_ROUTE' ELSE 'BUSY' END,
+        updated_at = NOW()
+    WHERE user_id = $1
+    `,
+    [resolver.id]
+  ).catch(() => null);
+
+  const actionType = ticket.assigned_resolver_id ? 'MANUAL_REASSIGNED' : 'MANUAL_ASSIGNED';
+  await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_user_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,$2,'OPERATOR',$3,$4,$5)
+    `,
+    [
+      ticket.id,
+      operatorUserId,
+      actionType,
+      `${ticket.assigned_resolver_id ? 'Ticket reasignado' : 'Ticket asignado'} manualmente a ${resolver.full_name}`,
+      JSON.stringify({
+        reason,
+        force,
+        resolver_user_id: resolver.id,
+        resolver_name: resolver.full_name,
+        previous_resolver_user_id: ticket.assigned_resolver_id || null,
+        resolver_status: resolver.status || null,
+        resolver_active_tickets_count_before: activeTicketsCount,
+        distance_meters: distance == null ? null : Math.round(distance)
+      })
+    ]
+  );
+
+  return {
+    ticket: update.rows[0],
+    resolver: { ...resolver, active_tickets_count: activeTicketsCount, distance_meters: distance },
+    forced: force,
+    previous_resolver_user_id: ticket.assigned_resolver_id || null
+  };
+}
+
+async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
+  if (!resolverUserId) return null;
+
+  const activeTicketsCount = await countActiveTicketsForResolver(resolverUserId);
+  if (activeTicketsCount > 0) {
+    return { assigned: false, reason: 'RESOLVER_STILL_HAS_ACTIVE_TICKETS', active_tickets_count: activeTicketsCount };
+  }
+
+  const resolverResult = await pool.query(
+    `
+    SELECT
+      u.id,
+      u.full_name,
+      u.control_center_id,
+      u.is_active,
+      rl.status
+    FROM users u
+    LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+    WHERE u.id = $1
+      AND u.role = 'RESOLVER'
+      AND u.is_active = true
+    LIMIT 1
+    `,
+    [resolverUserId]
+  );
+
+  if (!resolverResult.rows.length) {
+    return { assigned: false, reason: 'RESOLVER_NOT_ACTIVE' };
+  }
+
+  const resolver = resolverResult.rows[0];
+  const queuedTicket = await pool.query(
+    `
+    SELECT *
+    FROM tickets
+    WHERE control_center_id = $1
+      AND assigned_resolver_id IS NULL
+      AND state = 'ACTIVE'
+    ORDER BY created_at ASC
+    LIMIT 1
+    `,
+    [resolver.control_center_id]
+  );
+
+  if (!queuedTicket.rows.length) {
+    return { assigned: false, reason: 'NO_QUEUED_TICKET' };
+  }
+
+  const assignment = await assignTicketToResolverManually(queuedTicket.rows[0].id, resolver.id, {
+    force: true,
+    operator_user_id: null,
+    reason: options.reason || 'Autoasignación de cola al quedar libre el resolutor'
+  });
+
+  await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,'SYSTEM','AUTO_QUEUE_ASSIGNED',$2,$3)
+    `,
+    [
+      assignment.ticket.id,
+      `Ticket de cola asignado automáticamente a ${resolver.full_name}`,
+      JSON.stringify({
+        trigger: options.trigger || 'RESOLVER_RELEASED',
+        resolver_user_id: resolver.id,
+        resolver_name: resolver.full_name
+      })
+    ]
+  ).catch(() => null);
+
+  return { assigned: true, ...assignment };
+}
 
 
 async function createTicket({
@@ -4620,10 +4901,21 @@ app.post("/tickets/:id/resolve", async (req, res) => {
       );
     }
 
+    const nextAssignment = await assignNextQueuedTicketToResolver(resolver_user_id, {
+      trigger: "TICKET_RESOLVED",
+      resolved_ticket_id: id
+    }).catch((error) => {
+      console.warn("[AUTO QUEUE AFTER RESOLVE ERROR]", error.message);
+      return { assigned: false, reason: error.message };
+    });
+
     res.json({
       status: "ok",
-      message: "Ticket resolved",
-      ticket: ticketResult.rows[0]
+      message: nextAssignment?.assigned
+        ? "Ticket resolved; next queued ticket assigned"
+        : "Ticket resolved",
+      ticket: ticketResult.rows[0],
+      next_assignment: nextAssignment || null
     });
 
   } catch (error) {
@@ -4891,6 +5183,58 @@ app.post("/tickets/:id/reject", async (req, res) => {
     res.status(500).json({
       status: "error",
       message: error.message
+    });
+  }
+});
+
+
+app.post("/tickets/:id/manual-assign", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      resolver_user_id,
+      operator_user_id = null,
+      force = false,
+      reason = "Asignación manual desde mapa operacional"
+    } = req.body || {};
+
+    if (!resolver_user_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "resolver_user_id is required"
+      });
+    }
+
+    const assignment = await assignTicketToResolverManually(id, resolver_user_id, {
+      force: force === true || String(force).toLowerCase() === "true",
+      operator_user_id,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: assignment.forced
+        ? "Ticket asignado manualmente con forzado operacional"
+        : "Ticket asignado manualmente",
+      ticket: assignment.ticket,
+      resolver: {
+        id: assignment.resolver.id,
+        full_name: assignment.resolver.full_name,
+        phone: assignment.resolver.phone,
+        status: assignment.resolver.status,
+        active_tickets_count_before: assignment.resolver.active_tickets_count || 0,
+        distance_meters: assignment.resolver.distance_meters == null ? null : Math.round(assignment.resolver.distance_meters)
+      },
+      forced: assignment.forced,
+      previous_resolver_user_id: assignment.previous_resolver_user_id
+    });
+  } catch (error) {
+    console.error("[MANUAL ASSIGN TICKET ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      code: error.code || "MANUAL_ASSIGN_ERROR",
+      message: error.message,
+      details: error.details || null
     });
   }
 });
