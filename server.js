@@ -1174,36 +1174,49 @@ async function autoAssignResolver(ticket, options = {}) {
       CASE
         WHEN rl.updated_at IS NULL THEN NULL
         ELSE EXTRACT(EPOCH FROM (NOW() - rl.updated_at))
-      END AS location_age_seconds
+      END AS location_age_seconds,
+      (
+        SELECT COUNT(*)::int
+        FROM tickets active_tickets
+        WHERE active_tickets.assigned_resolver_id = u.id
+          AND active_tickets.state = ANY($2::text[])
+      ) AS active_tickets_count
     FROM users u
     LEFT JOIN resolver_locations rl ON rl.user_id = u.id
     WHERE u.control_center_id = $1
       AND u.role = 'RESOLVER'
     `,
-    [ticket.control_center_id]
+    [ticket.control_center_id, ACTIVE_RESOLVER_TICKET_STATES]
   );
 
-  const maxAgeSeconds = Number(process.env.AUTO_ASSIGN_MAX_LOCATION_AGE_SECONDS || 0);
+  const configuredMaxAgeSeconds = Number(process.env.AUTO_ASSIGN_MAX_LOCATION_AGE_SECONDS ?? 180);
+  const maxAgeSeconds = Number.isFinite(configuredMaxAgeSeconds) && configuredMaxAgeSeconds > 0
+    ? configuredMaxAgeSeconds
+    : 180;
 
   const candidates = candidateResult.rows.map((resolver) => {
     const lat = Number(resolver.latitude);
     const lon = Number(resolver.longitude);
     const age = resolver.location_age_seconds == null ? null : Number(resolver.location_age_seconds);
+    const activeTicketsCount = Number(resolver.active_tickets_count || 0);
     const hasLocation = Number.isFinite(lat) && Number.isFinite(lon);
-    const isStale = maxAgeSeconds > 0 && age != null && age > maxAgeSeconds;
+    const isStale = hasLocation && (age == null || age > maxAgeSeconds);
 
     const rejection_reasons = [];
     if (excludeResolverUserIds.has(normalizeResolverId(resolver.id))) rejection_reasons.push("ALREADY_REJECTED_TICKET");
     if (resolver.is_active !== true) rejection_reasons.push("USER_INACTIVE");
     if (String(resolver.status || "").toUpperCase() !== "AVAILABLE") rejection_reasons.push(`STATUS_${resolver.status || "NO_STATUS"}`);
+    if (activeTicketsCount > 0) rejection_reasons.push("HAS_ACTIVE_TICKET");
     if (!hasLocation) rejection_reasons.push("NO_LOCATION");
     if (isStale) rejection_reasons.push("STALE_LOCATION");
 
     return {
       ...resolver,
+      active_tickets_count: activeTicketsCount,
       latitude: hasLocation ? lat : null,
       longitude: hasLocation ? lon : null,
       location_age_seconds: age,
+      max_location_age_seconds: maxAgeSeconds,
       distance_meters: hasLocation
         ? distanceMeters(Number(ticket.latitude), Number(ticket.longitude), lat, lon)
         : null,
@@ -1235,14 +1248,17 @@ async function autoAssignResolver(ticket, options = {}) {
           reason: "NO_ELIGIBLE_RESOLVER",
           total_resolvers_in_center: candidates.length,
           excluded_resolver_user_ids: Array.from(excludeResolverUserIds),
+          max_location_age_seconds: maxAgeSeconds,
           candidates: candidates.map((r) => ({
             resolver_user_id: r.id,
             resolver_name: r.full_name,
             status: r.status,
             is_active: r.is_active,
             validation_status: r.validation_status,
+            active_tickets_count: r.active_tickets_count || 0,
             has_location: r.latitude != null && r.longitude != null,
             location_age_seconds: r.location_age_seconds == null ? null : Math.round(r.location_age_seconds),
+            max_location_age_seconds: r.max_location_age_seconds || maxAgeSeconds,
             distance_meters: r.distance_meters == null ? null : Math.round(r.distance_meters),
             rejection_reasons: r.rejection_reasons
           }))
@@ -4744,6 +4760,30 @@ app.post("/tickets/:id/reject", async (req, res) => {
 
     const ticketBefore = ticketBeforeResult.rows[0];
 
+    if (
+      ticketBefore.assigned_resolver_id &&
+      String(ticketBefore.assigned_resolver_id) !== String(resolver_user_id)
+    ) {
+      return res.status(409).json({
+        status: "error",
+        code: "TICKET_ASSIGNED_TO_ANOTHER_RESOLVER",
+        message: "Este caso está asignado a otro resolutor. No se puede rechazar desde esta sesión.",
+        ticket_id: id,
+        assigned_resolver_id: ticketBefore.assigned_resolver_id,
+        requested_resolver_user_id: resolver_user_id
+      });
+    }
+
+    if (!ticketBefore.assigned_resolver_id) {
+      return res.status(409).json({
+        status: "error",
+        code: "TICKET_NOT_ASSIGNED",
+        message: "Este caso no tiene resolutor asignado. No se puede rechazar desde la App Resolutor.",
+        ticket_id: id,
+        requested_resolver_user_id: resolver_user_id
+      });
+    }
+
     const assignmentUpdate = await pool.query(
       `
       UPDATE ticket_assignments
@@ -4773,7 +4813,7 @@ app.post("/tickets/:id/reject", async (req, res) => {
         assigned_at = NULL,
         updated_at = NOW()
       WHERE id = $1
-        AND (assigned_resolver_id = $2 OR assigned_resolver_id IS NOT NULL)
+        AND assigned_resolver_id = $2
         AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
       RETURNING *
       `,
@@ -7737,12 +7777,21 @@ app.post("/resolver/location", async (req, res) => {
       });
     }
 
-    let effectiveStatus = status;
-    if (["BUSY", "EN_ROUTE", "ON_SITE"].includes(String(status).toUpperCase())) {
-      const activeTickets = await getActiveTicketsForResolver(user.id);
-      if (activeTickets.length === 0) {
-        effectiveStatus = "AVAILABLE";
+    const requestedStatus = String(status || "AVAILABLE").toUpperCase();
+    const activeTickets = await getActiveTicketsForResolver(user.id);
+    let effectiveStatus = requestedStatus;
+
+    if (requestedStatus !== "OFFLINE" && activeTickets.length > 0) {
+      const activeStates = new Set(activeTickets.map((ticket) => String(ticket.state || "").toUpperCase()));
+      if (activeStates.has("ON_SITE")) {
+        effectiveStatus = "ON_SITE";
+      } else if (activeStates.has("EN_ROUTE")) {
+        effectiveStatus = "EN_ROUTE";
+      } else {
+        effectiveStatus = "BUSY";
       }
+    } else if (["BUSY", "EN_ROUTE", "ON_SITE"].includes(requestedStatus) && activeTickets.length === 0) {
+      effectiveStatus = "AVAILABLE";
     }
 
     const result = await pool.query(
@@ -7778,9 +7827,11 @@ app.post("/resolver/location", async (req, res) => {
 
     res.json({
       status: "ok",
-      message: effectiveStatus !== status ? "Resolver location updated; stale operational status auto-corrected" : "Resolver location updated",
-      requested_status: status,
+      message: effectiveStatus !== requestedStatus ? "Resolver location updated; operational status auto-corrected" : "Resolver location updated",
+      requested_status: requestedStatus,
       effective_status: effectiveStatus,
+      active_tickets_count: activeTickets.length,
+      active_tickets: activeTickets,
       resolver_location: result.rows[0],
       source
     });
