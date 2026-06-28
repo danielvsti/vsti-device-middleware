@@ -1584,6 +1584,23 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
   }
 
   const resolver = resolverResult.rows[0];
+  const resolverStatus = String(resolver.status || 'OFFLINE').toUpperCase();
+  if (resolverStatus !== 'AVAILABLE') {
+    return { assigned: false, reason: `RESOLVER_NOT_AVAILABLE_${resolverStatus}` };
+  }
+
+  const excludedTicketIds = (options.excludeTicketIds || options.exclude_ticket_ids || [])
+    .filter(Boolean)
+    .map((value) => String(value).trim())
+    .filter(Boolean);
+
+  const params = [resolver.control_center_id, resolver.id];
+  let excludedSql = '';
+  if (excludedTicketIds.length) {
+    params.push(excludedTicketIds);
+    excludedSql = `AND NOT (id = ANY($${params.length}::uuid[]))`;
+  }
+
   const queuedTicket = await pool.query(
     `
     SELECT *
@@ -1591,10 +1608,25 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
     WHERE control_center_id = $1
       AND assigned_resolver_id IS NULL
       AND state = 'ACTIVE'
+      ${excludedSql}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ticket_assignments rejected_assignments
+        WHERE rejected_assignments.ticket_id = tickets.id
+          AND rejected_assignments.resolver_user_id = $2
+          AND UPPER(COALESCE(rejected_assignments.state,'')) = 'REJECTED'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ticket_actions rejected_actions
+        WHERE rejected_actions.ticket_id = tickets.id
+          AND rejected_actions.actor_user_id = $2
+          AND rejected_actions.action_type = 'RESOLVER_REJECTED'
+      )
     ORDER BY created_at ASC
     LIMIT 1
     `,
-    [resolver.control_center_id]
+    params
   );
 
   if (!queuedTicket.rows.length) {
@@ -1624,7 +1656,8 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
       JSON.stringify({
         trigger: options.trigger || 'RESOLVER_RELEASED',
         resolver_user_id: resolver.id,
-        resolver_name: resolver.full_name
+        resolver_name: resolver.full_name,
+        skipped_rejected_tickets: true
       })
     ]
   ).catch(() => null);
@@ -5166,15 +5199,28 @@ app.post("/tickets/:id/reject", async (req, res) => {
       excludeResolverUserIds: excludedAfterReject
     });
 
+    const nextAssignment = await assignNextQueuedTicketToResolver(resolver_user_id, {
+      trigger: "TICKET_REJECTED_RESOLVER_FREE",
+      rejected_ticket_id: id,
+      excludeTicketIds: [id],
+      reason: "Autoasignación de cola tras rechazo y liberación del resolutor"
+    }).catch((error) => {
+      console.warn("[AUTO QUEUE AFTER REJECT ERROR]", error.message);
+      return { assigned: false, reason: error.message };
+    });
+
     res.json({
       status: "ok",
-      message: "Ticket rejected by resolver",
+      message: nextAssignment?.assigned
+        ? "Ticket rejected; next queued ticket assigned to resolver"
+        : "Ticket rejected by resolver",
       ticket: reassignment?.ticket || releasedTicket,
       released: true,
       reassigned: !!reassignment,
       rejected_resolver_user_id: resolver_user_id,
       excluded_resolver_user_ids: excludedAfterReject,
-      new_resolver: reassignment?.resolver || null
+      new_resolver: reassignment?.resolver || null,
+      next_assignment: nextAssignment || null
     });
 
   } catch (error) {
@@ -8178,14 +8224,27 @@ app.post("/resolver/location", async (req, res) => {
       ]
     );
 
+    const nextAssignment = effectiveStatus === "AVAILABLE" && activeTickets.length === 0
+      ? await assignNextQueuedTicketToResolver(user.id, {
+          trigger: "RESOLVER_AVAILABLE_LOCATION_HEARTBEAT",
+          reason: "Autoasignación de cola al reportar resolutor disponible"
+        }).catch((error) => {
+          console.warn("[AUTO QUEUE AFTER RESOLVER AVAILABLE ERROR]", error.message);
+          return { assigned: false, reason: error.message };
+        })
+      : null;
+
     res.json({
       status: "ok",
-      message: effectiveStatus !== requestedStatus ? "Resolver location updated; operational status auto-corrected" : "Resolver location updated",
+      message: nextAssignment?.assigned
+        ? "Resolver location updated; next queued ticket assigned"
+        : (effectiveStatus !== requestedStatus ? "Resolver location updated; operational status auto-corrected" : "Resolver location updated"),
       requested_status: requestedStatus,
       effective_status: effectiveStatus,
       active_tickets_count: activeTickets.length,
       active_tickets: activeTickets,
       resolver_location: result.rows[0],
+      next_assignment: nextAssignment,
       source
     });
 
