@@ -1997,8 +1997,13 @@ async function releaseResolverFromTicket(ticketId, reason = "TICKET_TERMINATED")
 
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
 const OTP_LENGTH = Number(process.env.OTP_LENGTH || 6);
-const OTP_DEMO_MODE = process.env.OTP_DEMO_MODE !== "false";
-const OTP_DEFAULT_CHANNEL = process.env.OTP_DEFAULT_CHANNEL || "demo";
+// Modo seguro por defecto: no exponer códigos en la App Vecino.
+// Para laboratorio/staging, habilitar explícitamente OTP_LOG_CODES=true y revisar logs de Render.
+const OTP_DEMO_MODE = process.env.OTP_DEMO_MODE === "true";
+const OTP_EXPOSE_DEMO_CODE = process.env.OTP_EXPOSE_DEMO_CODE === "true";
+const OTP_LOG_CODES = process.env.OTP_LOG_CODES === "true";
+const OTP_REQUIRE_DELIVERY = process.env.OTP_REQUIRE_DELIVERY === "true";
+const OTP_DEFAULT_CHANNEL = process.env.OTP_DEFAULT_CHANNEL || "sms";
 
 let authOtpTableReady = false;
 
@@ -2029,14 +2034,15 @@ function hashOtpCode(phone, code) {
 }
 
 function resolveOtpChannel(channel, email) {
-  const requested = String(channel || OTP_DEFAULT_CHANNEL || "demo").toLowerCase();
+  const requested = String(channel || OTP_DEFAULT_CHANNEL || "sms").toLowerCase();
 
   if (["sms", "whatsapp", "email", "demo"].includes(requested)) {
-    if (requested === "email" && !email) return "demo";
+    if (requested === "email" && !email) return "sms";
+    if (requested === "demo" && !OTP_DEMO_MODE) return "sms";
     return requested;
   }
 
-  return email ? "email" : "demo";
+  return "sms";
 }
 
 async function ensureAuthOtpTable() {
@@ -2090,7 +2096,7 @@ async function sendOtpByWebhook({ url, token, payload }) {
 async function deliverOtpCode({ phone, email, channel, code, purpose }) {
   const message = `Tu código SOS Municipal es ${code}. Vigencia ${OTP_TTL_MINUTES} minutos.`;
   const token = process.env.OTP_WEBHOOK_TOKEN || "";
-  let result = { sent: false, channel, reason: "demo_mode_or_not_configured" };
+  let result = { sent: false, channel, reason: "provider_not_configured" };
 
   try {
     if (channel === "sms") {
@@ -2117,18 +2123,21 @@ async function deliverOtpCode({ phone, email, channel, code, purpose }) {
           purpose
         }
       });
+    } else if (channel === "demo" && OTP_DEMO_MODE) {
+      result = { sent: true, channel, reason: "demo_mode" };
     }
   } catch (error) {
     console.error("[OTP DELIVERY ERROR]", error.message);
     result = { sent: false, channel, error: error.message };
   }
 
-  if (!result.sent || OTP_DEMO_MODE) {
-    console.log("[OTP DEMO CODE]", {
+  if (OTP_LOG_CODES || (OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE)) {
+    console.log("[OTP CODE]", {
       phone,
       email: email || null,
       channel,
       purpose,
+      delivery_sent: Boolean(result.sent),
       code,
       expires_minutes: OTP_TTL_MINUTES
     });
@@ -2177,10 +2186,17 @@ async function createAndSendOtp({ phone, email = null, channel = null, purpose =
     purpose
   });
 
+  if (OTP_REQUIRE_DELIVERY && selectedChannel !== "demo" && !delivery.sent) {
+    const error = new Error("No se pudo enviar el código de validación. Intenta nuevamente o contacta a la central.");
+    error.code = "OTP_DELIVERY_FAILED";
+    error.delivery = delivery;
+    throw error;
+  }
+
   return {
     channel: selectedChannel,
     delivery,
-    demo_code: OTP_DEMO_MODE ? code : undefined,
+    demo_code: OTP_EXPOSE_DEMO_CODE ? code : undefined,
     expires_minutes: OTP_TTL_MINUTES
   };
 }
@@ -4207,6 +4223,13 @@ app.post("/auth/logout", async (req, res) => {
 });
 
 app.post("/auth/login-demo", async (req, res) => {
+  if (process.env.AUTH_DEMO_LOGIN_ENABLED !== "true") {
+    return res.status(404).json({
+      status: "error",
+      message: "Demo login disabled"
+    });
+  }
+
   try {
     const { phone } = req.body;
 
