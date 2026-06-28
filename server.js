@@ -6895,7 +6895,7 @@ function luciaIntent(question) {
   if (/(cuant|cantidad|total|inventario|estado de plataforma).*(usuario|usuarios|vecino|vecinos|resolutor|resolutores|dispositivo|dispositivos)/.test(q)) return "platform_inventory";
 
   if (/rechaz/.test(q) && /resolutor|funcionario|movil|equipo/.test(q)) return "resolver_rejections";
-  if (/(top|ranking|mas|mayor|mejor).*(resolutor|funcionario|movil|equipo)|resolutor.*(atend|gestion|cerr|resolv)/.test(q)) return "resolver_performance";
+  if (/(top|ranking|mas|mayor|mejor).*(resolutor|funcionario|movil|equipo)|(resolutor|funcionario|movil|equipo).*(top|ranking|mas|mayor|mejor|atend|gestion|cerr|resuelt|resolv|finaliz|termin)/.test(q)) return "resolver_performance";
   if (/sin asignar|no asignad|pendiente de asign|disponible.*ticket|ticket.*disponible/.test(q)) return "unassigned_tickets";
   if (requestedAlertType && (
     /(ticket|tickets|caso|casos|evento|eventos|emergencia|emergencias|muestra|mostrar|muestrame|muéstrame|lista|listado|cuanto|cantidad|reporte|pdf)/.test(q) ||
@@ -7018,17 +7018,19 @@ function luciaBuildSafeQuery(question, ccId) {
   }
 
   if (intent === "resolver_performance") {
+    const performanceByResolved = /resuelt|cerrad|finaliz|terminad|completad/.test(normalizeLuciaText(question));
     return {
       intent, days, limit,
-      title: "Desempeño de resolutores",
+      title: performanceByResolved ? "Resolutores con más tickets resueltos" : "Desempeño de resolutores",
       params: baseParams,
+      sort_mode: performanceByResolved ? "resolved" : "assigned",
       sql: `
         SELECT
           u.full_name AS resolutor,
           u.phone AS telefono,
           COUNT(t.id)::int AS tickets_asignados,
           COUNT(t.id) FILTER (WHERE t.state IN ('RESOLVED','CLOSED'))::int AS tickets_cerrados,
-          COUNT(t.id) FILTER (WHERE t.state IN ('ASSIGNED','EN_ROUTE','ON_SITE'))::int AS tickets_en_gestion,
+          COUNT(t.id) FILTER (WHERE t.state IN ('ASSIGNED','ACCEPTED_BY_RESOLVER','EN_ROUTE','ON_SITE'))::int AS tickets_en_gestion,
           ROUND(AVG(EXTRACT(EPOCH FROM (t.resolved_at - t.assigned_at)) / 60.0) FILTER (WHERE t.resolved_at IS NOT NULL AND t.assigned_at IS NOT NULL)::numeric, 1) AS min_promedio_resolucion
         FROM users u
         LEFT JOIN tickets t ON t.assigned_resolver_id = u.id
@@ -7037,7 +7039,7 @@ function luciaBuildSafeQuery(question, ccId) {
         WHERE u.control_center_id = $1
           AND u.role = 'RESOLVER'
         GROUP BY u.id, u.full_name, u.phone
-        ORDER BY tickets_asignados DESC, tickets_cerrados DESC, resolutor ASC
+        ORDER BY ${performanceByResolved ? "tickets_cerrados DESC, tickets_asignados DESC" : "tickets_asignados DESC, tickets_cerrados DESC"}, resolutor ASC
         LIMIT $3
       `
     };
@@ -7382,7 +7384,14 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
     const r = rows[0] || {};
     return `Resumen de ${controlCenterCode} para los últimos ${days} días: ${r.tickets_periodo || 0} tickets, ${r.tickets_abiertos || 0} abiertos, ${r.tickets_24h || 0} en las últimas 24 horas y ${r.alta_prioridad || 0} de alta prioridad. Tiempo promedio de asignación: ${r.min_promedio_asignacion ?? '—'} min. Tiempo promedio de resolución: ${r.min_promedio_resolucion ?? '—'} min.`;
   }
-  if (queryDef.intent === "resolver_performance") return n ? `Encontré ${n} resolutores para el período. El ranking está ordenado por tickets asignados y cierres/resoluciones.` : "No encontré actividad de resolutores para ese período.";
+  if (queryDef.intent === "resolver_performance") {
+    if (!n) return "No encontré actividad de resolutores para ese período.";
+    const top = rows[0] || {};
+    if (queryDef.sort_mode === "resolved") {
+      return `El resolutor con mayor cantidad de tickets resueltos en el período es ${top.resolutor || "el primer lugar del ranking"}, con ${top.tickets_cerrados || 0} tickets cerrados/resueltos. Abajo dejé el ranking completo.`;
+    }
+    return `Encontré ${n} resolutores para el período. El ranking está ordenado por tickets asignados y cierres/resoluciones.`;
+  }
   if (queryDef.intent === "resolver_rejections") return n ? `Estos son los resolutores con rechazos registrados en los últimos ${days} días.` : "No hay rechazos de resolutores registrados en ese período.";
   if (queryDef.intent === "unassigned_tickets") return n ? `Hay ${n} tickets sin asignar dentro del límite solicitado. Prioricé por criticidad y antigüedad.` : "No encontré tickets sin asignar en el período consultado.";
   if (queryDef.intent === "open_tickets") return n ? `Estos son los tickets abiertos más relevantes, ordenados por prioridad y antigüedad.` : "No encontré tickets abiertos para ese período.";
