@@ -7451,6 +7451,11 @@ app.get("/tickets/:id", async (req, res) => {
       `
       SELECT
         t.*,
+        t.event_sector_code AS incident_sector_code,
+        t.event_sector_name AS incident_sector,
+        t.event_sector_name AS incident_sector_name,
+        t.event_sector_method AS incident_sector_method,
+        t.event_sector_source AS incident_sector_source,
         cc.code AS control_center_code,
         cc.name AS control_center_name,
 
