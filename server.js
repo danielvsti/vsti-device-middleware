@@ -104,6 +104,20 @@ const SAYVU_TOKEN = process.env.SAYVU_TOKEN || "";
 const FLESPI_TOKEN = process.env.FLESPI_TOKEN || "";
 const FLESPI_MQTT_URL = "mqtts://mqtt.flespi.io:8883";
 
+function envFlag(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(raw).trim().toLowerCase());
+}
+
+const WA_CENTER_BASE_URL = String(process.env.WA_CENTER_BASE_URL || "https://wa-center.vsti.cl").replace(/\/+$/, "");
+const WA_CENTER_API_TOKEN = process.env.WA_CENTER_API_TOKEN || "";
+const WA_CENTER_VOICE_ENABLED = envFlag("WA_CENTER_VOICE_ENABLED", false);
+const WA_CENTER_VOICE_RECORDING = envFlag("WA_CENTER_VOICE_RECORDING", true);
+const WA_CENTER_VOICE_SUPERVISION = envFlag("WA_CENTER_VOICE_SUPERVISION", true);
+const WA_CENTER_WEBHOOK_SECRET = process.env.WA_CENTER_WEBHOOK_SECRET || "";
+const SOS_PUBLIC_BASE_URL = String(process.env.SOS_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+
 const gpsDevices = {};
 const mobileEvents = {};
 
@@ -2973,6 +2987,415 @@ function meetingUrlForTicket(ticketId, mode = "video") {
   return `https://meet.jit.si/${room}#config.prejoinPageEnabled=false&config.startWithVideoMuted=${startWithVideoMuted}&config.startWithAudioMuted=false`;
 }
 
+let voiceSchemaReady = false;
+
+async function ensureVoiceSchema() {
+  if (voiceSchemaReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_voice_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL,
+      mobile_event_id TEXT REFERENCES mobile_events(id) ON DELETE SET NULL,
+      requested_by TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      neighbor_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      resolver_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      operator_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      external_reference TEXT NOT NULL,
+      wa_center_session_id TEXT,
+      wa_center_call_id TEXT,
+      wa_center_bridge_id TEXT,
+      status TEXT NOT NULL DEFAULT 'REQUESTED',
+      party_a_role TEXT,
+      party_b_role TEXT,
+      party_a_webrtc JSONB,
+      party_b_webrtc JSONB,
+      recording_id TEXT,
+      recording_url TEXT,
+      started_at TIMESTAMPTZ,
+      connected_at TIMESTAMPTZ,
+      ended_at TIMESTAMPTZ,
+      duration_seconds INTEGER,
+      failure_reason TEXT,
+      raw_request JSONB DEFAULT '{}'::jsonb,
+      raw_response JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_ticket_voice_sessions_ticket_created
+    ON ticket_voice_sessions(ticket_id, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_ticket_voice_sessions_wa_center
+    ON ticket_voice_sessions(wa_center_session_id)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_voice_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      voice_session_id UUID REFERENCES ticket_voice_sessions(id) ON DELETE SET NULL,
+      ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL,
+      wa_center_session_id TEXT,
+      external_reference TEXT,
+      event TEXT NOT NULL,
+      participant_role TEXT,
+      duration_seconds INTEGER,
+      failure_reason TEXT,
+      payload JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_ticket_voice_events_session_created
+    ON ticket_voice_events(wa_center_session_id, created_at DESC)
+  `);
+
+  voiceSchemaReady = true;
+}
+
+function sosPublicBaseUrl(req) {
+  return SOS_PUBLIC_BASE_URL || publicBaseUrl(req);
+}
+
+function normalizeVoiceStatus(event) {
+  const raw = String(event || '').toUpperCase();
+  if (raw === 'SESSION_CREATED') return 'CREATED';
+  if (raw === 'PARTICIPANT_REGISTERED') return 'WAITING';
+  if (raw === 'RINGING') return 'RINGING';
+  if (raw === 'CONNECTED') return 'CONNECTED';
+  if (raw === 'PARTICIPANT_DISCONNECTED') return 'CONNECTED';
+  if (raw === 'ENDED') return 'ENDED';
+  if (raw === 'FAILED') return 'FAILED';
+  if (raw === 'NO_ANSWER') return 'NO_ANSWER';
+  if (raw === 'EXPIRED') return 'EXPIRED';
+  if (raw === 'RECORDING_AVAILABLE') return 'ENDED';
+  return raw || 'UPDATED';
+}
+
+function voiceEventDescription(event, payload = {}) {
+  const normalized = String(event || '').toUpperCase();
+  const role = payload.participant_role ? ` (${payload.participant_role})` : '';
+  const descriptions = {
+    SESSION_CREATED: 'WA-Center creó la sesión de llamada segura',
+    PARTICIPANT_REGISTERED: `Participante registrado en llamada segura${role}`,
+    RINGING: `Llamada segura sonando${role}`,
+    CONNECTED: 'Llamada segura conectada',
+    PARTICIPANT_DISCONNECTED: `Participante desconectado de llamada segura${role}`,
+    ENDED: 'Llamada segura finalizada',
+    FAILED: 'Llamada segura fallida',
+    NO_ANSWER: 'Llamada segura sin respuesta',
+    EXPIRED: 'Sesión de llamada segura expirada',
+    RECORDING_AVAILABLE: 'Grabación de llamada segura disponible'
+  };
+  return descriptions[normalized] || `Evento técnico de llamada segura: ${normalized || 'UPDATED'}`;
+}
+
+function sanitizeVoiceSessionRow(row, options = {}) {
+  if (!row) return null;
+  const includeCredentials = options.includeCredentials === true;
+  const sanitizeParticipant = (value) => {
+    if (!value || typeof value !== 'object') return value || null;
+    if (includeCredentials) return value;
+    const copy = { ...value };
+    if (copy.password) copy.password = '***';
+    return copy;
+  };
+
+  return {
+    id: row.id,
+    ticket_id: row.ticket_id,
+    mobile_event_id: row.mobile_event_id,
+    requested_by: row.requested_by,
+    target_type: row.target_type,
+    status: row.status,
+    external_reference: row.external_reference,
+    wa_center_session_id: row.wa_center_session_id,
+    started_at: row.started_at,
+    connected_at: row.connected_at,
+    ended_at: row.ended_at,
+    duration_seconds: row.duration_seconds,
+    failure_reason: row.failure_reason,
+    recording_url: row.recording_url,
+    recording_id: row.recording_id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    party_a_webrtc: sanitizeParticipant(row.party_a_webrtc),
+    party_b_webrtc: sanitizeParticipant(row.party_b_webrtc)
+  };
+}
+
+async function getVoiceSessionsForTicket(ticketId, options = {}) {
+  if (!ticketId) return [];
+  await ensureVoiceSchema();
+
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM ticket_voice_sessions
+    WHERE ticket_id = $1
+    ORDER BY created_at DESC
+    LIMIT $2
+    `,
+    [ticketId, Math.min(Number(options.limit || 10), 50)]
+  );
+
+  return result.rows.map((row) => sanitizeVoiceSessionRow(row, options));
+}
+
+async function fetchTicketVoiceContext(ticketId) {
+  const result = await pool.query(
+    `
+    SELECT
+      t.*,
+      cc.code AS control_center_code,
+      cc.name AS control_center_name,
+      citizen.id AS citizen_id,
+      citizen.full_name AS citizen_name,
+      citizen.phone AS citizen_phone,
+      resolver.id AS resolver_id,
+      resolver.full_name AS resolver_name,
+      resolver.phone AS resolver_phone
+    FROM tickets t
+    JOIN control_centers cc ON cc.id = t.control_center_id
+    LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+    LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+    WHERE t.id = $1
+    LIMIT 1
+    `,
+    [ticketId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function callWaCenterCreateVoiceSession(payload) {
+  if (!WA_CENTER_VOICE_ENABLED) {
+    const err = new Error('WA-Center Voice no está habilitado en este ambiente.');
+    err.code = 'WA_CENTER_VOICE_DISABLED';
+    throw err;
+  }
+
+  if (!WA_CENTER_BASE_URL || !WA_CENTER_API_TOKEN) {
+    const err = new Error('WA-Center Voice no está configurado.');
+    err.code = 'WA_CENTER_VOICE_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const response = await fetch(`${WA_CENTER_BASE_URL}/voice/sessions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${WA_CENTER_API_TOKEN}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+
+  if (!response.ok || data?.ok === false) {
+    const err = new Error(data?.message || data?.error || `WA-Center HTTP ${response.status}`);
+    err.code = 'WA_CENTER_CREATE_FAILED';
+    err.status = response.status;
+    err.response = data;
+    throw err;
+  }
+
+  return data;
+}
+
+async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, actorUserId = null, resolverUserId = null }) {
+  await ensureVoiceSchema();
+
+  if (!ticket?.id) {
+    const err = new Error('Ticket not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const terminal = ['RESOLVED', 'CLOSED', 'CANCELLED'];
+  if (terminal.includes(String(ticket.state || '').toUpperCase())) {
+    const err = new Error('No se puede iniciar llamada segura para un ticket cerrado.');
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const externalReference = `sos-ticket-${ticket.id}`;
+  const isResolverTarget = String(targetType || '').toUpperCase() === 'RESOLVER';
+  const partyALabel = requestedBy === 'NEIGHBOR'
+    ? 'Vecino'
+    : requestedBy === 'RESOLVER'
+      ? 'Resolutor'
+      : 'Central SOS';
+  const partyBLabel = isResolverTarget
+    ? (ticket.resolver_name || 'Resolutor')
+    : requestedBy === 'RESOLVER'
+      ? 'Vecino'
+      : `Central ${ticket.control_center_code || ''}`.trim();
+
+  const payload = {
+    external_reference: externalReference,
+    mode: 'BRIDGE',
+    expires_in_seconds: Number(process.env.WA_CENTER_VOICE_EXPIRES_SECONDS || 900),
+    recording: WA_CENTER_VOICE_RECORDING,
+    supervision: WA_CENTER_VOICE_SUPERVISION,
+    participants: [
+      { role: 'party_a', type: 'webrtc', label: partyALabel },
+      { role: 'party_b', type: 'webrtc', label: partyBLabel }
+    ],
+    callback_url: `${sosPublicBaseUrl(req)}/integrations/wa-center/voice-events`
+  };
+
+  const insertResult = await pool.query(
+    `
+    INSERT INTO ticket_voice_sessions (
+      ticket_id,
+      mobile_event_id,
+      requested_by,
+      target_type,
+      neighbor_id,
+      resolver_user_id,
+      operator_user_id,
+      external_reference,
+      status,
+      party_a_role,
+      party_b_role,
+      raw_request
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'REQUESTED','party_a','party_b',$9)
+    RETURNING *
+    `,
+    [
+      ticket.id,
+      ticket.source_type === 'MOBILE_APP' ? ticket.source_event_id : null,
+      requestedBy,
+      targetType,
+      ticket.citizen_user_id || ticket.citizen_id || null,
+      resolverUserId || ticket.assigned_resolver_id || ticket.resolver_id || null,
+      requestedBy === 'OPERATOR' ? actorUserId : null,
+      externalReference,
+      JSON.stringify(payload)
+    ]
+  );
+
+  const localSession = insertResult.rows[0];
+
+  try {
+    const waResponse = await callWaCenterCreateVoiceSession(payload);
+    const participantA = Array.isArray(waResponse.participants) ? waResponse.participants.find(p => p.role === 'party_a') : null;
+    const participantB = Array.isArray(waResponse.participants) ? waResponse.participants.find(p => p.role === 'party_b') : null;
+
+    const updated = await pool.query(
+      `
+      UPDATE ticket_voice_sessions
+      SET
+        wa_center_session_id = $2,
+        status = COALESCE($3, 'CREATED'),
+        party_a_webrtc = $4,
+        party_b_webrtc = $5,
+        raw_response = $6,
+        started_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [
+        localSession.id,
+        waResponse.session_id || null,
+        waResponse.status || 'CREATED',
+        JSON.stringify(participantA || {}),
+        JSON.stringify(participantB || {}),
+        JSON.stringify(waResponse || {})
+      ]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,$2,$3,'CALL_VOICE',$4,$5)
+      `,
+      [
+        ticket.id,
+        actorUserId,
+        requestedBy,
+        requestedBy === 'NEIGHBOR'
+          ? 'Vecino solicitó llamada segura'
+          : requestedBy === 'RESOLVER'
+            ? 'Resolutor solicitó llamada segura con el vecino'
+            : 'Central solicitó llamada segura con el vecino',
+        JSON.stringify({
+          channel: 'voice',
+          provider: 'wa_center',
+          target_type: targetType,
+          requested_by: requestedBy,
+          voice_session_id: localSession.id,
+          wa_center_session_id: waResponse.session_id || null,
+          external_reference: externalReference,
+          status: waResponse.status || 'CREATED'
+        })
+      ]
+    );
+
+    await pool.query(`UPDATE tickets SET updated_at = NOW() WHERE id = $1`, [ticket.id]);
+
+    return sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: true });
+  } catch (error) {
+    await pool.query(
+      `
+      UPDATE ticket_voice_sessions
+      SET status = 'FAILED', failure_reason = $2, raw_response = $3, updated_at = NOW()
+      WHERE id = $1
+      `,
+      [localSession.id, error.message, JSON.stringify(error.response || { message: error.message, code: error.code || null })]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id,
+        actor_user_id,
+        actor_role,
+        action_type,
+        description,
+        metadata
+      )
+      VALUES ($1,$2,$3,'CALL_REJECTED',$4,$5)
+      `,
+      [
+        ticket.id,
+        actorUserId,
+        requestedBy,
+        'No fue posible crear la llamada segura en WA-Center',
+        JSON.stringify({
+          channel: 'voice',
+          provider: 'wa_center',
+          target_type: targetType,
+          requested_by: requestedBy,
+          voice_session_id: localSession.id,
+          error: error.message,
+          code: error.code || null
+        })
+      ]
+    );
+
+    throw error;
+  }
+}
+
 
 function normalizeMobileSosPayload(reqBody = {}) {
   const rawType = String(reqBody.alert_type || "SOS_MANUAL").toUpperCase();
@@ -3817,6 +4240,9 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
     const neighborActivity = event.ticket_id
       ? await getNeighborTicketActivity(event.ticket_id)
       : [];
+    const voiceSessions = event.ticket_id
+      ? await getVoiceSessionsForTicket(event.ticket_id, { includeCredentials: false, limit: 5 })
+      : [];
 
     res.json({
       status: "ok",
@@ -3825,6 +4251,7 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
       effective_state: effectiveState,
       neighbor_progress: neighborProgress,
       neighbor_activity: neighborActivity,
+      voice_sessions: voiceSessions,
       pending_call_request: pendingCallRequest
     });
 
@@ -3912,6 +4339,9 @@ app.get("/public/mobile/active", async (req, res) => {
     const neighborActivity = event.ticket_id
       ? await getNeighborTicketActivity(event.ticket_id)
       : [];
+    const voiceSessions = event.ticket_id
+      ? await getVoiceSessionsForTicket(event.ticket_id, { includeCredentials: false, limit: 5 })
+      : [];
 
     res.json({
       status: "ok",
@@ -3921,7 +4351,8 @@ app.get("/public/mobile/active", async (req, res) => {
       ticket_state: event.ticket_state || null,
       effective_state: effectiveState,
       neighbor_progress: buildNeighborProgress(event),
-      neighbor_activity: neighborActivity
+      neighbor_activity: neighborActivity,
+      voice_sessions: voiceSessions
     });
 
   } catch (error) {
@@ -6054,6 +6485,281 @@ app.post("/tickets/:id/call-response", async (req, res) => {
       status: "error",
       message: error.message
     });
+  }
+});
+
+app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { user_id = null, target_type = "CENTRAL" } = req.body || {};
+
+    const eventResult = await pool.query(
+      `
+      SELECT
+        m.*,
+        t.id AS ticket_id,
+        t.source_type,
+        t.source_event_id,
+        t.state AS ticket_state
+      FROM mobile_events m
+      LEFT JOIN tickets t
+        ON t.source_type = 'MOBILE_APP'
+       AND t.source_event_id = m.id
+      WHERE m.id = $1
+      ORDER BY t.created_at DESC NULLS LAST
+      LIMIT 1
+      `,
+      [eventId]
+    );
+
+    if (eventResult.rows.length === 0) {
+      return res.status(404).json({ status: "error", message: "Mobile event not found" });
+    }
+
+    const event = eventResult.rows[0];
+    if (user_id && event.user_id && String(user_id) !== String(event.user_id)) {
+      return res.status(403).json({ status: "error", message: "Mobile event does not belong to user" });
+    }
+
+    if (!event.ticket_id) {
+      return res.status(409).json({ status: "error", message: "El caso aún no tiene ticket operacional asociado." });
+    }
+
+    const ticket = await fetchTicketVoiceContext(event.ticket_id);
+    const voiceSession = await createTicketVoiceSession({
+      req,
+      ticket,
+      requestedBy: "NEIGHBOR",
+      targetType: String(target_type || "CENTRAL").toUpperCase() === "RESOLVER" ? "RESOLVER" : "CENTRAL",
+      actorUserId: ticket?.citizen_user_id || null,
+      resolverUserId: ticket?.assigned_resolver_id || null
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada segura solicitada",
+      voice_session: voiceSession
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE REQUEST ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible solicitar llamada segura"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
+  try {
+    const { ticketId } = req.params;
+    const { resolver_user_id } = req.body || {};
+
+    if (!resolver_user_id) {
+      return res.status(400).json({ status: "error", message: "resolver_user_id is required" });
+    }
+
+    const ticket = await fetchTicketVoiceContext(ticketId);
+    if (!ticket) {
+      return res.status(404).json({ status: "error", message: "Ticket not found" });
+    }
+
+    if (String(ticket.assigned_resolver_id || "") !== String(resolver_user_id)) {
+      return res.status(403).json({ status: "error", message: "El ticket no está asignado a este resolutor" });
+    }
+
+    const voiceSession = await createTicketVoiceSession({
+      req,
+      ticket,
+      requestedBy: "RESOLVER",
+      targetType: "NEIGHBOR",
+      actorUserId: resolver_user_id,
+      resolverUserId: resolver_user_id
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada segura solicitada",
+      voice_session: voiceSession
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE REQUEST ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible solicitar llamada segura"
+    });
+  }
+});
+
+app.post("/tickets/:id/voice/request", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para iniciar llamada segura")) return;
+
+    const { id } = req.params;
+    const { target_type = "NEIGHBOR" } = req.body || {};
+    const ticket = await fetchTicketVoiceContext(id);
+
+    if (!ticket) {
+      return res.status(404).json({ status: "error", message: "Ticket not found" });
+    }
+
+    const voiceSession = await createTicketVoiceSession({
+      req,
+      ticket,
+      requestedBy: "OPERATOR",
+      targetType: String(target_type || "NEIGHBOR").toUpperCase(),
+      actorUserId: req.panel_session?.sub || null,
+      resolverUserId: ticket.assigned_resolver_id || null
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada segura solicitada",
+      voice_session: voiceSession
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE REQUEST ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible solicitar llamada segura"
+    });
+  }
+});
+
+app.get("/tickets/:id/voice/sessions", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sessions = await getVoiceSessionsForTicket(id, { includeCredentials: false, limit: 20 });
+    res.json({ status: "ok", total: sessions.length, voice_sessions: sessions });
+  } catch (error) {
+    console.error("[GET VOICE SESSIONS ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/integrations/wa-center/voice-events", async (req, res) => {
+  try {
+    if (WA_CENTER_WEBHOOK_SECRET) {
+      const provided = req.headers["x-wa-center-webhook-secret"] ||
+        String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
+      if (provided !== WA_CENTER_WEBHOOK_SECRET) {
+        return res.status(401).json({ status: "error", message: "Invalid WA-Center webhook secret" });
+      }
+    }
+
+    await ensureVoiceSchema();
+
+    const payload = req.body || {};
+    const sessionId = payload.session_id || payload.wa_center_session_id || null;
+    const externalReference = payload.external_reference || null;
+    const event = String(payload.event || "UPDATED").toUpperCase();
+    const normalizedStatus = normalizeVoiceStatus(event);
+
+    const sessionResult = await pool.query(
+      `
+      SELECT *
+      FROM ticket_voice_sessions
+      WHERE ($1::text IS NOT NULL AND wa_center_session_id = $1)
+         OR ($2::text IS NOT NULL AND external_reference = $2)
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [sessionId, externalReference]
+    );
+
+    const session = sessionResult.rows[0] || null;
+
+    await pool.query(
+      `
+      INSERT INTO ticket_voice_events (
+        voice_session_id,
+        ticket_id,
+        wa_center_session_id,
+        external_reference,
+        event,
+        participant_role,
+        duration_seconds,
+        failure_reason,
+        payload
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `,
+      [
+        session?.id || null,
+        session?.ticket_id || null,
+        sessionId,
+        externalReference,
+        event,
+        payload.participant_role || null,
+        payload.duration_seconds != null ? Number(payload.duration_seconds) : null,
+        payload.failure_reason || null,
+        JSON.stringify(payload)
+      ]
+    );
+
+    if (session) {
+      const recordingUrl = payload.recording_url || payload.recording?.url || null;
+      const recordingId = payload.recording_id || payload.recording?.id || null;
+
+      await pool.query(
+        `
+        UPDATE ticket_voice_sessions
+        SET
+          status = $2,
+          connected_at = CASE WHEN $3 = 'CONNECTED' THEN COALESCE(connected_at, NOW()) ELSE connected_at END,
+          ended_at = CASE WHEN $3 IN ('ENDED','FAILED','NO_ANSWER','EXPIRED') THEN COALESCE(ended_at, NOW()) ELSE ended_at END,
+          duration_seconds = COALESCE($4, duration_seconds),
+          failure_reason = COALESCE($5, failure_reason),
+          recording_url = COALESCE($6, recording_url),
+          recording_id = COALESCE($7, recording_id),
+          updated_at = NOW()
+        WHERE id = $1
+        `,
+        [
+          session.id,
+          normalizedStatus,
+          event,
+          payload.duration_seconds != null ? Number(payload.duration_seconds) : null,
+          payload.failure_reason || null,
+          recordingUrl,
+          recordingId
+        ]
+      );
+
+      await pool.query(
+        `
+        INSERT INTO ticket_actions (
+          ticket_id,
+          actor_user_id,
+          actor_role,
+          action_type,
+          description,
+          metadata
+        )
+        VALUES ($1,NULL,'SYSTEM',$2,$3,$4)
+        `,
+        [
+          session.ticket_id,
+          `VOICE_${event}`,
+          voiceEventDescription(event, payload),
+          JSON.stringify({
+            provider: 'wa_center',
+            wa_center_session_id: sessionId,
+            external_reference: externalReference,
+            event,
+            participant_role: payload.participant_role || null,
+            duration_seconds: payload.duration_seconds || null,
+            failure_reason: payload.failure_reason || null,
+            recording_url: recordingUrl,
+            recording_id: recordingId
+          })
+        ]
+      );
+    }
+
+    res.json({ status: "ok", matched: Boolean(session), event });
+  } catch (error) {
+    console.error("[WA CENTER VOICE EVENT ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
   }
 });
 
@@ -8314,12 +9020,15 @@ app.get("/tickets/:id", async (req, res) => {
       [id]
     );
 
+    const voiceSessions = await getVoiceSessionsForTicket(id, { includeCredentials: false, limit: 20 });
+
     res.json({
       status: "ok",
       ticket,
       emergency_contacts: contactsResult.rows,
       actions: actionsResult.rows,
-      notes: notesResult.rows
+      notes: notesResult.rows,
+      voice_sessions: voiceSessions
     });
 
   } catch (error) {
