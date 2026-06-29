@@ -3331,6 +3331,83 @@ app.post("/public/mobile/ack", async (req, res) => {
 });
 
 
+
+async function getNeighborTicketActivity(ticketId, limit = 30) {
+  if (!ticketId) return [];
+
+  const result = await pool.query(
+    `
+    SELECT
+      id,
+      action_type,
+      actor_role,
+      description,
+      metadata,
+      created_at
+    FROM ticket_actions
+    WHERE ticket_id = $1
+      AND actor_role = 'NEIGHBOR'
+      AND action_type IN (
+        'MESSAGE_TEXT',
+        'MEDIA_AUDIO',
+        'MEDIA_VIDEO',
+        'CALL_VOICE',
+        'CALL_VIDEO',
+        'CALL_ACCEPTED',
+        'CALL_REJECTED',
+        'CALL_RESPONSE'
+      )
+    ORDER BY created_at DESC
+    LIMIT $2
+    `,
+    [ticketId, limit]
+  );
+
+  return result.rows.map((row) => {
+    const metadata = row.metadata && typeof row.metadata === 'object'
+      ? row.metadata
+      : {};
+
+    let kind = 'event';
+    let title = row.description || 'Actualización enviada';
+    let body = null;
+    let media_url = null;
+    let file_name = null;
+
+    if (row.action_type === 'MESSAGE_TEXT') {
+      kind = 'text';
+      title = 'Mensaje de texto enviado';
+      body = metadata.message || null;
+    } else if (row.action_type === 'MEDIA_AUDIO') {
+      kind = 'audio';
+      title = 'Audio enviado';
+      media_url = metadata.media_url || null;
+      file_name = metadata.file_name || null;
+    } else if (row.action_type === 'MEDIA_VIDEO') {
+      kind = 'video';
+      title = 'Video enviado';
+      media_url = metadata.media_url || null;
+      file_name = metadata.file_name || null;
+    } else if (row.action_type === 'CALL_VOICE' || row.action_type === 'CALL_VIDEO') {
+      kind = row.action_type === 'CALL_VOICE' ? 'voice_call' : 'video_call';
+      title = row.description || 'Solicitud de llamada enviada';
+    } else if (row.action_type === 'CALL_ACCEPTED' || row.action_type === 'CALL_REJECTED' || row.action_type === 'CALL_RESPONSE') {
+      kind = 'call_response';
+      title = row.description || 'Respuesta de llamada enviada';
+    }
+
+    return {
+      id: row.id,
+      kind,
+      title,
+      body,
+      media_url,
+      file_name,
+      created_at: row.created_at
+    };
+  });
+}
+
 function buildNeighborProgress(event) {
   const state = event.ticket_state || event.state || "ACTIVE";
   const shortTicket = event.ticket_id
@@ -3355,8 +3432,8 @@ function buildNeighborProgress(event) {
       key: "resolver_assigned",
       label: "Resolutor asignado",
       detail: event.resolver_name
-        ? `${event.resolver_name} fue asignado a tu caso.`
-        : "Un resolutor municipal fue asignado a tu caso.",
+        ? `Tu caso fue asignado a ${event.resolver_name}.`
+        : "Tu caso fue asignado a un resolutor municipal.",
       done: true,
       active: ["ASSIGNED", "ACCEPTED_BY_RESOLVER"].includes(state),
       at: event.ticket_assigned_at || null,
@@ -3415,8 +3492,8 @@ function buildNeighborProgress(event) {
   if (state === "ASSIGNED") {
     headline = "Resolutor asignado.";
     detail = event.resolver_name
-      ? `${event.resolver_name} fue asignado a tu caso.`
-      : "Un resolutor municipal fue asignado a tu caso.";
+      ? `Tu caso fue asignado a ${event.resolver_name}.`
+      : "Tu caso fue asignado a un resolutor municipal.";
   } else if (state === "ACCEPTED_BY_RESOLVER") {
     headline = "El resolutor aceptó el caso.";
     detail = event.resolver_name
@@ -3542,12 +3619,17 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
       }
     }
 
+    const neighborActivity = event.ticket_id
+      ? await getNeighborTicketActivity(event.ticket_id)
+      : [];
+
     res.json({
       status: "ok",
       event,
       ticket_state: event.ticket_state || null,
       effective_state: effectiveState,
       neighbor_progress: neighborProgress,
+      neighbor_activity: neighborActivity,
       pending_call_request: pendingCallRequest
     });
 
@@ -3619,7 +3701,8 @@ app.get("/public/mobile/active", async (req, res) => {
         active: false,
         event: null,
         ticket_id: null,
-        neighbor_progress: null
+        neighbor_progress: null,
+        neighbor_activity: []
       });
     }
 
@@ -3631,6 +3714,10 @@ app.get("/public/mobile/active", async (req, res) => {
 
     event.effective_state = effectiveState;
 
+    const neighborActivity = event.ticket_id
+      ? await getNeighborTicketActivity(event.ticket_id)
+      : [];
+
     res.json({
       status: "ok",
       active: true,
@@ -3638,7 +3725,8 @@ app.get("/public/mobile/active", async (req, res) => {
       ticket_id: event.ticket_id || null,
       ticket_state: event.ticket_state || null,
       effective_state: effectiveState,
-      neighbor_progress: buildNeighborProgress(event)
+      neighbor_progress: buildNeighborProgress(event),
+      neighbor_activity: neighborActivity
     });
 
   } catch (error) {
