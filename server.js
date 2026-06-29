@@ -2004,11 +2004,150 @@ const OTP_EXPOSE_DEMO_CODE = process.env.OTP_EXPOSE_DEMO_CODE === "true";
 const OTP_LOG_CODES = process.env.OTP_LOG_CODES === "true";
 const OTP_REQUIRE_DELIVERY = process.env.OTP_REQUIRE_DELIVERY === "true";
 const OTP_DEFAULT_CHANNEL = process.env.OTP_DEFAULT_CHANNEL || "sms";
+const OTP_PROVIDER = String(process.env.OTP_PROVIDER || "internal").toLowerCase();
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID || "";
 
 let authOtpTableReady = false;
 
 function normalizePhoneForAuth(phone) {
   return String(phone || "").trim().replace(/\s+/g, "");
+}
+
+function normalizePhoneForProvider(phone) {
+  const value = normalizePhoneForAuth(phone).replace(/[^\d+]/g, "");
+  if (!value) return "";
+  if (value.startsWith("+")) return value;
+  if (value.startsWith("56")) return `+${value}`;
+  if (value.startsWith("9") && value.length === 9) return `+56${value}`;
+  return value;
+}
+
+function isTwilioVerifyOtpEnabled(channel = "sms") {
+  if (OTP_PROVIDER !== "twilio_verify") return false;
+  if (!["sms", "whatsapp"].includes(String(channel || "").toLowerCase())) return false;
+  return Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_VERIFY_SERVICE_SID);
+}
+
+function twilioVerifyAuthHeader() {
+  return `Basic ${Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64")}`;
+}
+
+async function postTwilioVerifyForm(pathSuffix, form) {
+  const url = `https://verify.twilio.com/v2/Services/${encodeURIComponent(TWILIO_VERIFY_SERVICE_SID)}/${pathSuffix}`;
+  const body = new URLSearchParams(form);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: twilioVerifyAuthHeader(),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (_) {
+    data = { raw: text };
+  }
+
+  if (!response.ok) {
+    const message = data?.message || data?.raw || `Twilio Verify HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.twilio = data;
+    throw error;
+  }
+
+  return data || {};
+}
+
+async function sendTwilioVerifyCode({ phone, channel }) {
+  const to = normalizePhoneForProvider(phone);
+  if (!to) {
+    return { sent: false, channel, reason: "missing_phone" };
+  }
+
+  if (!isTwilioVerifyOtpEnabled(channel)) {
+    return { sent: false, channel, reason: "twilio_verify_not_configured" };
+  }
+
+  try {
+    const verification = await postTwilioVerifyForm("Verifications", {
+      To: to,
+      Channel: String(channel || "sms").toLowerCase()
+    });
+
+    return {
+      sent: ["pending", "approved"].includes(verification.status),
+      channel,
+      provider: "twilio_verify",
+      sid: verification.sid || null,
+      to: verification.to || to,
+      verification_status: verification.status || null
+    };
+  } catch (error) {
+    console.error("[TWILIO VERIFY SEND ERROR]", {
+      status: error.status || null,
+      message: error.message
+    });
+
+    return {
+      sent: false,
+      channel,
+      provider: "twilio_verify",
+      status: error.status || null,
+      error: error.message
+    };
+  }
+}
+
+async function checkTwilioVerifyCode({ phone, code, channel = "sms" }) {
+  const to = normalizePhoneForProvider(phone);
+  if (!to || !code) return { ok: false, reason: "invalid_or_expired" };
+
+  if (!isTwilioVerifyOtpEnabled(channel)) {
+    return { ok: false, reason: "twilio_verify_not_configured" };
+  }
+
+  try {
+    const verification = await postTwilioVerifyForm("VerificationCheck", {
+      To: to,
+      Code: String(code || "").trim()
+    });
+
+    if (verification.status === "approved") {
+      return {
+        ok: true,
+        provider: "twilio_verify",
+        sid: verification.sid || null,
+        to: verification.to || to,
+        status: verification.status
+      };
+    }
+
+    return {
+      ok: false,
+      provider: "twilio_verify",
+      reason: "invalid_or_expired",
+      status: verification.status || null
+    };
+  } catch (error) {
+    console.error("[TWILIO VERIFY CHECK ERROR]", {
+      status: error.status || null,
+      message: error.message
+    });
+
+    return {
+      ok: false,
+      provider: "twilio_verify",
+      reason: "invalid_or_expired",
+      status: error.status || null
+    };
+  }
 }
 
 function generateOtpCode() {
@@ -2099,7 +2238,9 @@ async function deliverOtpCode({ phone, email, channel, code, purpose }) {
   let result = { sent: false, channel, reason: "provider_not_configured" };
 
   try {
-    if (channel === "sms") {
+    if (isTwilioVerifyOtpEnabled(channel)) {
+      result = await sendTwilioVerifyCode({ phone, channel });
+    } else if (channel === "sms") {
       result = await sendOtpByWebhook({
         url: process.env.OTP_SMS_WEBHOOK_URL,
         token,
@@ -2131,7 +2272,7 @@ async function deliverOtpCode({ phone, email, channel, code, purpose }) {
     result = { sent: false, channel, error: error.message };
   }
 
-  if (OTP_LOG_CODES || (OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE)) {
+  if ((OTP_LOG_CODES || (OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE)) && result.provider !== "twilio_verify") {
     console.log("[OTP CODE]", {
       phone,
       email: email || null,
@@ -2140,6 +2281,17 @@ async function deliverOtpCode({ phone, email, channel, code, purpose }) {
       delivery_sent: Boolean(result.sent),
       code,
       expires_minutes: OTP_TTL_MINUTES
+    });
+  }
+
+  if (result.provider === "twilio_verify") {
+    console.log("[OTP TWILIO VERIFY]", {
+      phone,
+      channel,
+      purpose,
+      delivery_sent: Boolean(result.sent),
+      verification_status: result.verification_status || null,
+      sid: result.sid || null
     });
   }
 
@@ -2205,6 +2357,49 @@ async function verifyOtpForPhone({ phone, code, purpose = null }) {
   await ensureAuthOtpTable();
 
   const cleanPhone = normalizePhoneForAuth(phone);
+
+  if (isTwilioVerifyOtpEnabled(OTP_DEFAULT_CHANNEL)) {
+    const twilioVerification = await checkTwilioVerifyCode({
+      phone: cleanPhone,
+      code,
+      channel: OTP_DEFAULT_CHANNEL
+    });
+
+    if (!twilioVerification.ok) {
+      return {
+        ok: false,
+        reason: twilioVerification.reason || "invalid_or_expired",
+        provider: "twilio_verify"
+      };
+    }
+
+    const latestOtp = await pool.query(
+      `
+      SELECT *
+      FROM auth_otps
+      WHERE phone = $1
+        AND consumed_at IS NULL
+        ${purpose ? "AND purpose = $2" : ""}
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      purpose ? [cleanPhone, purpose] : [cleanPhone]
+    );
+
+    if (latestOtp.rows.length > 0) {
+      await pool.query(
+        `UPDATE auth_otps SET consumed_at = NOW() WHERE id = $1`,
+        [latestOtp.rows[0].id]
+      );
+    }
+
+    return {
+      ok: true,
+      provider: "twilio_verify",
+      otp: latestOtp.rows[0] || null
+    };
+  }
+
   const codeHash = hashOtpCode(cleanPhone, String(code || "").trim());
 
   const result = await pool.query(
