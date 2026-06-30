@@ -3289,7 +3289,7 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
   const payload = {
     external_reference: externalReference,
     mode: 'BRIDGE',
-    expires_in: Number(process.env.WA_CENTER_VOICE_EXPIRES_SECONDS || 900),
+    expires_in_seconds: Number(process.env.WA_CENTER_VOICE_EXPIRES_SECONDS || 900),
     record: WA_CENTER_VOICE_RECORDING,
     supervision: WA_CENTER_VOICE_SUPERVISION,
     participants: [
