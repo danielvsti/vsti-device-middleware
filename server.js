@@ -3113,6 +3113,9 @@ function sanitizeVoiceSessionRow(row, options = {}) {
     mobile_event_id: row.mobile_event_id,
     requested_by: row.requested_by,
     target_type: row.target_type,
+    neighbor_id: row.neighbor_id,
+    resolver_user_id: row.resolver_user_id,
+    operator_user_id: row.operator_user_id,
     status: row.status,
     external_reference: row.external_reference,
     wa_center_session_id: row.wa_center_session_id,
@@ -6663,6 +6666,63 @@ app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
   }
 });
 
+
+app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/join", async (req, res) => {
+  try {
+    const { eventId, sessionId } = req.params;
+    const { user_id = null } = req.body || {};
+
+    const eventResult = await pool.query(
+      `
+      SELECT
+        m.*,
+        t.id AS ticket_id,
+        t.source_type,
+        t.source_event_id,
+        t.state AS ticket_state
+      FROM mobile_events m
+      LEFT JOIN tickets t
+        ON t.source_type = 'MOBILE_APP'
+       AND t.source_event_id = m.id
+      WHERE m.id = $1
+      ORDER BY t.created_at DESC NULLS LAST
+      LIMIT 1
+      `,
+      [eventId]
+    );
+
+    if (eventResult.rows.length === 0) {
+      return res.status(404).json({ status: "error", message: "Mobile event not found" });
+    }
+
+    const event = eventResult.rows[0];
+    if (user_id && event.user_id && String(user_id) !== String(event.user_id)) {
+      return res.status(403).json({ status: "error", message: "Mobile event does not belong to user" });
+    }
+
+    if (!event.ticket_id) {
+      return res.status(409).json({ status: "error", message: "El caso aún no tiene ticket operacional asociado." });
+    }
+
+    const session = await getVoiceSessionForTicket(event.ticket_id, sessionId, { includeCredentials: true });
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Credenciales de llamada segura entregadas",
+      voice_session: voiceSessionForParticipant(session, 'party_a')
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE JOIN ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible entrar a la llamada segura"
+    });
+  }
+});
+
 app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
   try {
     const { ticketId } = req.params;
@@ -6759,6 +6819,13 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
 
     if (!session) {
       return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    if (String(session.target_type || "").toUpperCase() === "RESOLVER") {
+      return res.status(409).json({
+        status: "error",
+        message: "Esta llamada segura está destinada al resolutor asignado. Debe atenderla desde la App Resolutor."
+      });
     }
 
     res.json({
