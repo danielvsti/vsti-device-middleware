@@ -4982,6 +4982,72 @@ app.post("/auth/logout", async (req, res) => {
   });
 });
 
+
+app.post("/resolver/auth/login", async (req, res) => {
+  try {
+    const { phone } = req.body || {};
+
+    if (!phone) {
+      return res.status(400).json({
+        status: "error",
+        message: "phone is required"
+      });
+    }
+
+    const normalizedPhone = String(phone).trim();
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.control_center_id,
+        cc.code AS control_center_code,
+        cc.name AS control_center_name,
+        u.role,
+        u.validation_status,
+        u.full_name,
+        u.phone,
+        u.email,
+        u.rut,
+        u.declared_address,
+        u.latitude,
+        u.longitude
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.phone = $1
+        AND u.role = 'RESOLVER'
+        AND u.is_active = true
+      ORDER BY u.created_at DESC
+      LIMIT 1
+      `,
+      [normalizedPhone]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Resolutor no encontrado o no activo para este teléfono"
+      });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      status: "ok",
+      message: "Resolver login OK",
+      user
+    });
+
+  } catch (error) {
+    console.error("[RESOLVER AUTH LOGIN ERROR]", error);
+
+    res.status(500).json({
+      status: "error",
+      message: "Database error logging resolver in"
+    });
+  }
+});
+
 app.post("/auth/login-demo", async (req, res) => {
   if (process.env.AUTH_DEMO_LOGIN_ENABLED !== "true") {
     return res.status(404).json({
