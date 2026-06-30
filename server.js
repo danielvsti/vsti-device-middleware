@@ -3130,6 +3130,52 @@ function sanitizeVoiceSessionRow(row, options = {}) {
   };
 }
 
+function voiceSessionForParticipant(session, role) {
+  if (!session) return null;
+  const selectedRole = role === 'party_b' ? 'party_b' : 'party_a';
+  const webrtc = selectedRole === 'party_b' ? session.party_b_webrtc : session.party_a_webrtc;
+  const safeSession = { ...session };
+  delete safeSession.party_a_webrtc;
+  delete safeSession.party_b_webrtc;
+  return {
+    ...safeSession,
+    participant_role: selectedRole,
+    webrtc: webrtc || null
+  };
+}
+
+function voiceParticipantForRequester({ requestedBy, targetType }) {
+  const requester = String(requestedBy || '').toUpperCase();
+  if (requester === 'NEIGHBOR') return 'party_a';
+  return 'party_b';
+}
+
+async function getVoiceSessionForTicket(ticketId, sessionId = 'latest', options = {}) {
+  await ensureVoiceSchema();
+  const latest = !sessionId || String(sessionId).toLowerCase() === 'latest';
+  const params = latest ? [ticketId] : [ticketId, sessionId];
+  const query = latest
+    ? `
+      SELECT *
+      FROM ticket_voice_sessions
+      WHERE ticket_id = $1
+        AND status NOT IN ('FAILED','ENDED','EXPIRED','NO_ANSWER')
+      ORDER BY created_at DESC
+      LIMIT 1
+      `
+    : `
+      SELECT *
+      FROM ticket_voice_sessions
+      WHERE ticket_id = $1
+        AND (id::text = $2 OR wa_center_session_id = $2)
+      ORDER BY created_at DESC
+      LIMIT 1
+      `;
+
+  const result = await pool.query(query, params);
+  return result.rows[0] ? sanitizeVoiceSessionRow(result.rows[0], options) : null;
+}
+
 async function getVoiceSessionsForTicket(ticketId, options = {}) {
   if (!ticketId) return [];
   await ensureVoiceSchema();
@@ -3228,23 +3274,23 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
   }
 
   const externalReference = `sos-ticket-${ticket.id}`;
-  const isResolverTarget = String(targetType || '').toUpperCase() === 'RESOLVER';
-  const partyALabel = requestedBy === 'NEIGHBOR'
-    ? 'Vecino'
-    : requestedBy === 'RESOLVER'
-      ? 'Resolutor'
-      : 'Central SOS';
-  const partyBLabel = isResolverTarget
-    ? (ticket.resolver_name || 'Resolutor')
-    : requestedBy === 'RESOLVER'
-      ? 'Vecino'
-      : `Central ${ticket.control_center_code || ''}`.trim();
+  const normalizedTargetType = String(targetType || '').toUpperCase();
+
+  // Contrato WA-Center v0.8:
+  // - SOS conserva toda la lógica del caso/ticket.
+  // - WA-Center solo ve una referencia externa y participantes genéricos.
+  // - party_a queda reservado para Vecino.
+  // - party_b queda reservado para Central/Operador o Resolutor.
+  const partyALabel = 'vecino';
+  const partyBLabel = normalizedTargetType === 'RESOLVER'
+    ? 'resolutor'
+    : 'central';
 
   const payload = {
     external_reference: externalReference,
     mode: 'BRIDGE',
-    expires_in_seconds: Number(process.env.WA_CENTER_VOICE_EXPIRES_SECONDS || 900),
-    recording: WA_CENTER_VOICE_RECORDING,
+    expires_in: Number(process.env.WA_CENTER_VOICE_EXPIRES_SECONDS || 900),
+    record: WA_CENTER_VOICE_RECORDING,
     supervision: WA_CENTER_VOICE_SUPERVISION,
     participants: [
       { role: 'party_a', type: 'webrtc', label: partyALabel },
@@ -6538,7 +6584,7 @@ app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
     res.json({
       status: "ok",
       message: "Llamada segura solicitada",
-      voice_session: voiceSession
+      voice_session: voiceSessionForParticipant(voiceSession, 'party_a')
     });
   } catch (error) {
     console.error("[MOBILE VOICE REQUEST ERROR]", error);
@@ -6571,7 +6617,7 @@ app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
       req,
       ticket,
       requestedBy: "RESOLVER",
-      targetType: "NEIGHBOR",
+      targetType: "RESOLVER",
       actorUserId: resolver_user_id,
       resolverUserId: resolver_user_id
     });
@@ -6579,7 +6625,7 @@ app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
     res.json({
       status: "ok",
       message: "Llamada segura solicitada",
-      voice_session: voiceSession
+      voice_session: voiceSessionForParticipant(voiceSession, 'party_b')
     });
   } catch (error) {
     console.error("[RESOLVER VOICE REQUEST ERROR]", error);
@@ -6614,7 +6660,7 @@ app.post("/tickets/:id/voice/request", async (req, res) => {
     res.json({
       status: "ok",
       message: "Llamada segura solicitada",
-      voice_session: voiceSession
+      voice_session: voiceSessionForParticipant(voiceSession, 'party_b')
     });
   } catch (error) {
     console.error("[OPERATOR VOICE REQUEST ERROR]", error);
@@ -6633,6 +6679,68 @@ app.get("/tickets/:id/voice/sessions", async (req, res) => {
   } catch (error) {
     console.error("[GET VOICE SESSIONS ERROR]", error);
     res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para atender llamada segura")) return;
+
+    const { id, sessionId } = req.params;
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: true });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Credenciales de llamada segura entregadas",
+      voice_session: voiceSessionForParticipant(session, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE JOIN ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible atender la llamada segura"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/join", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id } = req.body || {};
+
+    if (!resolver_user_id) {
+      return res.status(400).json({ status: "error", message: "resolver_user_id is required" });
+    }
+
+    const ticket = await fetchTicketVoiceContext(ticketId);
+    if (!ticket) {
+      return res.status(404).json({ status: "error", message: "Ticket not found" });
+    }
+
+    if (String(ticket.assigned_resolver_id || "") !== String(resolver_user_id)) {
+      return res.status(403).json({ status: "error", message: "El ticket no está asignado a este resolutor" });
+    }
+
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: true });
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Credenciales de llamada segura entregadas",
+      voice_session: voiceSessionForParticipant(session, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE JOIN ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible atender la llamada segura"
+    });
   }
 });
 
