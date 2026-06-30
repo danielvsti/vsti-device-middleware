@@ -3322,7 +3322,7 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
       ticket.id,
       ticket.source_type === 'MOBILE_APP' ? ticket.source_event_id : null,
       requestedBy,
-      targetType,
+      normalizedTargetType,
       ticket.citizen_user_id || ticket.citizen_id || null,
       resolverUserId || ticket.assigned_resolver_id || ticket.resolver_id || null,
       requestedBy === 'OPERATOR' ? actorUserId : null,
@@ -3386,7 +3386,7 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
         JSON.stringify({
           channel: 'voice',
           provider: 'wa_center',
-          target_type: targetType,
+          target_type: normalizedTargetType,
           requested_by: requestedBy,
           voice_session_id: localSession.id,
           wa_center_session_id: waResponse.session_id || null,
@@ -3429,7 +3429,7 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
         JSON.stringify({
           channel: 'voice',
           provider: 'wa_center',
-          target_type: targetType,
+          target_type: normalizedTargetType,
           requested_by: requestedBy,
           voice_session_id: localSession.id,
           error: error.message,
@@ -6603,7 +6603,7 @@ app.post("/tickets/:id/call-response", async (req, res) => {
 app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
   try {
     const { eventId } = req.params;
-    const { user_id = null, target_type = "CENTRAL" } = req.body || {};
+    const { user_id = null, target_type = null } = req.body || {};
 
     const eventResult = await pool.query(
       `
@@ -6642,7 +6642,9 @@ app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
       req,
       ticket,
       requestedBy: "NEIGHBOR",
-      targetType: String(target_type || "CENTRAL").toUpperCase() === "RESOLVER" ? "RESOLVER" : "CENTRAL",
+      targetType: target_type
+        ? (String(target_type).toUpperCase() === "RESOLVER" ? "RESOLVER" : "CENTRAL")
+        : (ticket?.assigned_resolver_id ? "RESOLVER" : "CENTRAL"),
       actorUserId: ticket?.citizen_user_id || null,
       resolverUserId: ticket?.assigned_resolver_id || null
     });
@@ -8867,6 +8869,8 @@ app.get("/dashboard/map-state", async (req, res) => {
 
     const controlCenter = ccResult.rows[0];
 
+    await ensureVoiceSchema();
+
     const ticketsResult = await pool.query(
       `
       SELECT
@@ -8893,6 +8897,12 @@ app.get("/dashboard/map-state", async (req, res) => {
         u.full_name AS citizen_name,
         u.phone AS citizen_phone,
         r.full_name AS resolver_name,
+        latest_voice.id AS voice_session_id,
+        latest_voice.wa_center_session_id AS wa_center_session_id,
+        latest_voice.status AS voice_status,
+        latest_voice.requested_by AS voice_requested_by,
+        latest_voice.target_type AS voice_target_type,
+        latest_voice.created_at AS voice_created_at,
         latest_assignment.state AS latest_assignment_state,
         latest_assignment.resolver_user_id AS latest_assignment_resolver_user_id,
         latest_assignment.rejected_at AS latest_assignment_rejected_at,
@@ -8911,6 +8921,20 @@ app.get("/dashboard/map-state", async (req, res) => {
         ORDER BY ta.created_at DESC
         LIMIT 1
       ) latest_assignment ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          tvs.id,
+          tvs.wa_center_session_id,
+          tvs.status,
+          tvs.requested_by,
+          tvs.target_type,
+          tvs.created_at
+        FROM ticket_voice_sessions tvs
+        WHERE tvs.ticket_id = t.id
+          AND tvs.status NOT IN ('FAILED','ENDED','EXPIRED','NO_ANSWER')
+        ORDER BY tvs.created_at DESC
+        LIMIT 1
+      ) latest_voice ON true
       WHERE t.control_center_id = $1
         AND t.state NOT IN ('CLOSED', 'CANCELLED')
       ORDER BY t.created_at DESC
@@ -9593,6 +9617,8 @@ app.get("/resolver/:user_id/state", async (req, res) => {
 
     const resolver = userResult.rows[0];
 
+    await ensureVoiceSchema();
+
     if (resolver.role !== "RESOLVER") {
       return res.status(403).json({
         status: "error",
@@ -9657,7 +9683,13 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         resolver_user.full_name AS resolver_name,
         latest_assignment.state AS assignment_state,
         latest_assignment.assignment_type,
-        latest_assignment.distance_meters
+        latest_assignment.distance_meters,
+        latest_voice.id AS voice_session_id,
+        latest_voice.wa_center_session_id AS wa_center_session_id,
+        latest_voice.status AS voice_status,
+        latest_voice.requested_by AS voice_requested_by,
+        latest_voice.target_type AS voice_target_type,
+        latest_voice.created_at AS voice_created_at
       FROM tickets t
       LEFT JOIN users citizen
         ON citizen.id = t.citizen_user_id
@@ -9675,6 +9707,22 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         ORDER BY ta.created_at DESC
         LIMIT 1
       ) latest_assignment ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          tvs.id,
+          tvs.wa_center_session_id,
+          tvs.status,
+          tvs.requested_by,
+          tvs.target_type,
+          tvs.created_at
+        FROM ticket_voice_sessions tvs
+        WHERE tvs.ticket_id = t.id
+          AND tvs.resolver_user_id = $1
+          AND tvs.target_type = 'RESOLVER'
+          AND tvs.status NOT IN ('FAILED','ENDED','EXPIRED','NO_ANSWER')
+        ORDER BY tvs.created_at DESC
+        LIMIT 1
+      ) latest_voice ON true
       WHERE t.control_center_id = $2
         AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
         AND (
