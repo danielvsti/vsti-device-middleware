@@ -1123,6 +1123,216 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+
+/*
+   =========================================================
+   INCIDENT AGGREGATION / MULTI-REPORT CASES
+   =========================================================
+
+   Un incidente operativo puede recibir muchos reportes de vecinos.
+   El primer reporte crea el ticket; los siguientes, si son cercanos,
+   recientes y compatibles, se asocian al ticket existente como
+   testimonios/antecedentes sin saturar a la central con tickets duplicados.
+*/
+
+let incidentAggregationSchemaReady = false;
+const INCIDENT_DEDUP_RADIUS_METERS = Number(process.env.INCIDENT_DEDUP_RADIUS_METERS || 120);
+const INCIDENT_DEDUP_WINDOW_MINUTES = Number(process.env.INCIDENT_DEDUP_WINDOW_MINUTES || 30);
+
+async function ensureIncidentAggregationSchema() {
+  if (incidentAggregationSchemaReady) return;
+
+  await pool.query(`
+    ALTER TABLE mobile_events
+      ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_reports (
+      id UUID PRIMARY KEY,
+      ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+      mobile_event_id TEXT REFERENCES mobile_events(id) ON DELETE SET NULL,
+      reporter_user_id TEXT,
+      reporter_name TEXT,
+      reporter_phone TEXT,
+      latitude DOUBLE PRECISION,
+      longitude DOUBLE PRECISION,
+      accuracy DOUBLE PRECISION,
+      alert_type TEXT,
+      title TEXT,
+      description TEXT,
+      source TEXT,
+      confidence_score NUMERIC,
+      match_score NUMERIC,
+      distance_meters NUMERIC,
+      is_primary_report BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_ticket_reports_ticket_created
+    ON ticket_reports(ticket_id, created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_ticket_reports_mobile_event
+    ON ticket_reports(mobile_event_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_mobile_events_linked_ticket
+    ON mobile_events(linked_ticket_id)
+  `);
+
+  incidentAggregationSchemaReady = true;
+}
+
+function incidentGroup(alertType) {
+  const type = String(alertType || 'SOS_MANUAL').toUpperCase();
+  if (['FIRE', 'INCENDIO'].includes(type)) return 'FIRE';
+  if (type === 'VIF' || type === 'VIF_SILENT_SHAKE' || type.includes('VIOLENCIA')) return 'VIF';
+  if (['SECURITY', 'SEGURIDAD', 'ROBBERY', 'THEFT'].includes(type)) return 'SECURITY';
+  if (['MEDICAL', 'MEDICA', 'MÉDICA', 'FALL_DETECTED', 'TRAFFIC_ACCIDENT', 'ACCIDENT', 'URBAN_RISK', 'SOS_MANUAL', 'OTHER'].includes(type)) {
+    return 'PUBLIC_INCIDENT';
+  }
+  return 'PUBLIC_INCIDENT';
+}
+
+function incidentTypesCompatible(a, b) {
+  const groupA = incidentGroup(a);
+  const groupB = incidentGroup(b);
+  if (groupA === groupB) return true;
+  const typeA = String(a || '').toUpperCase();
+  const typeB = String(b || '').toUpperCase();
+  return (typeA === 'SOS_MANUAL' && groupB === 'PUBLIC_INCIDENT') ||
+         (typeB === 'SOS_MANUAL' && groupA === 'PUBLIC_INCIDENT');
+}
+
+function scoreIncidentMatch(distance, ageMinutes, categoryCompatible) {
+  if (!categoryCompatible || distance == null) return 0;
+  const distanceScore = Math.max(0, 1 - (distance / INCIDENT_DEDUP_RADIUS_METERS));
+  const timeScore = Math.max(0, 1 - (ageMinutes / INCIDENT_DEDUP_WINDOW_MINUTES));
+  return Math.round((0.65 * distanceScore + 0.35 * timeScore) * 100) / 100;
+}
+
+async function findNearbyActiveIncident({ controlCenterId, latitude, longitude, alertType }) {
+  await ensureIncidentAggregationSchema();
+
+  const result = await pool.query(
+    `
+    SELECT
+      t.*,
+      citizen.full_name AS citizen_name,
+      resolver.full_name AS resolver_name,
+      COALESCE(report_stats.report_count, 0)::int AS report_count
+    FROM tickets t
+    LEFT JOIN users citizen ON citizen.id = t.citizen_user_id
+    LEFT JOIN users resolver ON resolver.id = t.assigned_resolver_id
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*)::int AS report_count
+      FROM ticket_reports tr
+      WHERE tr.ticket_id = t.id
+    ) report_stats ON true
+    WHERE t.control_center_id = $1
+      AND t.state NOT IN ('RESOLVED','CLOSED','CANCELLED')
+      AND t.latitude IS NOT NULL
+      AND t.longitude IS NOT NULL
+      AND t.created_at >= NOW() - ($2::int * INTERVAL '1 minute')
+    ORDER BY t.created_at DESC
+    LIMIT 50
+    `,
+    [controlCenterId, Math.max(1, Math.round(INCIDENT_DEDUP_WINDOW_MINUTES))]
+  );
+
+  const candidates = result.rows
+    .map((ticket) => {
+      const distance = distanceMeters(Number(latitude), Number(longitude), Number(ticket.latitude), Number(ticket.longitude));
+      const ageMinutes = Math.max(0, (Date.now() - new Date(ticket.created_at).getTime()) / 60000);
+      const compatible = incidentTypesCompatible(alertType, ticket.alert_type);
+      const score = scoreIncidentMatch(distance, ageMinutes, compatible);
+      return { ticket, distance_meters: distance, age_minutes: ageMinutes, compatible, score };
+    })
+    .filter((item) => item.compatible && item.distance_meters <= INCIDENT_DEDUP_RADIUS_METERS)
+    .sort((a, b) => b.score - a.score || a.distance_meters - b.distance_meters);
+
+  return candidates[0] || null;
+}
+
+async function insertTicketReport({ ticket, event, citizen, normalizedAlert, source, confidence, isPrimaryReport, match = null }) {
+  await ensureIncidentAggregationSchema();
+  const reportId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+  const confidenceValue = confidence == null || confidence === '' ? null : Number(confidence);
+
+  const result = await pool.query(
+    `
+    INSERT INTO ticket_reports (
+      id,
+      ticket_id,
+      mobile_event_id,
+      reporter_user_id,
+      reporter_name,
+      reporter_phone,
+      latitude,
+      longitude,
+      accuracy,
+      alert_type,
+      title,
+      description,
+      source,
+      confidence_score,
+      match_score,
+      distance_meters,
+      is_primary_report
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+    RETURNING *
+    `,
+    [
+      reportId,
+      ticket.id,
+      event.id,
+      citizen?.id || event.user_id || null,
+      citizen?.full_name || event.name || null,
+      citizen?.phone || event.phone || null,
+      event.latitude,
+      event.longitude,
+      event.accuracy,
+      normalizedAlert.alert_type,
+      normalizedAlert.title,
+      normalizedAlert.description,
+      source || null,
+      Number.isFinite(confidenceValue) ? confidenceValue : null,
+      match?.score ?? null,
+      match?.distance_meters == null ? null : Math.round(match.distance_meters),
+      isPrimaryReport === true
+    ]
+  );
+
+  await pool.query(
+    `
+    UPDATE mobile_events
+    SET linked_ticket_id = $2,
+        acknowledged = true,
+        acknowledged_at = COALESCE(acknowledged_at, NOW()),
+        updated_at = NOW()
+    WHERE id = $1
+    `,
+    [event.id, ticket.id]
+  );
+
+  return result.rows[0];
+}
+
+async function ticketReportCount(ticketId) {
+  await ensureIncidentAggregationSchema();
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS report_count FROM ticket_reports WHERE ticket_id = $1`,
+    [ticketId]
+  );
+  return Number(result.rows[0]?.report_count || 0);
+}
+
 async function autoAssignResolver(ticket, options = {}) {
   const force = options.force === true;
   const excludeResolverUserIds = new Set(
@@ -3625,6 +3835,7 @@ app.post("/public/mobile/sos", async (req, res) => {
     }
 
     await ensureGeofenceSchema();
+    await ensureIncidentAggregationSchema();
     const jurisdiction = evaluateJurisdiction(citizen, Number(latitude), Number(longitude));
 
     if (!jurisdiction.valid) {
@@ -3749,6 +3960,82 @@ app.post("/public/mobile/sos", async (req, res) => {
       source
     });
 
+    const existingIncident = await findNearbyActiveIncident({
+      controlCenterId,
+      latitude: event.latitude,
+      longitude: event.longitude,
+      alertType: normalizedAlert.alert_type
+    });
+
+    if (existingIncident?.ticket) {
+      const linkedTicket = existingIncident.ticket;
+      const report = await insertTicketReport({
+        ticket: linkedTicket,
+        event,
+        citizen,
+        normalizedAlert,
+        source,
+        confidence: normalizedAlert.confidence,
+        isPrimaryReport: false,
+        match: existingIncident
+      });
+
+      await pool.query(
+        `
+        INSERT INTO ticket_actions (
+          ticket_id,
+          actor_user_id,
+          actor_role,
+          action_type,
+          description,
+          metadata
+        )
+        VALUES ($1,$2,'NEIGHBOR','REPORT_ATTACHED',$3,$4)
+        `,
+        [
+          linkedTicket.id,
+          citizenUserId,
+          `${citizen.full_name || name || 'Vecino'} sumó información a un incidente ya reportado`,
+          JSON.stringify({
+            mobile_event_id: event.id,
+            ticket_report_id: report.id,
+            report_count: Number(linkedTicket.report_count || 0) + 1,
+            dedup_distance_meters: Math.round(existingIncident.distance_meters),
+            dedup_score: existingIncident.score,
+            alert_type: normalizedAlert.alert_type,
+            title: normalizedAlert.title,
+            description: normalizedAlert.description,
+            source,
+            aggregation: 'NEARBY_ACTIVE_INCIDENT'
+          })
+        ]
+      );
+
+      await pool.query(`UPDATE tickets SET updated_at = NOW() WHERE id = $1`, [linkedTicket.id]);
+      const reportCount = await ticketReportCount(linkedTicket.id);
+
+      console.log("[MOBILE SOS DB DUPLICATE-LINKED]", { event_id: event.id, ticket_id: linkedTicket.id, report_count: reportCount });
+
+      return res.json({
+        status: "ok",
+        message: "Este incidente ya estaba reportado. Sumamos tu información al caso activo.",
+        event_id: event.id,
+        state: event.state,
+        received_at: event.created_at,
+        ticket_id: linkedTicket.id,
+        incident_linked: true,
+        duplicate_of_ticket_id: linkedTicket.id,
+        report_count: reportCount,
+        match: {
+          distance_meters: Math.round(existingIncident.distance_meters),
+          score: existingIncident.score,
+          window_minutes: INCIDENT_DEDUP_WINDOW_MINUTES,
+          radius_meters: INCIDENT_DEDUP_RADIUS_METERS
+        },
+        user: publicUserPayload(citizen)
+      });
+    }
+
     const ticket = await createTicket({
       control_center_id: controlCenterId,
       citizen_user_id: citizenUserId,
@@ -3777,7 +4064,8 @@ app.post("/public/mobile/sos", async (req, res) => {
         anonymous_user_id: user_id,
         jurisdiction_status: jurisdiction.status,
         jurisdiction_reason: jurisdiction.reason,
-        jurisdiction_distance_meters: jurisdiction.distance_meters ?? null
+        jurisdiction_distance_meters: jurisdiction.distance_meters ?? null,
+        aggregation: 'PRIMARY_INCIDENT'
       }
     });
 
@@ -3791,6 +4079,17 @@ app.post("/public/mobile/sos", async (req, res) => {
       [ticket.id, jurisdiction.status, jurisdiction.reason]
     );
 
+    await insertTicketReport({
+      ticket,
+      event,
+      citizen,
+      normalizedAlert,
+      source,
+      confidence: normalizedAlert.confidence,
+      isPrimaryReport: true,
+      match: null
+    });
+
     console.log("[MOBILE SOS DB]", event);
 
     res.json({
@@ -3800,6 +4099,8 @@ app.post("/public/mobile/sos", async (req, res) => {
       state: event.state,
       received_at: event.created_at,
       ticket_id: ticket ? ticket.id : null,
+      incident_linked: false,
+      report_count: 1,
       user: publicUserPayload(citizen)
     });
 
@@ -4153,8 +4454,15 @@ function buildNeighborProgress(event) {
     });
   }
 
-  let headline = "La central ya recibió tu emergencia.";
-  let detail = "Puedes agregar información mientras se gestiona el caso.";
+  const reportCount = Number(event.report_count || 0);
+  const isPrimaryReport = event.is_primary_report === true || String(event.is_primary_report).toLowerCase() === 'true';
+
+  let headline = reportCount > 1 && !isPrimaryReport
+    ? "Tu reporte fue sumado a un caso activo."
+    : "La central ya recibió tu emergencia.";
+  let detail = reportCount > 1
+    ? `Este incidente acumula ${reportCount} reportes ciudadanos. Puedes agregar información mientras se gestiona el caso.`
+    : "Puedes agregar información mientras se gestiona el caso.";
 
   if (state === "ASSIGNED") {
     headline = "Resolutor asignado.";
@@ -4188,6 +4496,8 @@ function buildNeighborProgress(event) {
   return {
     ticket_id: event.ticket_id || null,
     ticket_state: state,
+    report_count: reportCount,
+    is_primary_report: isPrimaryReport,
     headline,
     detail,
     resolver: event.assigned_resolver_id
@@ -4203,6 +4513,7 @@ function buildNeighborProgress(event) {
 
 app.get("/public/mobile/status/:event_id", async (req, res) => {
   try {
+    await ensureIncidentAggregationSchema();
     const { event_id } = req.params;
 
     const result = await pool.query(
@@ -4221,11 +4532,27 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
         t.closed_at AS ticket_closed_at,
         t.assigned_resolver_id,
         r.full_name AS resolver_name,
-        r.phone AS resolver_phone
+        r.phone AS resolver_phone,
+        COALESCE(report_stats.report_count, 0)::int AS report_count,
+        report_self.id AS self_report_id,
+        COALESCE(report_self.is_primary_report, false) AS is_primary_report
       FROM mobile_events m
       LEFT JOIN tickets t
-        ON t.source_type = 'MOBILE_APP'
-       AND t.source_event_id = m.id
+        ON (t.source_type = 'MOBILE_APP' AND t.source_event_id = m.id)
+        OR t.id = m.linked_ticket_id
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS report_count
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+      ) report_stats ON true
+      LEFT JOIN LATERAL (
+        SELECT tr.id, tr.is_primary_report
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+          AND tr.mobile_event_id = m.id
+        ORDER BY tr.created_at DESC
+        LIMIT 1
+      ) report_self ON true
       LEFT JOIN users r
         ON r.id = t.assigned_resolver_id
       WHERE m.id = $1
@@ -4317,6 +4644,7 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
 
 app.get("/public/mobile/active", async (req, res) => {
   try {
+    await ensureIncidentAggregationSchema();
     const { user_id } = req.query;
 
     if (!user_id) {
@@ -4342,11 +4670,27 @@ app.get("/public/mobile/active", async (req, res) => {
         t.closed_at AS ticket_closed_at,
         t.assigned_resolver_id,
         r.full_name AS resolver_name,
-        r.phone AS resolver_phone
+        r.phone AS resolver_phone,
+        COALESCE(report_stats.report_count, 0)::int AS report_count,
+        report_self.id AS self_report_id,
+        COALESCE(report_self.is_primary_report, false) AS is_primary_report
       FROM mobile_events m
       LEFT JOIN tickets t
-        ON t.source_type = 'MOBILE_APP'
-       AND t.source_event_id = m.id
+        ON (t.source_type = 'MOBILE_APP' AND t.source_event_id = m.id)
+        OR t.id = m.linked_ticket_id
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS report_count
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+      ) report_stats ON true
+      LEFT JOIN LATERAL (
+        SELECT tr.id, tr.is_primary_report
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+          AND tr.mobile_event_id = m.id
+        ORDER BY tr.created_at DESC
+        LIMIT 1
+      ) report_self ON true
       LEFT JOIN users r
         ON r.id = t.assigned_resolver_id
       WHERE m.user_id = $1
@@ -8937,6 +9281,7 @@ app.get("/dashboard/map-state", async (req, res) => {
     const controlCenter = ccResult.rows[0];
 
     await ensureVoiceSchema();
+    await ensureIncidentAggregationSchema();
 
     const ticketsResult = await pool.query(
       `
@@ -8970,6 +9315,8 @@ app.get("/dashboard/map-state", async (req, res) => {
         latest_voice.requested_by AS voice_requested_by,
         latest_voice.target_type AS voice_target_type,
         latest_voice.created_at AS voice_created_at,
+        COALESCE(report_stats.report_count, 0)::int AS report_count,
+        latest_report.latest_report_at AS latest_report_at,
         latest_assignment.state AS latest_assignment_state,
         latest_assignment.resolver_user_id AS latest_assignment_resolver_user_id,
         latest_assignment.rejected_at AS latest_assignment_rejected_at,
@@ -8988,6 +9335,16 @@ app.get("/dashboard/map-state", async (req, res) => {
         ORDER BY ta.created_at DESC
         LIMIT 1
       ) latest_assignment ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS report_count
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+      ) report_stats ON true
+      LEFT JOIN LATERAL (
+        SELECT MAX(tr.created_at) AS latest_report_at
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+      ) latest_report ON true
       LEFT JOIN LATERAL (
         SELECT
           tvs.id,
@@ -9170,6 +9527,7 @@ const sirensForDashboard = sirensResult.rows.map((siren) => {
 
 app.get("/tickets/:id", async (req, res) => {
   try {
+    await ensureIncidentAggregationSchema();
     const { id } = req.params;
 
     const ticketResult = await pool.query(
@@ -9194,7 +9552,8 @@ app.get("/tickets/:id", async (req, res) => {
         latest_assignment.state AS latest_assignment_state,
         latest_assignment.resolver_user_id AS latest_assignment_resolver_user_id,
         latest_assignment.rejected_at AS latest_assignment_rejected_at,
-        latest_assignment.assignment_type AS latest_assignment_type
+        latest_assignment.assignment_type AS latest_assignment_type,
+        COALESCE(report_stats.report_count, 0)::int AS report_count
 
       FROM tickets t
 
@@ -9206,6 +9565,12 @@ app.get("/tickets/:id", async (req, res) => {
 
       LEFT JOIN users resolver
         ON resolver.id = t.assigned_resolver_id
+
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS report_count
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+      ) report_stats ON true
 
       LEFT JOIN LATERAL (
         SELECT
@@ -9285,6 +9650,30 @@ app.get("/tickets/:id", async (req, res) => {
       [id]
     );
 
+    const reportsResult = await pool.query(
+      `
+      SELECT
+        tr.id,
+        tr.mobile_event_id,
+        tr.reporter_name,
+        tr.reporter_phone,
+        tr.latitude,
+        tr.longitude,
+        tr.accuracy,
+        tr.alert_type,
+        tr.title,
+        tr.description,
+        tr.distance_meters,
+        tr.match_score,
+        tr.is_primary_report,
+        tr.created_at
+      FROM ticket_reports tr
+      WHERE tr.ticket_id = $1
+      ORDER BY tr.created_at ASC
+      `,
+      [id]
+    );
+
     const voiceSessions = await getVoiceSessionsForTicket(id, { includeCredentials: false, limit: 20 });
 
     res.json({
@@ -9293,6 +9682,7 @@ app.get("/tickets/:id", async (req, res) => {
       emergency_contacts: contactsResult.rows,
       actions: actionsResult.rows,
       notes: notesResult.rows,
+      reports: reportsResult.rows,
       voice_sessions: voiceSessions
     });
 
@@ -9698,6 +10088,8 @@ app.get("/resolver/:user_id/state", async (req, res) => {
       message: error.message
     }));
 
+    await ensureIncidentAggregationSchema();
+
     const locationResult = await pool.query(
       `
       SELECT *
@@ -9756,12 +10148,18 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         latest_voice.status AS voice_status,
         latest_voice.requested_by AS voice_requested_by,
         latest_voice.target_type AS voice_target_type,
-        latest_voice.created_at AS voice_created_at
+        latest_voice.created_at AS voice_created_at,
+        COALESCE(report_stats.report_count, 0)::int AS report_count
       FROM tickets t
       LEFT JOIN users citizen
         ON citizen.id = t.citizen_user_id
       LEFT JOIN users resolver_user
         ON resolver_user.id = t.assigned_resolver_id
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS report_count
+        FROM ticket_reports tr
+        WHERE tr.ticket_id = t.id
+      ) report_stats ON true
       LEFT JOIN LATERAL (
         SELECT
           ta.state,
