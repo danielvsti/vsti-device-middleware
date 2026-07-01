@@ -3388,7 +3388,10 @@ last_event_type: d.last_event_type || null
       ? await loadSirensForControlCenter(settingsRow.control_center_id, platformSettings)
       : publicSirens;
 
-		const sirensForMap = configuredSirens.map((s) => {
+    const sirensEnabledForMap = platformSettings.features?.sirens_enabled !== false;
+    const sirensSourceForMap = sirensEnabledForMap ? configuredSirens : [];
+
+		const sirensForMap = sirensSourceForMap.map((s) => {
 				const state = sirenStates[s.id] || {
 state: s.state || "OFF",
 relay: s.relay === true,
@@ -4573,6 +4576,7 @@ app.post("/public/mobile/cancel", async (req, res) => {
       SELECT
         m.*,
         t.id AS ticket_id,
+        t.control_center_id AS ticket_control_center_id,
         t.state AS ticket_state,
         t.title AS ticket_title,
         t.alert_type AS ticket_alert_type,
@@ -5061,6 +5065,10 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
     const voiceSessions = event.ticket_id
       ? await getVoiceSessionsForTicket(event.ticket_id, { includeCredentials: false, limit: 5 })
       : [];
+    const statusSettingsRow = event.ticket_control_center_id
+      ? await getControlCenterSettingsById(event.ticket_control_center_id).catch(() => null)
+      : null;
+    const statusPlatformSettings = statusSettingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
     res.json({
       status: "ok",
@@ -5070,7 +5078,8 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
       neighbor_progress: neighborProgress,
       neighbor_activity: neighborActivity,
       voice_sessions: voiceSessions,
-      pending_call_request: pendingCallRequest
+      pending_call_request: pendingCallRequest,
+      platform_settings: publicSettingsPayload(statusPlatformSettings)
     });
 
   } catch (error) {
@@ -10515,6 +10524,8 @@ app.get("/resolver/:user_id/state", async (req, res) => {
     }
 
     const resolver = userResult.rows[0];
+    const resolverSettingsRow = await getControlCenterSettingsById(resolver.control_center_id).catch(() => null);
+    const resolverPlatformSettings = resolverSettingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
     await ensureVoiceSchema();
 
@@ -10655,6 +10666,7 @@ app.get("/resolver/:user_id/state", async (req, res) => {
       resolver,
       location: locationResult.rows[0] || null,
       reconciliation,
+      platform_settings: publicSettingsPayload(resolverPlatformSettings),
       tickets: ticketsResult.rows,
       counts: {
         tickets: ticketsResult.rows.length,
