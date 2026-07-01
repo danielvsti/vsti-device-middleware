@@ -150,6 +150,343 @@ function getRemoteIp(req) {
 
 /*
    =========================================================
+   CONTROL CENTER PLATFORM SETTINGS
+   =========================================================
+
+   Configuración multi-municipal por centro de control. Evita dejar
+   políticas de operación hardcodeadas por ambiente y permite que cada
+   municipalidad habilite/deshabilite funcionalidades propias.
+*/
+
+let controlCenterSettingsSchemaReady = false;
+
+const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
+  features: {
+    mobile_app_enabled: true,
+    resolver_app_enabled: true,
+    physical_sos_buttons_enabled: true,
+    sirens_enabled: true,
+    secure_voice_enabled: true,
+    multi_report_incidents_enabled: true,
+    resolver_auto_assignment_enabled: true
+  },
+  siren_policy: {
+    activation_mode: 'MANUAL_ONLY',
+    auto_activate_on_ticket: false,
+    auto_categories: ['FIRE', 'SECURITY'],
+    default_duration_seconds: 60,
+    max_duration_seconds: 180,
+    cooldown_seconds: 120,
+    operator_manual_control_enabled: true
+  },
+  voice_policy: {
+    recording_enabled: WA_CENTER_VOICE_RECORDING,
+    supervision_enabled: WA_CENTER_VOICE_SUPERVISION,
+    max_call_minutes: 30,
+    expires_minutes: Math.max(1, Math.round(Number(process.env.WA_CENTER_VOICE_EXPIRES_SECONDS || 900) / 60))
+  },
+  notification_policy: {
+    nearby_neighbor_notifications_enabled: false,
+    radius_meters: 300,
+    categories: ['FIRE', 'TRAFFIC_ACCIDENT', 'URBAN_RISK'],
+    channels: ['PUSH'],
+    privacy_mode: 'SAFE_AREA_ONLY'
+  },
+  incident_policy: {
+    dedup_enabled: true,
+    dedup_radius_meters: 120,
+    dedup_window_minutes: 120
+  },
+  resolver_policy: {
+    auto_assignment_enabled: true,
+    max_location_age_seconds: 180,
+    max_active_tickets: 1
+  }
+});
+
+function isPlainObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function deepMergeSettings(base, override) {
+  const output = Array.isArray(base) ? [...base] : { ...(base || {}) };
+  if (!isPlainObject(override)) return output;
+
+  for (const [key, value] of Object.entries(override)) {
+    if (isPlainObject(value) && isPlainObject(output[key])) {
+      output[key] = deepMergeSettings(output[key], value);
+    } else if (Array.isArray(value)) {
+      output[key] = value.map(item => item);
+    } else if (value !== undefined) {
+      output[key] = value;
+    }
+  }
+
+  return output;
+}
+
+function normalizePolicyBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  if (value === 1 || value === '1') return true;
+  if (value === 0 || value === '0') return false;
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase();
+    if (['true','yes','si','sí','on'].includes(lower)) return true;
+    if (['false','no','off'].includes(lower)) return false;
+  }
+  return fallback;
+}
+
+function clampPolicyNumber(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function normalizeControlCenterSettings(input = {}) {
+  const merged = deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS, input || {});
+
+  merged.features = merged.features || {};
+  for (const key of Object.keys(DEFAULT_CONTROL_CENTER_SETTINGS.features)) {
+    merged.features[key] = normalizePolicyBoolean(
+      merged.features[key],
+      DEFAULT_CONTROL_CENTER_SETTINGS.features[key]
+    );
+  }
+
+  merged.siren_policy = merged.siren_policy || {};
+  const validSirenModes = ['MANUAL_ONLY', 'AUTO_BY_CATEGORY', 'AUTO_ALL'];
+  merged.siren_policy.activation_mode = validSirenModes.includes(String(merged.siren_policy.activation_mode || '').toUpperCase())
+    ? String(merged.siren_policy.activation_mode).toUpperCase()
+    : DEFAULT_CONTROL_CENTER_SETTINGS.siren_policy.activation_mode;
+  merged.siren_policy.auto_activate_on_ticket = normalizePolicyBoolean(merged.siren_policy.auto_activate_on_ticket, false);
+  merged.siren_policy.operator_manual_control_enabled = normalizePolicyBoolean(merged.siren_policy.operator_manual_control_enabled, true);
+  merged.siren_policy.default_duration_seconds = clampPolicyNumber(merged.siren_policy.default_duration_seconds, 60, 5, 600);
+  merged.siren_policy.max_duration_seconds = clampPolicyNumber(merged.siren_policy.max_duration_seconds, 180, 10, 900);
+  merged.siren_policy.cooldown_seconds = clampPolicyNumber(merged.siren_policy.cooldown_seconds, 120, 0, 3600);
+  if (!Array.isArray(merged.siren_policy.auto_categories)) merged.siren_policy.auto_categories = [];
+
+  merged.voice_policy = merged.voice_policy || {};
+  merged.voice_policy.recording_enabled = normalizePolicyBoolean(merged.voice_policy.recording_enabled, WA_CENTER_VOICE_RECORDING);
+  merged.voice_policy.supervision_enabled = normalizePolicyBoolean(merged.voice_policy.supervision_enabled, WA_CENTER_VOICE_SUPERVISION);
+  merged.voice_policy.max_call_minutes = clampPolicyNumber(merged.voice_policy.max_call_minutes, 30, 1, 240);
+  merged.voice_policy.expires_minutes = clampPolicyNumber(merged.voice_policy.expires_minutes, 15, 1, 240);
+
+  merged.notification_policy = merged.notification_policy || {};
+  merged.notification_policy.nearby_neighbor_notifications_enabled = normalizePolicyBoolean(merged.notification_policy.nearby_neighbor_notifications_enabled, false);
+  merged.notification_policy.radius_meters = clampPolicyNumber(merged.notification_policy.radius_meters, 300, 50, 5000);
+  if (!Array.isArray(merged.notification_policy.categories)) merged.notification_policy.categories = [];
+  if (!Array.isArray(merged.notification_policy.channels)) merged.notification_policy.channels = ['PUSH'];
+
+  merged.incident_policy = merged.incident_policy || {};
+  merged.incident_policy.dedup_enabled = normalizePolicyBoolean(merged.incident_policy.dedup_enabled, true);
+  merged.incident_policy.dedup_radius_meters = clampPolicyNumber(
+    merged.incident_policy.dedup_radius_meters,
+    Number(process.env.INCIDENT_DEDUP_RADIUS_METERS || 120),
+    10,
+    2000
+  );
+  merged.incident_policy.dedup_window_minutes = clampPolicyNumber(
+    merged.incident_policy.dedup_window_minutes,
+    Number(process.env.INCIDENT_DEDUP_WINDOW_MINUTES || 30),
+    1,
+    1440
+  );
+
+  merged.resolver_policy = merged.resolver_policy || {};
+  merged.resolver_policy.auto_assignment_enabled = normalizePolicyBoolean(merged.resolver_policy.auto_assignment_enabled, true);
+  merged.resolver_policy.max_location_age_seconds = clampPolicyNumber(merged.resolver_policy.max_location_age_seconds, 180, 30, 86400);
+  merged.resolver_policy.max_active_tickets = clampPolicyNumber(merged.resolver_policy.max_active_tickets, 1, 1, 20);
+
+  return merged;
+}
+
+async function ensureControlCenterSettingsSchema() {
+  if (controlCenterSettingsSchemaReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS control_center_settings (
+      control_center_id UUID PRIMARY KEY REFERENCES control_centers(id) ON DELETE CASCADE,
+      settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS control_center_settings_audit (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      control_center_id UUID REFERENCES control_centers(id) ON DELETE CASCADE,
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      old_settings JSONB,
+      new_settings JSONB,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE sirens
+      ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT true,
+      ADD COLUMN IF NOT EXISTS activation_mode TEXT DEFAULT 'MANUAL_ONLY',
+      ADD COLUMN IF NOT EXISTS default_duration_seconds INTEGER DEFAULT 60,
+      ADD COLUMN IF NOT EXISTS max_duration_seconds INTEGER DEFAULT 180,
+      ADD COLUMN IF NOT EXISTS cooldown_seconds INTEGER DEFAULT 120
+  `);
+
+  await pool.query(`
+    INSERT INTO control_center_settings (control_center_id, settings)
+    SELECT id, $1::jsonb
+    FROM control_centers cc
+    WHERE NOT EXISTS (
+      SELECT 1 FROM control_center_settings s WHERE s.control_center_id = cc.id
+    )
+  `, [JSON.stringify(DEFAULT_CONTROL_CENTER_SETTINGS)]);
+
+  controlCenterSettingsSchemaReady = true;
+}
+
+async function getControlCenterSettingsById(controlCenterId) {
+  await ensureControlCenterSettingsSchema();
+  const result = await pool.query(
+    `
+    SELECT
+      cc.id AS control_center_id,
+      cc.code AS control_center_code,
+      cc.name AS control_center_name,
+      COALESCE(s.settings, '{}'::jsonb) AS settings,
+      s.updated_at,
+      s.updated_by
+    FROM control_centers cc
+    LEFT JOIN control_center_settings s ON s.control_center_id = cc.id
+    WHERE cc.id = $1
+    LIMIT 1
+    `,
+    [controlCenterId]
+  );
+
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  return {
+    ...row,
+    settings: normalizeControlCenterSettings(row.settings || {})
+  };
+}
+
+async function getControlCenterSettingsByCode(controlCenterCode = 'CC-VINA') {
+  await ensureControlCenterSettingsSchema();
+  const result = await pool.query(
+    `
+    SELECT
+      cc.id AS control_center_id,
+      cc.code AS control_center_code,
+      cc.name AS control_center_name,
+      COALESCE(s.settings, '{}'::jsonb) AS settings,
+      s.updated_at,
+      s.updated_by
+    FROM control_centers cc
+    LEFT JOIN control_center_settings s ON s.control_center_id = cc.id
+    WHERE cc.code = $1
+    LIMIT 1
+    `,
+    [controlCenterCode]
+  );
+
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  return {
+    ...row,
+    settings: normalizeControlCenterSettings(row.settings || {})
+  };
+}
+
+function publicSettingsPayload(settings) {
+  const normalized = normalizeControlCenterSettings(settings || {});
+  return {
+    features: {
+      mobile_app_enabled: normalized.features.mobile_app_enabled,
+      resolver_app_enabled: normalized.features.resolver_app_enabled,
+      physical_sos_buttons_enabled: normalized.features.physical_sos_buttons_enabled,
+      sirens_enabled: normalized.features.sirens_enabled,
+      secure_voice_enabled: normalized.features.secure_voice_enabled,
+      multi_report_incidents_enabled: normalized.features.multi_report_incidents_enabled,
+      resolver_auto_assignment_enabled: normalized.features.resolver_auto_assignment_enabled
+    },
+    siren_policy: normalized.siren_policy,
+    voice_policy: {
+      recording_enabled: normalized.voice_policy.recording_enabled,
+      max_call_minutes: normalized.voice_policy.max_call_minutes,
+      expires_minutes: normalized.voice_policy.expires_minutes
+    },
+    notification_policy: normalized.notification_policy,
+    incident_policy: normalized.incident_policy,
+    resolver_policy: normalized.resolver_policy
+  };
+}
+
+function adminSettingsPayload(row) {
+  return {
+    status: 'ok',
+    control_center: {
+      id: row.control_center_id,
+      code: row.control_center_code,
+      name: row.control_center_name
+    },
+    settings: normalizeControlCenterSettings(row.settings || {}),
+    updated_at: row.updated_at || null,
+    updated_by: row.updated_by || null
+  };
+}
+
+async function loadSirensForControlCenter(controlCenterId, settings) {
+  await ensureControlCenterSettingsSchema();
+  const normalized = normalizeControlCenterSettings(settings || {});
+  if (!normalized.features.sirens_enabled) return [];
+
+  const result = await pool.query(
+    `
+    SELECT
+      id,
+      name,
+      latitude,
+      longitude,
+      location,
+      COALESCE(enabled, true) AS enabled,
+      COALESCE(activation_mode, 'MANUAL_ONLY') AS activation_mode,
+      COALESCE(default_duration_seconds, 60) AS default_duration_seconds,
+      COALESCE(max_duration_seconds, 180) AS max_duration_seconds,
+      COALESCE(cooldown_seconds, 120) AS cooldown_seconds,
+      state,
+      relay,
+      last_seen,
+      rssi,
+      firmware,
+      uptime,
+      remote_ip,
+      metadata,
+      updated_at
+    FROM sirens
+    WHERE control_center_id = $1
+      AND COALESCE(enabled, true) = true
+    ORDER BY name ASC
+    `,
+    [controlCenterId]
+  );
+
+  return result.rows || [];
+}
+
+async function findSirenByIdForPublicControlCenter(sirenId, controlCenterCode = 'CC-VINA') {
+  const settingsRow = await getControlCenterSettingsByCode(controlCenterCode);
+  if (!settingsRow) return { settingsRow: null, siren: null };
+  const sirens = await loadSirensForControlCenter(settingsRow.control_center_id, settingsRow.settings);
+  const siren = sirens.find(item => String(item.id) === String(sirenId));
+  return { settingsRow, siren };
+}
+
+
+/*
+   =========================================================
    PANEL ACCESS SESSIONS
    =========================================================
 
@@ -1139,6 +1476,11 @@ let incidentAggregationSchemaReady = false;
 const INCIDENT_DEDUP_RADIUS_METERS = Number(process.env.INCIDENT_DEDUP_RADIUS_METERS || 120);
 const INCIDENT_DEDUP_WINDOW_MINUTES = Number(process.env.INCIDENT_DEDUP_WINDOW_MINUTES || 30);
 
+function incidentPolicyFromSettings(settings) {
+  const normalized = normalizeControlCenterSettings(settings || {});
+  return normalized.incident_policy || DEFAULT_CONTROL_CENTER_SETTINGS.incident_policy;
+}
+
 async function ensureIncidentAggregationSchema() {
   if (incidentAggregationSchemaReady) return;
 
@@ -1209,15 +1551,22 @@ function incidentTypesCompatible(a, b) {
          (typeB === 'SOS_MANUAL' && groupA === 'PUBLIC_INCIDENT');
 }
 
-function scoreIncidentMatch(distance, ageMinutes, categoryCompatible) {
+function scoreIncidentMatch(distance, ageMinutes, categoryCompatible, policy = null) {
+  const p = incidentPolicyFromSettings({ incident_policy: policy || {} });
+  const radiusMeters = Number(policy?.dedup_radius_meters || INCIDENT_DEDUP_RADIUS_METERS);
+  const windowMinutes = Number(policy?.dedup_window_minutes || INCIDENT_DEDUP_WINDOW_MINUTES);
   if (!categoryCompatible || distance == null) return 0;
-  const distanceScore = Math.max(0, 1 - (distance / INCIDENT_DEDUP_RADIUS_METERS));
-  const timeScore = Math.max(0, 1 - (ageMinutes / INCIDENT_DEDUP_WINDOW_MINUTES));
+  const distanceScore = Math.max(0, 1 - (distance / radiusMeters));
+  const timeScore = Math.max(0, 1 - (ageMinutes / windowMinutes));
   return Math.round((0.65 * distanceScore + 0.35 * timeScore) * 100) / 100;
 }
 
-async function findNearbyActiveIncident({ controlCenterId, latitude, longitude, alertType }) {
+async function findNearbyActiveIncident({ controlCenterId, latitude, longitude, alertType, settings = null }) {
   await ensureIncidentAggregationSchema();
+  const incidentPolicy = incidentPolicyFromSettings(settings || {});
+  if (!incidentPolicy.dedup_enabled) return null;
+  const dedupWindowMinutes = Math.max(1, Math.round(Number(incidentPolicy.dedup_window_minutes || INCIDENT_DEDUP_WINDOW_MINUTES)));
+  const dedupRadiusMeters = Math.max(1, Math.round(Number(incidentPolicy.dedup_radius_meters || INCIDENT_DEDUP_RADIUS_METERS)));
 
   const result = await pool.query(
     `
@@ -1242,7 +1591,7 @@ async function findNearbyActiveIncident({ controlCenterId, latitude, longitude, 
     ORDER BY t.created_at DESC
     LIMIT 50
     `,
-    [controlCenterId, Math.max(1, Math.round(INCIDENT_DEDUP_WINDOW_MINUTES))]
+    [controlCenterId, dedupWindowMinutes]
   );
 
   const candidates = result.rows
@@ -1250,10 +1599,10 @@ async function findNearbyActiveIncident({ controlCenterId, latitude, longitude, 
       const distance = distanceMeters(Number(latitude), Number(longitude), Number(ticket.latitude), Number(ticket.longitude));
       const ageMinutes = Math.max(0, (Date.now() - new Date(ticket.created_at).getTime()) / 60000);
       const compatible = incidentTypesCompatible(alertType, ticket.alert_type);
-      const score = scoreIncidentMatch(distance, ageMinutes, compatible);
+      const score = scoreIncidentMatch(distance, ageMinutes, compatible, incidentPolicy);
       return { ticket, distance_meters: distance, age_minutes: ageMinutes, compatible, score };
     })
-    .filter((item) => item.compatible && item.distance_meters <= INCIDENT_DEDUP_RADIUS_METERS)
+    .filter((item) => item.compatible && item.distance_meters <= dedupRadiusMeters)
     .sort((a, b) => b.score - a.score || a.distance_meters - b.distance_meters);
 
   return candidates[0] || null;
@@ -1970,8 +2319,32 @@ async function createTicket({
       metadata
     ]
   );
-const assignment = await autoAssignResolver(ticket);
-  return assignment?.ticket || ticket;
+const ccSettings = await getControlCenterSettingsById(control_center_id).catch(() => null);
+  const settings = ccSettings?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+  if (settings.features?.resolver_auto_assignment_enabled !== false && settings.resolver_policy?.auto_assignment_enabled !== false) {
+    const assignment = await autoAssignResolver(ticket);
+    return assignment?.ticket || ticket;
+  }
+
+  await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,'SYSTEM','AUTO_ASSIGNMENT_SKIPPED',$2,$3)
+    `,
+    [
+      ticket.id,
+      'Autoasignación omitida por política del centro de control',
+      JSON.stringify({ policy: 'resolver_auto_assignment_enabled=false' })
+    ]
+  );
+
+  return ticket;
 }
 
 async function syncMobileEventStateFromTicket(ticketId, mobileState) {
@@ -2935,6 +3308,9 @@ const publicSirens = [
 
 app.get("/public/map-state", async (req, res) => {
 		const now = Date.now();
+    const controlCenterCode = req.query.control_center_code || 'CC-VINA';
+    const settingsRow = await getControlCenterSettingsByCode(controlCenterCode);
+    const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
 
 const mobileResult = await pool.query(`
@@ -2953,6 +3329,7 @@ const mobileResult = await pool.query(`
     acknowledged,
     acknowledged_at,
     cancelled,
+    linked_ticket_id,
     created_at,
     updated_at
   FROM mobile_events
@@ -3006,13 +3383,18 @@ last_event_type: d.last_event_type || null
 
 
 
-		const sirensForMap = publicSirens.map((s) => {
+
+    const configuredSirens = settingsRow
+      ? await loadSirensForControlCenter(settingsRow.control_center_id, platformSettings)
+      : publicSirens;
+
+		const sirensForMap = configuredSirens.map((s) => {
 				const state = sirenStates[s.id] || {
-state: "OFF",
-relay: false,
+state: s.state || "OFF",
+relay: s.relay === true,
 event_id: null,
 source: null,
-updated_at: null,
+updated_at: s.updated_at || null,
 expires_at: Date.now()
 };
 
@@ -3024,6 +3406,10 @@ name: s.name,
 latitude: s.latitude,
 longitude: s.longitude,
 location: s.location,
+enabled: s.enabled !== false,
+activation_mode: s.activation_mode || platformSettings.siren_policy.activation_mode,
+default_duration_seconds: s.default_duration_seconds || platformSettings.siren_policy.default_duration_seconds,
+max_duration_seconds: s.max_duration_seconds || platformSettings.siren_policy.max_duration_seconds,
 state: expired ? "OFF" : state.state,
 active: !expired && state.relay === true,
 event_id: expired ? null : state.event_id,
@@ -3032,18 +3418,21 @@ updated_at: state.updated_at || null
 };
 });
 
+
 res.json({
   status: "ok",
   updated_at: nowChile(),
   devices: devicesForMap,
   sirens: sirensForMap,
-  mobile_events: mobileEventsForMap
+  mobile_events: mobileEventsForMap,
+  platform_settings: publicSettingsPayload(platformSettings)
 });
 
 });
 
-app.post("/public/sirens/activate", (req, res) => {
-		const { siren_id, duration_seconds } = req.body;
+
+app.post("/public/sirens/activate", async (req, res) => {
+		const { siren_id, duration_seconds, control_center_code } = req.body;
 
 		if (!siren_id) {
 		return res.status(400).json({
@@ -3052,37 +3441,55 @@ message: "siren_id is required"
 });
 		}
 
-		const siren = publicSirens.find((s) => s.id === siren_id);
+    try {
+      const { settingsRow, siren } = await findSirenByIdForPublicControlCenter(siren_id, control_center_code || 'CC-VINA');
+      const settings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
-		if (!siren) {
-		return res.status(404).json({
-status: "error",
-message: "Unknown siren_id"
+      if (!settings.features.sirens_enabled) {
+        return res.status(403).json({ status: "error", message: "Las sirenas no están habilitadas para este centro de control" });
+      }
+
+      if (!settings.siren_policy.operator_manual_control_enabled) {
+        return res.status(403).json({ status: "error", message: "La activación manual de sirenas está deshabilitada por política" });
+      }
+
+      if (!siren) {
+        return res.status(404).json({ status: "error", message: "Unknown siren_id" });
+      }
+
+      const maxDuration = Number(siren.max_duration_seconds || settings.siren_policy.max_duration_seconds || 180);
+      const defaultDuration = Number(siren.default_duration_seconds || settings.siren_policy.default_duration_seconds || 60);
+      const duration = Math.min(maxDuration, Math.max(5, Number(duration_seconds || defaultDuration)));
+      const expiresAt = Date.now() + duration * 1000;
+
+      sirenStates[siren_id] = {
+        state: "ON",
+        relay: true,
+        event_id: `PUBLIC-MAP-${Date.now()}`,
+        source: "public-map",
+        updated_at: nowChile(),
+        expires_at: expiresAt
+      };
+
+      await pool.query(
+        `UPDATE sirens SET state='ON', relay=true, updated_at=NOW() WHERE id=$1`,
+        [siren_id]
+      );
+
+      res.json({
+        status: "ok",
+        message: "Siren activated",
+        siren_id,
+        duration_seconds: duration
+      });
+    } catch (error) {
+      console.error("[PUBLIC SIREN ACTIVATE ERROR]", error);
+      res.status(500).json({ status: "error", message: error.message });
+    }
 });
-		}
 
-		const duration = Number(duration_seconds || 60);
-		const expiresAt = Date.now() + duration * 1000;
-
-sirenStates[siren_id] = {
-state: "ON",
-       relay: true,
-       event_id: `PUBLIC-MAP-${Date.now()}`,
-       source: "public-map",
-       updated_at: nowChile(),
-       expires_at: expiresAt
-};
-
-res.json({
-status: "ok",
-message: "Siren activated",
-siren_id,
-duration_seconds: duration
-});
-});
-
-app.post("/public/sirens/deactivate", (req, res) => {
-		const { siren_id } = req.body;
+app.post("/public/sirens/deactivate", async (req, res) => {
+		const { siren_id, control_center_code } = req.body;
 
 		if (!siren_id) {
 		return res.status(400).json({
@@ -3091,29 +3498,41 @@ message: "siren_id is required"
 });
 		}
 
-		const siren = publicSirens.find((s) => s.id === siren_id);
+    try {
+      const { settingsRow, siren } = await findSirenByIdForPublicControlCenter(siren_id, control_center_code || 'CC-VINA');
+      const settings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
-		if (!siren) {
-		return res.status(404).json({
-status: "error",
-message: "Unknown siren_id"
-});
-		}
+      if (!settings.features.sirens_enabled) {
+        return res.status(403).json({ status: "error", message: "Las sirenas no están habilitadas para este centro de control" });
+      }
 
-		sirenStates[siren_id] = {
-state: "OFF",
-       relay: false,
-       event_id: `PUBLIC-MAP-OFF-${Date.now()}`,
-       source: "public-map",
-       updated_at: nowChile(),
-       expires_at: Date.now()
+      if (!siren) {
+        return res.status(404).json({ status: "error", message: "Unknown siren_id" });
+      }
+
+      sirenStates[siren_id] = {
+        state: "OFF",
+        relay: false,
+        event_id: `PUBLIC-MAP-OFF-${Date.now()}`,
+        source: "public-map",
+        updated_at: nowChile(),
+        expires_at: Date.now()
 		};
 
-res.json({
-status: "ok",
-message: "Siren deactivated",
-siren_id
-});
+      await pool.query(
+        `UPDATE sirens SET state='OFF', relay=false, updated_at=NOW() WHERE id=$1`,
+        [siren_id]
+      );
+
+      res.json({
+        status: "ok",
+        message: "Siren deactivated",
+        siren_id
+      });
+    } catch (error) {
+      console.error("[PUBLIC SIREN DEACTIVATE ERROR]", error);
+      res.status(500).json({ status: "error", message: error.message });
+    }
 });
 
 app.post("/public/devices/ack-sos", (req, res) => {
@@ -3486,6 +3905,16 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
     throw err;
   }
 
+  const settingsRow = await getControlCenterSettingsById(ticket.control_center_id).catch(() => null);
+  const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+
+  if (platformSettings.features?.secure_voice_enabled === false) {
+    const err = new Error('Las llamadas seguras no están habilitadas para este centro de control.');
+    err.code = 'SECURE_VOICE_DISABLED_BY_POLICY';
+    err.statusCode = 403;
+    throw err;
+  }
+
   const externalReference = `sos-ticket-${ticket.id}`;
   const normalizedTargetType = String(targetType || '').toUpperCase();
 
@@ -3502,9 +3931,9 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
   const payload = {
     external_reference: externalReference,
     mode: 'BRIDGE',
-    expires_in_seconds: Number(process.env.WA_CENTER_VOICE_EXPIRES_SECONDS || 900),
-    record: WA_CENTER_VOICE_RECORDING,
-    supervision: WA_CENTER_VOICE_SUPERVISION,
+    expires_in_seconds: Math.max(60, Number(platformSettings.voice_policy?.expires_minutes || 15) * 60),
+    record: platformSettings.voice_policy?.recording_enabled !== false,
+    supervision: platformSettings.voice_policy?.supervision_enabled !== false,
     participants: [
       { role: 'party_a', type: 'webrtc', label: partyALabel },
       { role: 'party_b', type: 'webrtc', label: partyBLabel }
@@ -3960,12 +4389,25 @@ app.post("/public/mobile/sos", async (req, res) => {
       source
     });
 
-    const existingIncident = await findNearbyActiveIncident({
-      controlCenterId,
-      latitude: event.latitude,
-      longitude: event.longitude,
-      alertType: normalizedAlert.alert_type
-    });
+    const settingsRow = await getControlCenterSettingsById(controlCenterId);
+    const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+
+    if (platformSettings.features?.mobile_app_enabled === false) {
+      return res.status(403).json({
+        status: "error",
+        message: "La App Vecino no está habilitada para este centro de control."
+      });
+    }
+
+    const existingIncident = platformSettings.features?.multi_report_incidents_enabled === false
+      ? null
+      : await findNearbyActiveIncident({
+          controlCenterId,
+          latitude: event.latitude,
+          longitude: event.longitude,
+          alertType: normalizedAlert.alert_type,
+          settings: platformSettings
+        });
 
     if (existingIncident?.ticket) {
       const linkedTicket = existingIncident.ticket;
@@ -4029,8 +4471,8 @@ app.post("/public/mobile/sos", async (req, res) => {
         match: {
           distance_meters: Math.round(existingIncident.distance_meters),
           score: existingIncident.score,
-          window_minutes: INCIDENT_DEDUP_WINDOW_MINUTES,
-          radius_meters: INCIDENT_DEDUP_RADIUS_METERS
+          window_minutes: platformSettings.incident_policy?.dedup_window_minutes || INCIDENT_DEDUP_WINDOW_MINUTES,
+          radius_meters: platformSettings.incident_policy?.dedup_radius_meters || INCIDENT_DEDUP_RADIUS_METERS
         },
         user: publicUserPayload(citizen)
       });
@@ -10412,6 +10854,182 @@ function checkAdminToken(req, res) {
   // Nuevo control de acceso por sesión de usuario ADMIN.
   return checkRoleAccess(req, res, ["ADMIN"], "Se requiere usuario ADMIN para acceder al mantenedor");
 }
+
+
+
+async function adminResolveControlCenter(code) {
+  const result = await pool.query(
+    `SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1`,
+    [code || 'CC-VINA']
+  );
+  return result.rows[0] || null;
+}
+
+app.get("/admin/control-centers/:code/settings", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const row = await getControlCenterSettingsByCode(req.params.code || 'CC-VINA');
+    if (!row) {
+      return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    }
+    res.json(adminSettingsPayload(row));
+  } catch (error) {
+    console.error("[ADMIN GET CONTROL CENTER SETTINGS ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.put("/admin/control-centers/:code/settings", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    await ensureControlCenterSettingsSchema();
+    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    if (!cc) {
+      return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    }
+
+    const current = await getControlCenterSettingsById(cc.id);
+    const currentSettings = current?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+    const nextSettings = normalizeControlCenterSettings(deepMergeSettings(currentSettings, req.body?.settings || req.body || {}));
+    const actorId = req.panel_session?.sub || null;
+
+    await pool.query(
+      `
+      INSERT INTO control_center_settings (control_center_id, settings, updated_by, updated_at)
+      VALUES ($1,$2::jsonb,$3,NOW())
+      ON CONFLICT (control_center_id) DO UPDATE
+      SET settings = EXCLUDED.settings,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = NOW()
+      `,
+      [cc.id, JSON.stringify(nextSettings), actorId]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO control_center_settings_audit (control_center_id, actor_user_id, old_settings, new_settings)
+      VALUES ($1,$2,$3::jsonb,$4::jsonb)
+      `,
+      [cc.id, actorId, JSON.stringify(currentSettings), JSON.stringify(nextSettings)]
+    );
+
+    const saved = await getControlCenterSettingsById(cc.id);
+    res.json(adminSettingsPayload(saved));
+  } catch (error) {
+    console.error("[ADMIN PUT CONTROL CENTER SETTINGS ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.get("/admin/control-centers/:code/sirens", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    await ensureControlCenterSettingsSchema();
+    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM sirens
+      WHERE control_center_id = $1
+      ORDER BY name ASC
+      `,
+      [cc.id]
+    );
+
+    res.json({ status: "ok", control_center: cc, total: result.rows.length, sirens: result.rows });
+  } catch (error) {
+    console.error("[ADMIN GET SIRENS ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/admin/control-centers/:code/sirens", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    await ensureControlCenterSettingsSchema();
+    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const payload = req.body || {};
+    const id = String(payload.id || '').trim();
+    const name = String(payload.name || '').trim();
+    if (!id || !name) {
+      return res.status(400).json({ status: "error", message: "id y name son obligatorios" });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO sirens (
+        id, control_center_id, name, latitude, longitude, location,
+        enabled, activation_mode, default_duration_seconds, max_duration_seconds,
+        cooldown_seconds, metadata, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE
+      SET control_center_id = EXCLUDED.control_center_id,
+          name = EXCLUDED.name,
+          latitude = EXCLUDED.latitude,
+          longitude = EXCLUDED.longitude,
+          location = EXCLUDED.location,
+          enabled = EXCLUDED.enabled,
+          activation_mode = EXCLUDED.activation_mode,
+          default_duration_seconds = EXCLUDED.default_duration_seconds,
+          max_duration_seconds = EXCLUDED.max_duration_seconds,
+          cooldown_seconds = EXCLUDED.cooldown_seconds,
+          metadata = EXCLUDED.metadata,
+          updated_at = NOW()
+      RETURNING *
+      `,
+      [
+        id,
+        cc.id,
+        name,
+        payload.latitude === '' || payload.latitude == null ? null : Number(payload.latitude),
+        payload.longitude === '' || payload.longitude == null ? null : Number(payload.longitude),
+        payload.location || null,
+        payload.enabled !== false,
+        String(payload.activation_mode || 'MANUAL_ONLY').toUpperCase(),
+        clampPolicyNumber(payload.default_duration_seconds, 60, 5, 600),
+        clampPolicyNumber(payload.max_duration_seconds, 180, 10, 900),
+        clampPolicyNumber(payload.cooldown_seconds, 120, 0, 3600),
+        JSON.stringify(payload.metadata || {})
+      ]
+    );
+
+    res.json({ status: "ok", siren: result.rows[0] });
+  } catch (error) {
+    console.error("[ADMIN UPSERT SIREN ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/admin/control-centers/:code/sirens/:id/active", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    await ensureControlCenterSettingsSchema();
+    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const enabled = req.body?.enabled !== false;
+    const result = await pool.query(
+      `UPDATE sirens SET enabled=$3, updated_at=NOW() WHERE id=$1 AND control_center_id=$2 RETURNING *`,
+      [req.params.id, cc.id, enabled]
+    );
+
+    if (!result.rows.length) return res.status(404).json({ status: "error", message: "Sirena no encontrada" });
+    res.json({ status: "ok", siren: result.rows[0] });
+  } catch (error) {
+    console.error("[ADMIN SIREN ACTIVE ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
 
 const VALID_USER_ROLES = [
   "NEIGHBOR",
