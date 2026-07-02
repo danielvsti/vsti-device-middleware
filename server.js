@@ -954,6 +954,120 @@ function getPhysicalSosButtonProfile(normalized) {
   };
 }
 
+
+async function getPhysicalSosButtonProfileFromDb(normalized) {
+  const platformId = normalized?.device?.platform_id ? String(normalized.device.platform_id) : null;
+  const ident = normalized?.device?.id ? String(normalized.device.id) : null;
+  const deviceName = normalized?.device?.name ? String(normalized.device.name) : null;
+
+  const keys = [platformId, ident, deviceName].filter(Boolean);
+  if (!keys.length) return null;
+
+  const result = await pool.query(
+    `
+    SELECT
+      d.*,
+      cc.code AS control_center_code,
+      cc.name AS control_center_name
+    FROM devices d
+    LEFT JOIN control_centers cc ON cc.id = d.control_center_id
+    WHERE d.type = 'PHYSICAL_SOS'
+      AND (
+        d.id = ANY($1::text[])
+        OR d.platform_id = ANY($1::text[])
+        OR d.name = ANY($1::text[])
+        OR d.metadata->>'ident' = ANY($1::text[])
+        OR d.metadata->>'device_id' = ANY($1::text[])
+      )
+    ORDER BY d.updated_at DESC NULLS LAST
+    LIMIT 1
+    `,
+    [keys]
+  );
+
+  const row = result.rows[0];
+  if (!row) return null;
+  const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+
+  return {
+    id: row.platform_id || row.id || ident || platformId || 'UNKNOWN',
+    platform_id: row.platform_id || platformId || null,
+    ident: metadata.ident || ident || null,
+    name: row.name || deviceName || `Botón SOS ${row.platform_id || row.id || ident || platformId || 'UNKNOWN'}`,
+    phone: metadata.sim_phone || metadata.phone || '',
+    address: metadata.registered_address || metadata.address || '',
+    owner_name: metadata.owner_name || metadata.owner || '',
+    control_center_code: row.control_center_code || metadata.control_center_code || 'CC-VINA',
+    notes: metadata.notes || '',
+    enabled: metadata.enabled !== false,
+    db_device_id: row.id,
+    metadata
+  };
+}
+
+async function syncPhysicalSosDeviceTelemetry(normalized) {
+  const platformId = normalized?.device?.platform_id ? String(normalized.device.platform_id) : null;
+  const ident = normalized?.device?.id ? String(normalized.device.id) : null;
+  const deviceName = normalized?.device?.name ? String(normalized.device.name) : null;
+  const keys = [platformId, ident, deviceName].filter(Boolean);
+  if (!keys.length) return null;
+
+  const found = await pool.query(
+    `
+    SELECT *
+    FROM devices
+    WHERE type = 'PHYSICAL_SOS'
+      AND (
+        id = ANY($1::text[])
+        OR platform_id = ANY($1::text[])
+        OR name = ANY($1::text[])
+        OR metadata->>'ident' = ANY($1::text[])
+      )
+    ORDER BY updated_at DESC NULLS LAST
+    LIMIT 1
+    `,
+    [keys]
+  );
+
+  if (!found.rows.length) return null;
+
+  const current = found.rows[0];
+  const currentMetadata = current.metadata && typeof current.metadata === 'object' ? current.metadata : {};
+  const nextMetadata = {
+    ...currentMetadata,
+    ident: currentMetadata.ident || ident || null,
+    last_event_type: normalized.event_type || null,
+    battery: normalized.device?.battery ?? currentMetadata.battery ?? null,
+    gsm_signal: normalized.device?.gsm_signal ?? currentMetadata.gsm_signal ?? null,
+    satellites: normalized.position?.satellites ?? currentMetadata.satellites ?? null,
+    position_valid: normalized.position?.valid ?? currentMetadata.position_valid ?? null,
+    raw_type: normalized.raw_type || currentMetadata.raw_type || null
+  };
+
+  const latitude = normalized.position?.latitude ?? current.last_latitude;
+  const longitude = normalized.position?.longitude ?? current.last_longitude;
+
+  const update = await pool.query(
+    `
+    UPDATE devices
+    SET
+      platform_id = COALESCE($2, platform_id),
+      name = COALESCE($3, name),
+      last_latitude = $4,
+      last_longitude = $5,
+      last_seen = NOW(),
+      status = 'ONLINE',
+      metadata = $6::jsonb,
+      updated_at = NOW()
+    WHERE id = $1
+    RETURNING *
+    `,
+    [current.id, platformId, deviceName, latitude, longitude, JSON.stringify(nextMetadata)]
+  );
+
+  return update.rows[0] || null;
+}
+
 async function getControlCenterIdByCode(code = "CC-VINA") {
   const result = await pool.query(
     `
@@ -1029,7 +1143,32 @@ async function createTicketFromPhysicalSos(normalized) {
     return null;
   }
 
-  const profile = getPhysicalSosButtonProfile(normalized);
+  const dbProfile = await getPhysicalSosButtonProfileFromDb(normalized).catch((error) => {
+    console.warn("[PHYSICAL SOS DB PROFILE WARNING]", error.message);
+    return null;
+  });
+  const profile = dbProfile || getPhysicalSosButtonProfile(normalized);
+
+  if (profile.enabled === false) {
+    console.log("[PHYSICAL SOS] Device disabled by admin inventory", { device_id: profile.id, platform_id: profile.platform_id });
+    return null;
+  }
+
+  const controlCenterId = await getControlCenterIdByCode(profile.control_center_code);
+
+  if (!controlCenterId) {
+    console.warn("[PHYSICAL SOS] Control center not found", profile.control_center_code);
+    return null;
+  }
+
+  const settingsRow = await getControlCenterSettingsById(controlCenterId).catch(() => null);
+  const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+
+  if (platformSettings.features?.physical_sos_buttons_enabled === false) {
+    console.log("[PHYSICAL SOS] Physical SOS buttons disabled by control center policy", { control_center_code: profile.control_center_code });
+    return null;
+  }
+
   const existingTicket = await findOpenPhysicalDeviceTicket(normalized, profile);
 
   if (existingTicket) {
@@ -1040,13 +1179,6 @@ async function createTicketFromPhysicalSos(normalized) {
     });
 
     return existingTicket;
-  }
-
-  const controlCenterId = await getControlCenterIdByCode(profile.control_center_code);
-
-  if (!controlCenterId) {
-    console.warn("[PHYSICAL SOS] Control center not found", profile.control_center_code);
-    return null;
   }
 
   const phoneText = profile.phone ? ` Teléfono asociado: ${profile.phone}.` : "";
@@ -1286,6 +1418,10 @@ async function processIncomingMessage(msg, receivedAt) {
 	updateDeviceState(normalized);
 
 	updateGpsDeviceFromNormalized(normalized);
+
+  await syncPhysicalSosDeviceTelemetry(normalized).catch((error) => {
+    console.warn("[PHYSICAL SOS TELEMETRY SYNC WARNING]", error.message);
+  });
 
 	let physicalSosTicket = null;
 
@@ -3340,7 +3476,7 @@ const mobileResult = await pool.query(`
 const mobileEventsForMap = mobileResult.rows;
 
 
-		const devicesForMap = Object.values(gpsDevices).map((d) => {
+		let devicesForMap = Object.values(gpsDevices).map((d) => {
 				let sosState = "NORMAL";
 
 				if (d.sos_started_at && !d.sos_acknowledged) {
@@ -3383,6 +3519,62 @@ last_event_type: d.last_event_type || null
 
 
 
+
+    if (settingsRow && platformSettings.features?.physical_sos_buttons_enabled !== false) {
+      try {
+        const registeredDevicesResult = await pool.query(
+          `
+          SELECT
+            id,
+            name,
+            type,
+            platform_id,
+            last_latitude,
+            last_longitude,
+            last_seen,
+            status,
+            metadata,
+            updated_at
+          FROM devices
+          WHERE control_center_id = $1
+            AND type = 'PHYSICAL_SOS'
+            AND COALESCE((metadata->>'enabled')::boolean, true) = true
+          ORDER BY name ASC
+          `,
+          [settingsRow.control_center_id]
+        );
+
+        const liveKeys = new Set(devicesForMap.map((device) => String(device.id)));
+        const registeredDevices = registeredDevicesResult.rows
+          .filter((device) => !liveKeys.has(String(device.platform_id || device.id)))
+          .map((device) => {
+            const metadata = device.metadata && typeof device.metadata === 'object' ? device.metadata : {};
+            return {
+              id: device.platform_id || device.id,
+              registry_id: device.id,
+              name: device.name || `Botón SOS ${device.platform_id || device.id}`,
+              type: device.type || 'PHYSICAL_SOS',
+              platform_id: device.platform_id,
+              latitude: device.last_latitude,
+              longitude: device.last_longitude,
+              last_seen: device.last_seen,
+              online: String(device.status || '').toUpperCase() === 'ONLINE',
+              sos_state: 'NORMAL',
+              sos_active: false,
+              sos_recent: false,
+              last_event_type: metadata.last_event_type || null,
+              battery: metadata.battery ?? null,
+              phone: metadata.sim_phone || metadata.phone || null,
+              registered_address: metadata.registered_address || metadata.address || null,
+              metadata
+            };
+          });
+
+        devicesForMap = [...devicesForMap, ...registeredDevices];
+      } catch (error) {
+        console.warn('[MAP STATE REGISTERED PHYSICAL DEVICES WARNING]', error.message);
+      }
+    }
 
     const configuredSirens = settingsRow
       ? await loadSirensForControlCenter(settingsRow.control_center_id, platformSettings)
@@ -11039,6 +11231,170 @@ app.post("/admin/control-centers/:code/sirens/:id/active", async (req, res) => {
     res.json({ status: "ok", siren: result.rows[0] });
   } catch (error) {
     console.error("[ADMIN SIREN ACTIVE ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+
+function normalizeAdminDeviceType(value) {
+  const type = String(value || 'PHYSICAL_SOS').trim().toUpperCase();
+  if (['PHYSICAL_SOS', 'GPS_TRACKER', 'COMMUNITY_BUTTON', 'FIXED_BUTTON'].includes(type)) return type;
+  return 'PHYSICAL_SOS';
+}
+
+function sanitizeDeviceMetadata(payload = {}, existingMetadata = {}) {
+  return {
+    ...(existingMetadata && typeof existingMetadata === 'object' ? existingMetadata : {}),
+    enabled: payload.enabled !== false,
+    sim_phone: String(payload.sim_phone || payload.phone || '').trim() || null,
+    registered_address: String(payload.registered_address || payload.address || payload.location || '').trim() || null,
+    owner_name: String(payload.owner_name || '').trim() || null,
+    ident: String(payload.ident || payload.device_ident || '').trim() || null,
+    device_model: String(payload.device_model || payload.model || '').trim() || null,
+    heartbeat_max_seconds: clampPolicyNumber(payload.heartbeat_max_seconds, 900, 60, 86400),
+    notes: String(payload.notes || '').trim() || null,
+    sector_code: String(payload.sector_code || '').trim() || null,
+    sector_name: String(payload.sector_name || '').trim() || null,
+    siren_id: String(payload.siren_id || '').trim() || null
+  };
+}
+
+app.get("/admin/control-centers/:code/devices", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const type = req.query.type ? normalizeAdminDeviceType(req.query.type) : null;
+    const params = [cc.id];
+    let typeSql = '';
+    if (type) {
+      params.push(type);
+      typeSql = `AND type = $${params.length}`;
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        control_center_id,
+        name,
+        type,
+        platform_id,
+        last_latitude,
+        last_longitude,
+        last_seen,
+        status,
+        metadata,
+        created_at,
+        updated_at
+      FROM devices
+      WHERE control_center_id = $1
+        ${typeSql}
+      ORDER BY name ASC, id ASC
+      `,
+      params
+    );
+
+    res.json({ status: "ok", control_center: cc, total: result.rows.length, devices: result.rows });
+  } catch (error) {
+    console.error("[ADMIN GET DEVICES ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/admin/control-centers/:code/devices", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const payload = req.body || {};
+    const id = String(payload.id || payload.device_id || payload.platform_id || '').trim();
+    const name = String(payload.name || '').trim();
+    if (!id || !name) {
+      return res.status(400).json({ status: "error", message: "id/device_id y name son obligatorios" });
+    }
+
+    const existing = await pool.query(`SELECT metadata FROM devices WHERE id = $1 LIMIT 1`, [id]);
+    const existingMetadata = existing.rows[0]?.metadata || {};
+    const metadata = sanitizeDeviceMetadata(payload, existingMetadata);
+    const type = normalizeAdminDeviceType(payload.type || 'PHYSICAL_SOS');
+    const platformId = String(payload.platform_id || id).trim();
+
+    const result = await pool.query(
+      `
+      INSERT INTO devices (
+        id,
+        control_center_id,
+        name,
+        type,
+        platform_id,
+        last_latitude,
+        last_longitude,
+        status,
+        metadata,
+        updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NOW())
+      ON CONFLICT (id) DO UPDATE
+      SET control_center_id = EXCLUDED.control_center_id,
+          name = EXCLUDED.name,
+          type = EXCLUDED.type,
+          platform_id = EXCLUDED.platform_id,
+          last_latitude = EXCLUDED.last_latitude,
+          last_longitude = EXCLUDED.last_longitude,
+          status = EXCLUDED.status,
+          metadata = EXCLUDED.metadata,
+          updated_at = NOW()
+      RETURNING *
+      `,
+      [
+        id,
+        cc.id,
+        name,
+        type,
+        platformId || null,
+        payload.latitude === '' || payload.latitude == null ? null : Number(payload.latitude),
+        payload.longitude === '' || payload.longitude == null ? null : Number(payload.longitude),
+        String(payload.status || 'OFFLINE').toUpperCase(),
+        JSON.stringify(metadata)
+      ]
+    );
+
+    res.json({ status: "ok", device: result.rows[0] });
+  } catch (error) {
+    console.error("[ADMIN UPSERT DEVICE ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/admin/control-centers/:code/devices/:id/active", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const enabled = req.body?.enabled !== false;
+    const result = await pool.query(
+      `
+      UPDATE devices
+      SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{enabled}', to_jsonb($3::boolean), true),
+          updated_at = NOW()
+      WHERE id = $1
+        AND control_center_id = $2
+      RETURNING *
+      `,
+      [req.params.id, cc.id, enabled]
+    );
+
+    if (!result.rows.length) return res.status(404).json({ status: "error", message: "Dispositivo no encontrado" });
+    res.json({ status: "ok", device: result.rows[0] });
+  } catch (error) {
+    console.error("[ADMIN DEVICE ACTIVE ERROR]", error);
     res.status(500).json({ status: "error", message: error.message });
   }
 });
