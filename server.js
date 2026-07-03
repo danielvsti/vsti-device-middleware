@@ -585,10 +585,23 @@ function panelSessionFromRequest(req) {
   return verifyPanelSessionToken(getBearerOrPanelToken(req));
 }
 
+function isSuperAdminSession(session) {
+  return String(session?.role || "").toUpperCase() === "SUPER_ADMIN";
+}
+
+function roleHasAccess(role, allowedRoles = []) {
+  const normalizedRole = String(role || "").toUpperCase();
+  const allowed = allowedRoles.map((item) => String(item || "").toUpperCase());
+  if (normalizedRole === "SUPER_ADMIN") {
+    return allowed.includes("SUPER_ADMIN") || allowed.includes("ADMIN") || allowed.includes("OPERATOR");
+  }
+  return allowed.includes(normalizedRole);
+}
+
 function checkRoleAccess(req, res, allowedRoles, message = "Unauthorized panel request") {
   const session = panelSessionFromRequest(req);
 
-  if (!session || !allowedRoles.includes(session.role)) {
+  if (!session || !roleHasAccess(session.role, allowedRoles)) {
     res.status(401).json({
       status: "error",
       message
@@ -603,11 +616,12 @@ function checkRoleAccess(req, res, allowedRoles, message = "Unauthorized panel r
 function allowedRolesForPanel(panelType) {
   const normalized = String(panelType || "CONTROL_CENTER").toUpperCase();
 
-  if (normalized === "ADMIN") return ["ADMIN"];
-  if (normalized === "CONTROL_CENTER") return ["OPERATOR", "ADMIN"];
-  if (normalized === "RESOLVER") return ["RESOLVER", "ADMIN"];
+  if (normalized === "SUPER_ADMIN") return ["SUPER_ADMIN"];
+  if (normalized === "ADMIN") return ["ADMIN", "SUPER_ADMIN"];
+  if (normalized === "CONTROL_CENTER") return ["OPERATOR", "ADMIN", "SUPER_ADMIN"];
+  if (normalized === "RESOLVER") return ["RESOLVER", "ADMIN", "SUPER_ADMIN"];
 
-  return ["OPERATOR", "ADMIN"];
+  return ["OPERATOR", "ADMIN", "SUPER_ADMIN"];
 }
 
 
@@ -810,7 +824,7 @@ app.get('/admin/control-centers/:code/geofence', async (req, res) => {
       FROM control_centers
       WHERE code = $1
       LIMIT 1
-    `, [req.params.code]);
+    `, [requestedControlCenterForSession(req, req.params.code)]);
     if (!result.rows.length) return res.status(404).json({ status: 'error', message: 'Unknown control center' });
     res.json({ status: 'ok', control_center: result.rows[0] });
   } catch (error) {
@@ -843,7 +857,7 @@ app.post('/admin/control-centers/:code/geofence', async (req, res) => {
       WHERE code = $1
       RETURNING id, code, name, latitude, longitude, boundary_geojson,
                 geofence_buffer_meters, map_center_lat, map_center_lon, map_zoom
-    `, [req.params.code, JSON.stringify(boundary), buffer, centerLat, centerLon, mapZoom]);
+    `, [requestedControlCenterForSession(req, req.params.code), JSON.stringify(boundary), buffer, centerLat, centerLon, mapZoom]);
 
     if (!result.rows.length) return res.status(404).json({ status: 'error', message: 'Unknown control center' });
     res.json({ status: 'ok', message: 'Geofence updated', control_center: result.rows[0], bounds });
@@ -6110,20 +6124,14 @@ app.post("/auth/login-demo", async (req, res) => {
 
 
 app.get("/tickets", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para listar tickets")) return;
   try {
     const {
-      control_center_code,
       state,
       limit
     } = req.query;
 
-    if (!control_center_code) {
-      return res.status(400).json({
-        status: "error",
-        message: "control_center_code is required"
-      });
-    }
-
+    const control_center_code = dashboardAuthorizedControlCenterCode(req);
     const params = [control_center_code];
     let where = `cc.code = $1`;
 
@@ -7753,7 +7761,7 @@ app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
 
 app.post("/tickets/:id/voice/request", async (req, res) => {
   try {
-    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para iniciar llamada segura")) return;
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para iniciar llamada segura")) return;
 
     const { id } = req.params;
     const { target_type = "NEIGHBOR" } = req.body || {};
@@ -7799,7 +7807,7 @@ app.get("/tickets/:id/voice/sessions", async (req, res) => {
 
 app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
   try {
-    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para atender llamada segura")) return;
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para atender llamada segura")) return;
 
     const { id, sessionId } = req.params;
     const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: true });
@@ -8069,16 +8077,10 @@ app.get("/tickets/:id/notes", async (req, res) => {
 });
 
 app.get("/dashboard/summary", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al dashboard")) return;
   try {
     await ensureGeofenceSchema();
-    const { control_center_code } = req.query;
-
-    if (!control_center_code) {
-      return res.status(400).json({
-        status: "error",
-        message: "control_center_code is required"
-      });
-    }
+    const control_center_code = dashboardAuthorizedControlCenterCode(req);
 
     const result = await pool.query(`
       WITH cc AS (
@@ -8218,7 +8220,7 @@ app.get("/debug/resolver-status-summary", async (req, res) => {
 });
 
 app.get("/dashboard/analytics", async (req, res) => {
-  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al dashboard")) return;
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al dashboard")) return;
 
   try {
     await ensureGeofenceSchema();
@@ -8853,12 +8855,16 @@ app.get("/dashboard/analytics", async (req, res) => {
 */
 
 function dashboardAuthorizedControlCenterCode(req) {
-  // Regla estricta multi-comuna: la sesión manda.
-  // El frontend puede enviar control_center_code, pero no se usa para escapar del centro del usuario.
+  // Regla estricta multi-comuna:
+  // - OPERATOR/ADMIN municipal: la sesión manda siempre.
+  // - SUPER_ADMIN: puede elegir centro con control_center_code para soporte/demo.
+  if (req.panel_session && isSuperAdminSession(req.panel_session)) {
+    return String(req.query.control_center_code || req.body?.control_center_code || req.panel_session.control_center_code || "CC-VINA").trim().toUpperCase();
+  }
   if (req.panel_session && req.panel_session.control_center_code) {
     return String(req.panel_session.control_center_code).trim().toUpperCase();
   }
-  return String(req.query.control_center_code || "CC-VINA").trim().toUpperCase();
+  return String(req.query.control_center_code || req.body?.control_center_code || "CC-VINA").trim().toUpperCase();
 }
 
 let luciaSchemaReady = false;
@@ -9693,7 +9699,7 @@ function luciaSuggestionsForIntent(question, queryDef) {
 }
 
 app.post("/dashboard/lucia/ask", async (req, res) => {
-  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para usar Luc-IA")) return;
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para usar Luc-IA")) return;
 
   try {
     await ensureLuciaSchema();
@@ -9788,7 +9794,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
 });
 
 app.get("/dashboard/tickets", async (req, res) => {
-  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para listar tickets")) return;
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para listar tickets")) return;
 
   try {
     const controlCenterCode = dashboardAuthorizedControlCenterCode(req);
@@ -9884,19 +9890,10 @@ app.get("/dashboard/tickets", async (req, res) => {
 });
 
 app.get("/dashboard/map-state", async (req, res) => {
-  if (String(process.env.REQUIRE_CONTROL_PANEL_AUTH || "false").toLowerCase() === "true") {
-    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al panel de control")) return;
-  }
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al panel de control")) return;
 
   try {
-    const { control_center_code } = req.query;
-
-    if (!control_center_code) {
-      return res.status(400).json({
-        status: "error",
-        message: "control_center_code is required"
-      });
-    }
+    const control_center_code = dashboardAuthorizedControlCenterCode(req);
 
     const ccResult = await pool.query(
       `
@@ -10653,6 +10650,7 @@ app.post("/resolvers/:id/location/clear", async (req, res) => {
 app.post("/resolvers/:id/status/offline", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!(await requireSameControlCenterForUser(req, res, id))) return;
 
     const userResult = await pool.query(
       `SELECT id, full_name, control_center_id, role FROM users WHERE id = $1 AND is_active = true`,
@@ -11037,6 +11035,176 @@ app.post("/tickets/:id/take", async (req, res) => {
 
 
 
+
+/*
+   =========================================================
+   SUPER ADMIN / MULTI-COMUNA
+   =========================================================
+
+   SUPER_ADMIN crea centros, primer administrador municipal,
+   geocercas comunales y Unidades Vecinales.
+   =========================================================
+*/
+
+async function ensureSuperAdminSchema() {
+  await ensureGeofenceSchema();
+  await ensureSectorSchema();
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`).catch(() => null);
+  await pool.query(`
+    ALTER TABLE control_centers
+      ADD COLUMN IF NOT EXISTS municipality TEXT,
+      ADD COLUMN IF NOT EXISTS region TEXT,
+      ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'Chile',
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_control_centers_code_unique ON control_centers(code)`);
+}
+
+function requireSuperAdmin(req, res) {
+  return checkRoleAccess(req, res, ["SUPER_ADMIN"], "Se requiere usuario SUPER_ADMIN");
+}
+
+function geoJsonFromRequestBody(body) {
+  const input = body?.boundary_geojson || body?.geojson || body;
+  if (!input) return null;
+  if (input.type === "FeatureCollection") {
+    const feature = (input.features || []).find((f) => f?.geometry);
+    return feature ? normalizeGeoJsonGeometry(feature.geometry) : null;
+  }
+  return normalizeGeoJsonGeometry(input);
+}
+
+function inferGeoJsonCenter(geometry) {
+  const bounds = getGeoJsonBounds(geometry);
+  if (!bounds) return { latitude: null, longitude: null, bounds: null };
+  return {
+    latitude: (bounds.minLat + bounds.maxLat) / 2,
+    longitude: (bounds.minLon + bounds.maxLon) / 2,
+    bounds
+  };
+}
+
+app.get("/superadmin/control-centers", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    await ensureSuperAdminSchema();
+    const result = await pool.query(`
+      SELECT
+        cc.id, cc.code, cc.name, cc.municipality, cc.region, cc.country,
+        cc.latitude, cc.longitude, cc.map_center_lat, cc.map_center_lon, cc.map_zoom,
+        cc.geofence_buffer_meters, cc.boundary_geojson->>'type' AS boundary_type,
+        COUNT(u.id)::int AS users_count,
+        COUNT(u.id) FILTER (WHERE u.role = 'ADMIN')::int AS admins_count,
+        COUNT(u.id) FILTER (WHERE u.role = 'OPERATOR')::int AS operators_count,
+        COUNT(u.id) FILTER (WHERE u.role = 'RESOLVER')::int AS resolvers_count,
+        COUNT(u.id) FILTER (WHERE u.role = 'NEIGHBOR')::int AS neighbors_count
+      FROM control_centers cc
+      LEFT JOIN users u ON u.control_center_id = cc.id
+      GROUP BY cc.id
+      ORDER BY cc.region NULLS LAST, cc.municipality NULLS LAST, cc.code
+    `);
+    res.json({ status: "ok", total: result.rows.length, control_centers: result.rows });
+  } catch (error) {
+    console.error("[SUPERADMIN CONTROL CENTERS LIST ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/superadmin/control-centers", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    await ensureSuperAdminSchema();
+    const code = String(req.body?.code || "").trim().toUpperCase();
+    const name = String(req.body?.name || "").trim();
+    const municipality = String(req.body?.municipality || "").trim() || null;
+    const region = String(req.body?.region || "").trim() || null;
+    const country = String(req.body?.country || "Chile").trim() || "Chile";
+    const latitude = req.body?.latitude == null || req.body.latitude === "" ? null : Number(req.body.latitude);
+    const longitude = req.body?.longitude == null || req.body.longitude === "" ? null : Number(req.body.longitude);
+    const mapZoom = Number(req.body?.map_zoom || 13);
+    const buffer = Number(req.body?.geofence_buffer_meters || 100);
+
+    if (!code || !/^CC-[A-Z0-9-]{2,40}$/.test(code)) {
+      return res.status(400).json({ status: "error", message: "code debe tener formato CC-COMUNA" });
+    }
+    if (!name) return res.status(400).json({ status: "error", message: "name is required" });
+
+    const result = await pool.query(`
+      INSERT INTO control_centers (code, name, municipality, region, country, latitude, longitude, map_center_lat, map_center_lon, map_zoom, geofence_buffer_meters, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$6,$7,$8,$9,NOW())
+      ON CONFLICT (code) DO UPDATE SET
+        name = EXCLUDED.name,
+        municipality = EXCLUDED.municipality,
+        region = EXCLUDED.region,
+        country = EXCLUDED.country,
+        latitude = EXCLUDED.latitude,
+        longitude = EXCLUDED.longitude,
+        map_center_lat = EXCLUDED.map_center_lat,
+        map_center_lon = EXCLUDED.map_center_lon,
+        map_zoom = EXCLUDED.map_zoom,
+        geofence_buffer_meters = EXCLUDED.geofence_buffer_meters,
+        updated_at = NOW()
+      RETURNING *
+    `, [code, name, municipality, region, country, latitude, longitude, mapZoom, buffer]);
+
+    res.json({ status: "ok", control_center: result.rows[0] });
+  } catch (error) {
+    console.error("[SUPERADMIN CONTROL CENTER UPSERT ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/superadmin/control-centers/:code/boundary", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    await ensureSuperAdminSchema();
+    const code = String(req.params.code || "").trim().toUpperCase();
+    const boundary = geoJsonFromRequestBody(req.body);
+    if (!boundary) return res.status(400).json({ status: "error", message: "GeoJSON Polygon/MultiPolygon requerido" });
+    const center = inferGeoJsonCenter(boundary);
+    const mapZoom = Number(req.body?.map_zoom || 13);
+    const buffer = Number(req.body?.geofence_buffer_meters || 100);
+
+    const result = await pool.query(`
+      UPDATE control_centers
+      SET boundary_geojson = $2::jsonb,
+          geofence_buffer_meters = $3,
+          map_center_lat = COALESCE($4, map_center_lat),
+          map_center_lon = COALESCE($5, map_center_lon),
+          latitude = COALESCE(latitude, $4),
+          longitude = COALESCE(longitude, $5),
+          map_zoom = $6,
+          updated_at = NOW()
+      WHERE code = $1
+      RETURNING id, code, name, municipality, region, latitude, longitude, map_center_lat, map_center_lon, map_zoom, geofence_buffer_meters, boundary_geojson->>'type' AS boundary_type
+    `, [code, JSON.stringify(boundary), buffer, center.latitude, center.longitude, mapZoom]);
+
+    if (!result.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    res.json({ status: "ok", control_center: result.rows[0], bounds: center.bounds });
+  } catch (error) {
+    console.error("[SUPERADMIN BOUNDARY ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.post("/superadmin/control-centers/:code/admin", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const code = String(req.params.code || req.body?.control_center_code || "").trim().toUpperCase();
+    const result = await adminCreateOrUpdateUser({
+      ...(req.body || {}),
+      control_center_code: code,
+      role: "ADMIN",
+      validation_status: req.body?.validation_status || "VALIDATED",
+      is_active: req.body?.is_active ?? true
+    }, req.panel_session);
+    res.json({ status: "ok", message: "Administrador municipal creado/actualizado", operation: result.operation, user: result.user });
+  } catch (error) {
+    console.error("[SUPERADMIN CREATE MUNICIPAL ADMIN ERROR]", error);
+    res.status(400).json({ status: "error", message: error.message });
+  }
+});
+
 /*
    =========================================================
    ADMIN USERS / MUNICIPAL VALIDATION
@@ -11052,28 +11220,57 @@ function checkAdminToken(req, res) {
 
   // Compatibilidad: si se define ADMIN_TOKEN, sigue funcionando como llave maestra.
   if (expected && legacyAdminToken === expected) {
+    req.admin_legacy_token = true;
     return true;
   }
 
-  // Nuevo control de acceso por sesión de usuario ADMIN.
-  return checkRoleAccess(req, res, ["ADMIN"], "Se requiere usuario ADMIN para acceder al mantenedor");
+  // Nuevo control de acceso por sesión de usuario ADMIN/SUPER_ADMIN.
+  return checkRoleAccess(req, res, ["ADMIN", "SUPER_ADMIN"], "Se requiere usuario ADMIN para acceder al mantenedor");
 }
 
+function requestedControlCenterForSession(req, requestedCode, fallback = "CC-VINA") {
+  const session = req.panel_session || panelSessionFromRequest(req);
+  if (session) req.panel_session = session;
+  if (isSuperAdminSession(session)) {
+    return String(requestedCode || session.control_center_code || fallback).trim().toUpperCase();
+  }
+  if (session?.control_center_code) {
+    return String(session.control_center_code).trim().toUpperCase();
+  }
+  return String(requestedCode || fallback).trim().toUpperCase();
+}
 
-
-async function adminResolveControlCenter(code) {
+async function adminResolveControlCenter(reqOrCode, maybeCode) {
+  const requestedCode = typeof reqOrCode === "object" && reqOrCode?.headers
+    ? requestedControlCenterForSession(reqOrCode, maybeCode || reqOrCode.params?.code || reqOrCode.query?.control_center_code)
+    : String(reqOrCode || maybeCode || "CC-VINA").trim().toUpperCase();
   const result = await pool.query(
     `SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1`,
-    [code || 'CC-VINA']
+    [requestedCode || 'CC-VINA']
   );
   return result.rows[0] || null;
+}
+
+async function requireSameControlCenterForUser(req, res, userId) {
+  if (req.admin_legacy_token || isSuperAdminSession(req.panel_session)) return true;
+  const result = await pool.query(`SELECT control_center_id FROM users WHERE id = $1 LIMIT 1`, [userId]);
+  if (!result.rows.length) {
+    res.status(404).json({ status: "error", message: "User not found" });
+    return false;
+  }
+  if (String(result.rows[0].control_center_id) !== String(req.panel_session?.control_center_id)) {
+    res.status(403).json({ status: "error", message: "No puedes administrar usuarios de otro centro de control" });
+    return false;
+  }
+  return true;
 }
 
 app.get("/admin/control-centers/:code/settings", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
 
   try {
-    const row = await getControlCenterSettingsByCode(req.params.code || 'CC-VINA');
+    const requestedCode = requestedControlCenterForSession(req, req.params.code || 'CC-VINA');
+    const row = await getControlCenterSettingsByCode(requestedCode);
     if (!row) {
       return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
     }
@@ -11089,7 +11286,7 @@ app.put("/admin/control-centers/:code/settings", async (req, res) => {
 
   try {
     await ensureControlCenterSettingsSchema();
-    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
     if (!cc) {
       return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
     }
@@ -11132,7 +11329,7 @@ app.get("/admin/control-centers/:code/sirens", async (req, res) => {
 
   try {
     await ensureControlCenterSettingsSchema();
-    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
     if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const result = await pool.query(
@@ -11157,7 +11354,7 @@ app.post("/admin/control-centers/:code/sirens", async (req, res) => {
 
   try {
     await ensureControlCenterSettingsSchema();
-    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
     if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const payload = req.body || {};
@@ -11218,7 +11415,7 @@ app.post("/admin/control-centers/:code/sirens/:id/active", async (req, res) => {
 
   try {
     await ensureControlCenterSettingsSchema();
-    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
     if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const enabled = req.body?.enabled !== false;
@@ -11263,7 +11460,7 @@ app.get("/admin/control-centers/:code/devices", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
 
   try {
-    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
     if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const type = req.query.type ? normalizeAdminDeviceType(req.query.type) : null;
@@ -11308,7 +11505,7 @@ app.post("/admin/control-centers/:code/devices", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
 
   try {
-    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
     if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const payload = req.body || {};
@@ -11375,7 +11572,7 @@ app.post("/admin/control-centers/:code/devices/:id/active", async (req, res) => 
   if (!checkAdminToken(req, res)) return;
 
   try {
-    const cc = await adminResolveControlCenter(req.params.code || 'CC-VINA');
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
     if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const enabled = req.body?.enabled !== false;
@@ -11403,7 +11600,8 @@ const VALID_USER_ROLES = [
   "NEIGHBOR",
   "RESOLVER",
   "OPERATOR",
-  "ADMIN"
+  "ADMIN",
+  "SUPER_ADMIN"
 ];
 
 const VALID_VALIDATION_STATUSES = [
@@ -11426,7 +11624,7 @@ function normalizeAdminBoolean(value, fallback) {
   return fallback;
 }
 
-async function adminCreateOrUpdateUser(payload) {
+async function adminCreateOrUpdateUser(payload, actorSession = null) {
   const {
     control_center_code = "CC-VINA",
     full_name,
@@ -11450,6 +11648,14 @@ async function adminCreateOrUpdateUser(payload) {
     throw new Error(`Invalid role: ${role}`);
   }
 
+  if (!isSuperAdminSession(actorSession) && role === "SUPER_ADMIN") {
+    throw new Error("Solo SUPER_ADMIN puede crear o actualizar usuarios SUPER_ADMIN");
+  }
+
+  const effectiveControlCenterCode = isSuperAdminSession(actorSession)
+    ? String(control_center_code || actorSession?.control_center_code || "CC-VINA").trim().toUpperCase()
+    : String(actorSession?.control_center_code || control_center_code || "CC-VINA").trim().toUpperCase();
+
   const finalValidationStatus = validation_status || defaultValidationStatusForRole(role);
 
   if (!VALID_VALIDATION_STATUSES.includes(finalValidationStatus)) {
@@ -11471,7 +11677,7 @@ async function adminCreateOrUpdateUser(payload) {
     FROM control_centers
     WHERE code = $1
     `,
-    [control_center_code]
+    [effectiveControlCenterCode]
   );
 
   if (ccResult.rows.length === 0) {
@@ -11619,7 +11825,8 @@ app.get("/admin/users", async (req, res) => {
       limit
     } = req.query;
 
-    const params = [control_center_code];
+    const effectiveControlCenterCode = requestedControlCenterForSession(req, control_center_code);
+    const params = [effectiveControlCenterCode];
     const where = ["cc.code = $1"];
 
     if (role && role !== "ALL") {
@@ -11703,7 +11910,7 @@ app.post("/admin/users", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
 
   try {
-    const result = await adminCreateOrUpdateUser(req.body || {});
+    const result = await adminCreateOrUpdateUser(req.body || {}, req.panel_session);
 
     res.json({
       status: "ok",
@@ -11746,7 +11953,7 @@ app.post("/admin/users/bulk", async (req, res) => {
 
     for (const [index, userPayload] of users.entries()) {
       try {
-        const result = await adminCreateOrUpdateUser(userPayload);
+        const result = await adminCreateOrUpdateUser(userPayload, req.panel_session);
         results.push({
           index,
           status: "ok",
@@ -11881,6 +12088,7 @@ app.post("/admin/users/:id/validation", async (req, res) => {
 
   try {
     const { id } = req.params;
+    if (!(await requireSameControlCenterForUser(req, res, id))) return;
     const { validation_status, operator_user_id, reason } = req.body;
 
     if (!VALID_VALIDATION_STATUSES.includes(validation_status)) {
@@ -11941,6 +12149,7 @@ app.post("/admin/users/:id/role", async (req, res) => {
 
   try {
     const { id } = req.params;
+    if (!(await requireSameControlCenterForUser(req, res, id))) return;
     const { role } = req.body;
 
     if (!VALID_USER_ROLES.includes(role)) {
@@ -11948,6 +12157,10 @@ app.post("/admin/users/:id/role", async (req, res) => {
         status: "error",
         message: "Invalid role"
       });
+    }
+
+    if (!isSuperAdminSession(req.panel_session) && role === "SUPER_ADMIN") {
+      return res.status(403).json({ status: "error", message: "Solo SUPER_ADMIN puede asignar el rol SUPER_ADMIN" });
     }
 
     const result = await pool.query(
@@ -11989,6 +12202,7 @@ app.post("/admin/users/:id/active", async (req, res) => {
 
   try {
     const { id } = req.params;
+    if (!(await requireSameControlCenterForUser(req, res, id))) return;
     const { is_active } = req.body;
 
     const result = await pool.query(
@@ -12034,6 +12248,7 @@ app.post("/admin/users/:id/update", async (req, res) => {
 
   try {
     const { id } = req.params;
+    if (!(await requireSameControlCenterForUser(req, res, id))) return;
     const {
       full_name,
       rut,
@@ -12095,6 +12310,7 @@ app.post("/admin/users/:id/contacts", async (req, res) => {
 
   try {
     const { id } = req.params;
+    if (!(await requireSameControlCenterForUser(req, res, id))) return;
     const contacts = Array.isArray(req.body.contacts)
       ? req.body.contacts
       : [];
@@ -12358,7 +12574,7 @@ function getFeatureProperty(props, names, fallback = null) {
 app.get('/admin/control-centers/:code/sectors', async (req, res) => {
   if (!checkAdminToken(req, res)) return;
   try {
-    const code = String(req.params.code || '').toUpperCase();
+    const code = requestedControlCenterForSession(req, req.params.code);
     await ensureSectorSchema();
     const sectors = await loadSectorsForControlCenter(code, { force: true });
     res.json({
@@ -12384,7 +12600,7 @@ app.get('/admin/control-centers/:code/sectors', async (req, res) => {
 app.post('/admin/control-centers/:code/sectors/bulk', async (req, res) => {
   if (!checkAdminToken(req, res)) return;
   try {
-    const code = String(req.params.code || '').toUpperCase();
+    const code = requestedControlCenterForSession(req, req.params.code);
     await ensureSectorSchema();
     const cc = await getControlCenterByCode(code);
     if (!cc) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
@@ -12463,7 +12679,7 @@ app.post('/admin/control-centers/:code/sectors/bulk', async (req, res) => {
 app.post('/admin/control-centers/:code/sectors/reclassify-tickets', async (req, res) => {
   if (!checkAdminToken(req, res)) return;
   try {
-    const code = String(req.params.code || '').toUpperCase();
+    const code = requestedControlCenterForSession(req, req.params.code);
     const limit = Math.min(Number(req.body?.limit || req.query?.limit || 500), 5000);
     await ensureSectorSchema();
 
