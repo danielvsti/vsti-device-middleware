@@ -11111,7 +11111,24 @@ app.get("/superadmin/control-centers", async (req, res) => {
         COUNT(u.id) FILTER (WHERE u.role = 'ADMIN')::int AS admins_count,
         COUNT(u.id) FILTER (WHERE u.role = 'OPERATOR')::int AS operators_count,
         COUNT(u.id) FILTER (WHERE u.role = 'RESOLVER')::int AS resolvers_count,
-        COUNT(u.id) FILTER (WHERE u.role = 'NEIGHBOR')::int AS neighbors_count
+        COUNT(u.id) FILTER (WHERE u.role = 'NEIGHBOR')::int AS neighbors_count,
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'id', u.id,
+              'full_name', u.full_name,
+              'phone', u.phone,
+              'email', u.email,
+              'declared_address', u.declared_address,
+              'is_active', u.is_active,
+              'validation_status', u.validation_status,
+              'created_at', u.created_at,
+              'updated_at', u.updated_at
+            )
+            ORDER BY u.created_at DESC
+          ) FILTER (WHERE u.role = 'ADMIN'),
+          '[]'::jsonb
+        ) AS admins
       FROM control_centers cc
       LEFT JOIN users u ON u.control_center_id = cc.id
       GROUP BY cc.id
