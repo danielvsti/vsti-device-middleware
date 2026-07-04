@@ -647,7 +647,11 @@ async function ensureGeofenceSchema() {
       ADD COLUMN IF NOT EXISTS geofence_buffer_meters INTEGER DEFAULT 100,
       ADD COLUMN IF NOT EXISTS map_center_lat DOUBLE PRECISION,
       ADD COLUMN IF NOT EXISTS map_center_lon DOUBLE PRECISION,
-      ADD COLUMN IF NOT EXISTS map_zoom INTEGER DEFAULT 13
+      ADD COLUMN IF NOT EXISTS map_zoom INTEGER DEFAULT 13,
+      ADD COLUMN IF NOT EXISTS municipality_logo_url TEXT,
+      ADD COLUMN IF NOT EXISTS product_logo_url TEXT,
+      ADD COLUMN IF NOT EXISTS brand_primary_color TEXT,
+      ADD COLUMN IF NOT EXISTS brand_secondary_color TEXT
   `);
 
   await pool.query(`
@@ -8229,7 +8233,9 @@ app.get("/dashboard/analytics", async (req, res) => {
 
     const ccResult = await pool.query(
       `
-      SELECT id, code, name,
+      SELECT id, code, name, municipality, region, country,
+             municipality_logo_url, product_logo_url,
+             brand_primary_color, brand_secondary_color,
              COALESCE(map_center_lat, latitude) AS latitude,
              COALESCE(map_center_lon, longitude) AS longitude,
              boundary_geojson,
@@ -9893,11 +9899,14 @@ app.get("/dashboard/map-state", async (req, res) => {
   if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al panel de control")) return;
 
   try {
+    await ensureGeofenceSchema();
     const control_center_code = dashboardAuthorizedControlCenterCode(req);
 
     const ccResult = await pool.query(
       `
-      SELECT id, code, name,
+      SELECT id, code, name, municipality, region, country,
+             municipality_logo_url, product_logo_url,
+             brand_primary_color, brand_secondary_color,
              COALESCE(map_center_lat, latitude) AS latitude,
              COALESCE(map_center_lon, longitude) AS longitude,
              boundary_geojson,
@@ -11055,6 +11064,10 @@ async function ensureSuperAdminSchema() {
       ADD COLUMN IF NOT EXISTS municipality TEXT,
       ADD COLUMN IF NOT EXISTS region TEXT,
       ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'Chile',
+      ADD COLUMN IF NOT EXISTS municipality_logo_url TEXT,
+      ADD COLUMN IF NOT EXISTS product_logo_url TEXT,
+      ADD COLUMN IF NOT EXISTS brand_primary_color TEXT,
+      ADD COLUMN IF NOT EXISTS brand_secondary_color TEXT,
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
   `);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_control_centers_code_unique ON control_centers(code)`);
@@ -11091,6 +11104,7 @@ app.get("/superadmin/control-centers", async (req, res) => {
     const result = await pool.query(`
       SELECT
         cc.id, cc.code, cc.name, cc.municipality, cc.region, cc.country,
+        cc.municipality_logo_url, cc.product_logo_url, cc.brand_primary_color, cc.brand_secondary_color,
         cc.latitude, cc.longitude, cc.map_center_lat, cc.map_center_lon, cc.map_zoom,
         cc.geofence_buffer_meters, cc.boundary_geojson->>'type' AS boundary_type,
         COUNT(u.id)::int AS users_count,
@@ -11123,6 +11137,10 @@ app.post("/superadmin/control-centers", async (req, res) => {
     const longitude = req.body?.longitude == null || req.body.longitude === "" ? null : Number(req.body.longitude);
     const mapZoom = Number(req.body?.map_zoom || 13);
     const buffer = Number(req.body?.geofence_buffer_meters || 100);
+    const municipalityLogoUrl = String(req.body?.municipality_logo_url || "").trim() || null;
+    const productLogoUrl = String(req.body?.product_logo_url || "").trim() || null;
+    const brandPrimaryColor = String(req.body?.brand_primary_color || "").trim() || null;
+    const brandSecondaryColor = String(req.body?.brand_secondary_color || "").trim() || null;
 
     if (!code || !/^CC-[A-Z0-9-]{2,40}$/.test(code)) {
       return res.status(400).json({ status: "error", message: "code debe tener formato CC-COMUNA" });
@@ -11130,8 +11148,12 @@ app.post("/superadmin/control-centers", async (req, res) => {
     if (!name) return res.status(400).json({ status: "error", message: "name is required" });
 
     const result = await pool.query(`
-      INSERT INTO control_centers (code, name, municipality, region, country, latitude, longitude, map_center_lat, map_center_lon, map_zoom, geofence_buffer_meters, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$6,$7,$8,$9,NOW())
+      INSERT INTO control_centers (
+        code, name, municipality, region, country, latitude, longitude,
+        map_center_lat, map_center_lon, map_zoom, geofence_buffer_meters,
+        municipality_logo_url, product_logo_url, brand_primary_color, brand_secondary_color, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
       ON CONFLICT (code) DO UPDATE SET
         name = EXCLUDED.name,
         municipality = EXCLUDED.municipality,
@@ -11143,9 +11165,16 @@ app.post("/superadmin/control-centers", async (req, res) => {
         map_center_lon = EXCLUDED.map_center_lon,
         map_zoom = EXCLUDED.map_zoom,
         geofence_buffer_meters = EXCLUDED.geofence_buffer_meters,
+        municipality_logo_url = COALESCE(EXCLUDED.municipality_logo_url, control_centers.municipality_logo_url),
+        product_logo_url = COALESCE(EXCLUDED.product_logo_url, control_centers.product_logo_url),
+        brand_primary_color = COALESCE(EXCLUDED.brand_primary_color, control_centers.brand_primary_color),
+        brand_secondary_color = COALESCE(EXCLUDED.brand_secondary_color, control_centers.brand_secondary_color),
         updated_at = NOW()
       RETURNING *
-    `, [code, name, municipality, region, country, latitude, longitude, mapZoom, buffer]);
+    `, [
+      code, name, municipality, region, country, latitude, longitude, mapZoom, buffer,
+      municipalityLogoUrl, productLogoUrl, brandPrimaryColor, brandSecondaryColor
+    ]);
 
     res.json({ status: "ok", control_center: result.rows[0] });
   } catch (error) {
@@ -11264,6 +11293,82 @@ async function requireSameControlCenterForUser(req, res, userId) {
   }
   return true;
 }
+
+
+function normalizeBrandAsset(value, label = "logo") {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const isHttp = /^https:\/\//i.test(raw);
+  const isDataImage = /^data:image\/(png|jpe?g|webp|svg\+xml);base64,/i.test(raw);
+  if (!isHttp && !isDataImage) {
+    throw new Error(`${label} debe ser una URL https o una imagen base64 data:image válida`);
+  }
+  if (raw.length > 1500000) {
+    throw new Error(`${label} es demasiado grande. Usa una imagen menor a 1 MB o una URL pública`);
+  }
+  return raw;
+}
+
+function normalizeBrandColor(value, label = "color") {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (!/^#[0-9a-fA-F]{6}$/.test(raw)) {
+    throw new Error(`${label} debe tener formato #RRGGBB`);
+  }
+  return raw.toUpperCase();
+}
+
+app.get("/admin/control-centers/:code/branding", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    await ensureSuperAdminSchema();
+    const requestedCode = requestedControlCenterForSession(req, req.params.code || "CC-VINA");
+    const result = await pool.query(`
+      SELECT id, code, name, municipality, region,
+             municipality_logo_url, product_logo_url,
+             brand_primary_color, brand_secondary_color
+      FROM control_centers
+      WHERE code = $1
+      LIMIT 1
+    `, [requestedCode]);
+    if (!result.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    res.json({ status: "ok", control_center: result.rows[0] });
+  } catch (error) {
+    console.error("[ADMIN GET BRANDING ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.put("/admin/control-centers/:code/branding", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    await ensureSuperAdminSchema();
+    const requestedCode = requestedControlCenterForSession(req, req.params.code || "CC-VINA");
+    const municipalityLogoUrl = normalizeBrandAsset(req.body?.municipality_logo_url, "Logo municipal");
+    const productLogoUrl = normalizeBrandAsset(req.body?.product_logo_url, "Logo producto");
+    const brandPrimaryColor = normalizeBrandColor(req.body?.brand_primary_color, "Color principal");
+    const brandSecondaryColor = normalizeBrandColor(req.body?.brand_secondary_color, "Color secundario");
+
+    const result = await pool.query(`
+      UPDATE control_centers
+      SET municipality_logo_url = $2,
+          product_logo_url = $3,
+          brand_primary_color = $4,
+          brand_secondary_color = $5,
+          updated_at = NOW()
+      WHERE code = $1
+      RETURNING id, code, name, municipality, region,
+                municipality_logo_url, product_logo_url,
+                brand_primary_color, brand_secondary_color
+    `, [requestedCode, municipalityLogoUrl, productLogoUrl, brandPrimaryColor, brandSecondaryColor]);
+
+    if (!result.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    res.json({ status: "ok", message: "Branding actualizado", control_center: result.rows[0] });
+  } catch (error) {
+    console.error("[ADMIN PUT BRANDING ERROR]", error);
+    res.status(400).json({ status: "error", message: error.message });
+  }
+});
 
 app.get("/admin/control-centers/:code/settings", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
