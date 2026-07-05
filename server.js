@@ -3911,8 +3911,9 @@ function normalizeVoiceStatus(event) {
   if (raw === 'PARTICIPANT_REGISTERED') return 'WAITING';
   if (raw === 'RINGING') return 'RINGING';
   if (raw === 'CONNECTED') return 'CONNECTED';
-  if (raw === 'PARTICIPANT_DISCONNECTED') return 'CONNECTED';
+  if (raw === 'PARTICIPANT_DISCONNECTED') return 'ENDED';
   if (raw === 'ENDED') return 'ENDED';
+  if (raw === 'REJECTED') return 'REJECTED';
   if (raw === 'FAILED') return 'FAILED';
   if (raw === 'NO_ANSWER') return 'NO_ANSWER';
   if (raw === 'EXPIRED') return 'EXPIRED';
@@ -3930,6 +3931,7 @@ function voiceEventDescription(event, payload = {}) {
     CONNECTED: 'Llamada segura conectada',
     PARTICIPANT_DISCONNECTED: `Participante desconectado de llamada segura${role}`,
     ENDED: 'Llamada segura finalizada',
+    REJECTED: 'Llamada segura rechazada',
     FAILED: 'Llamada segura fallida',
     NO_ANSWER: 'Llamada segura sin respuesta',
     EXPIRED: 'Sesión de llamada segura expirada',
@@ -4004,7 +4006,7 @@ async function getVoiceSessionForTicket(ticketId, sessionId = 'latest', options 
       SELECT *
       FROM ticket_voice_sessions
       WHERE ticket_id = $1
-        AND status NOT IN ('FAILED','ENDED','EXPIRED','NO_ANSWER')
+        AND status NOT IN ('FAILED','ENDED','EXPIRED','NO_ANSWER','REJECTED')
       ORDER BY created_at DESC
       LIMIT 1
       `
@@ -4100,6 +4102,182 @@ async function callWaCenterCreateVoiceSession(payload) {
   }
 
   return data;
+}
+
+const VOICE_TERMINAL_STATUSES = new Set(['ENDED', 'FAILED', 'NO_ANSWER', 'EXPIRED', 'REJECTED']);
+const VOICE_NO_ANSWER_TIMEOUT_MS = 45_000;
+
+function isVoiceTerminalStatus(status) {
+  return VOICE_TERMINAL_STATUSES.has(String(status || '').toUpperCase());
+}
+
+async function callWaCenterVoiceAction(session, action) {
+  if (!WA_CENTER_VOICE_ENABLED) {
+    const err = new Error('WA-Center Voice no está habilitado en este ambiente.');
+    err.code = 'WA_CENTER_VOICE_DISABLED';
+    throw err;
+  }
+
+  if (!WA_CENTER_BASE_URL || !WA_CENTER_API_TOKEN) {
+    const err = new Error('WA-Center Voice no está configurado.');
+    err.code = 'WA_CENTER_VOICE_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const waSessionId = session?.wa_center_session_id;
+  if (!waSessionId) {
+    const err = new Error('La sesión no tiene identificador WA-Center.');
+    err.code = 'WA_CENTER_SESSION_ID_MISSING';
+    throw err;
+  }
+
+  const normalizedAction = action === 'end' ? 'end' : 'revoke';
+  const response = await fetch(
+    `${WA_CENTER_BASE_URL}/voice/sessions/${encodeURIComponent(waSessionId)}/${normalizedAction}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${WA_CENTER_API_TOKEN}`
+      },
+      body: JSON.stringify({})
+    }
+  );
+
+  const text = await response.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+
+  // Una sesión que WA-Center ya cerró cumple el objetivo de una limpieza idempotente.
+  if (!response.ok && ![404, 409, 410].includes(response.status)) {
+    const err = new Error(data?.message || data?.error || `WA-Center HTTP ${response.status}`);
+    err.code = 'WA_CENTER_FINALIZE_FAILED';
+    err.status = response.status;
+    err.response = data;
+    throw err;
+  }
+
+  return data;
+}
+
+async function finalizeTicketVoiceSession({
+  session,
+  outcome = 'ENDED',
+  actorRole = 'SYSTEM',
+  actorUserId = null,
+  reason = null
+}) {
+  if (!session?.id) {
+    const err = new Error('Voice session not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const currentStatus = String(session.status || '').toUpperCase();
+  if (isVoiceTerminalStatus(currentStatus)) return session;
+
+  const normalizedOutcome = VOICE_TERMINAL_STATUSES.has(String(outcome).toUpperCase())
+    ? String(outcome).toUpperCase()
+    : 'ENDED';
+  const action = currentStatus === 'CONNECTED' || session.connected_at ? 'end' : 'revoke';
+
+  await callWaCenterVoiceAction(session, action);
+
+  const updated = await pool.query(
+    `
+    UPDATE ticket_voice_sessions
+    SET
+      status = $2,
+      ended_at = COALESCE(ended_at, NOW()),
+      failure_reason = CASE WHEN $3::text IS NULL THEN failure_reason ELSE $3 END,
+      updated_at = NOW()
+    WHERE id = $1
+      AND status NOT IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED')
+    RETURNING *
+    `,
+    [session.id, normalizedOutcome, reason]
+  );
+
+  if (updated.rows.length === 0) {
+    return getVoiceSessionForTicket(session.ticket_id, session.id, { includeCredentials: false });
+  }
+
+  const eventName = normalizedOutcome;
+  await pool.query(
+    `
+    INSERT INTO ticket_voice_events (
+      voice_session_id,
+      ticket_id,
+      wa_center_session_id,
+      external_reference,
+      event,
+      failure_reason,
+      payload
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `,
+    [
+      session.id,
+      session.ticket_id,
+      session.wa_center_session_id,
+      session.external_reference,
+      eventName,
+      reason,
+      JSON.stringify({ source: 'sos_lifecycle', action, outcome: normalizedOutcome, reason })
+    ]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_user_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,$2,$3,$4,$5,$6)
+    `,
+    [
+      session.ticket_id,
+      actorUserId,
+      actorRole,
+      `VOICE_${normalizedOutcome}`,
+      voiceEventDescription(eventName, { failure_reason: reason }),
+      JSON.stringify({
+        provider: 'wa_center',
+        voice_session_id: session.id,
+        wa_center_session_id: session.wa_center_session_id,
+        action,
+        outcome: normalizedOutcome,
+        reason
+      })
+    ]
+  );
+
+  return sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: false });
+}
+
+function scheduleVoiceNoAnswerTimeout(session) {
+  if (!session?.id || !session?.ticket_id) return;
+
+  const timer = setTimeout(async () => {
+    try {
+      const latest = await getVoiceSessionForTicket(session.ticket_id, session.id, { includeCredentials: false });
+      if (!latest || isVoiceTerminalStatus(latest.status) || String(latest.status).toUpperCase() === 'CONNECTED') return;
+      await finalizeTicketVoiceSession({
+        session: latest,
+        outcome: 'NO_ANSWER',
+        actorRole: 'SYSTEM',
+        reason: 'Tiempo de espera agotado (45 segundos)'
+      });
+    } catch (error) {
+      console.error('[VOICE NO ANSWER TIMEOUT ERROR]', error);
+    }
+  }, VOICE_NO_ANSWER_TIMEOUT_MS);
+
+  if (typeof timer.unref === 'function') timer.unref();
 }
 
 async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, actorUserId = null, resolverUserId = null }) {
@@ -4253,7 +4431,9 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
 
     await pool.query(`UPDATE tickets SET updated_at = NOW() WHERE id = $1`, [ticket.id]);
 
-    return sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: true });
+    const createdSession = sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: true });
+    scheduleVoiceNoAnswerTimeout(createdSession);
+    return createdSession;
   } catch (error) {
     await pool.query(
       `
@@ -7602,10 +7782,75 @@ app.post("/tickets/:id/call-response", async (req, res) => {
   }
 });
 
+async function getMobileVoiceAccess(eventId, userId = null) {
+  if (!userId) {
+    const err = new Error('user_id is required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      m.id AS event_id,
+      m.user_id,
+      t.id AS ticket_id,
+      t.state AS ticket_state
+    FROM mobile_events m
+    LEFT JOIN tickets t
+      ON t.source_type = 'MOBILE_APP'
+     AND t.source_event_id = m.id
+    WHERE m.id = $1
+    ORDER BY t.created_at DESC NULLS LAST
+    LIMIT 1
+    `,
+    [eventId]
+  );
+
+  const access = result.rows[0] || null;
+  if (!access) {
+    const err = new Error('Mobile event not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (userId && access.user_id && String(userId) !== String(access.user_id)) {
+    const err = new Error('Mobile event does not belong to user');
+    err.statusCode = 403;
+    throw err;
+  }
+  if (!access.ticket_id) {
+    const err = new Error('El caso aún no tiene ticket operacional asociado.');
+    err.statusCode = 409;
+    throw err;
+  }
+  return access;
+}
+
+async function getResolverVoiceAccess(ticketId, resolverUserId) {
+  if (!resolverUserId) {
+    const err = new Error('resolver_user_id is required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const ticket = await fetchTicketVoiceContext(ticketId);
+  if (!ticket) {
+    const err = new Error('Ticket not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (String(ticket.assigned_resolver_id || '') !== String(resolverUserId)) {
+    const err = new Error('El ticket no está asignado a este resolutor');
+    err.statusCode = 403;
+    throw err;
+  }
+  return ticket;
+}
+
 app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
   try {
     const { eventId } = req.params;
-    const { user_id = null, target_type = null } = req.body || {};
+    const { user_id = null } = req.body || {};
 
     const eventResult = await pool.query(
       `
@@ -7644,9 +7889,8 @@ app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
       req,
       ticket,
       requestedBy: "NEIGHBOR",
-      targetType: target_type
-        ? (String(target_type).toUpperCase() === "RESOLVER" ? "RESOLVER" : "CENTRAL")
-        : (ticket?.assigned_resolver_id ? "RESOLVER" : "CENTRAL"),
+      // La decisión de enrutamiento pertenece al backend, nunca al cliente móvil.
+      targetType: ticket?.assigned_resolver_id ? "RESOLVER" : "CENTRAL",
       actorUserId: ticket?.citizen_user_id || null,
       resolverUserId: ticket?.assigned_resolver_id || null
     });
@@ -7718,6 +7962,69 @@ app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/join", async 
     res.status(error.statusCode || 500).json({
       status: "error",
       message: error.message || "No fue posible entrar a la llamada segura"
+    });
+  }
+});
+
+app.get("/public/mobile/events/:eventId/voice/sessions/:sessionId/status", async (req, res) => {
+  try {
+    const { eventId, sessionId } = req.params;
+    const { user_id = null } = req.query || {};
+    const access = await getMobileVoiceAccess(eventId, user_id);
+    const session = await getVoiceSessionForTicket(access.ticket_id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      voice_session: voiceSessionForParticipant(session, 'party_a')
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE STATUS ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible consultar la llamada segura"
+    });
+  }
+});
+
+app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/end", async (req, res) => {
+  try {
+    const { eventId, sessionId } = req.params;
+    const { user_id = null, reason = "HANGUP" } = req.body || {};
+    const access = await getMobileVoiceAccess(eventId, user_id);
+    const session = await getVoiceSessionForTicket(access.ticket_id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const normalizedReason = String(reason || "HANGUP").toUpperCase();
+    const outcome = normalizedReason === "NO_ANSWER"
+      ? "NO_ANSWER"
+      : normalizedReason === "ERROR"
+        ? "FAILED"
+        : "ENDED";
+    const endedSession = await finalizeTicketVoiceSession({
+      session,
+      outcome,
+      actorRole: "NEIGHBOR",
+      actorUserId: access.user_id || null,
+      reason: normalizedReason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada segura finalizada",
+      voice_session: voiceSessionForParticipant(endedSession, 'party_a')
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE END ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible finalizar la llamada segura"
     });
   }
 });
@@ -7841,6 +8148,40 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
   }
 });
 
+app.post("/tickets/:id/voice/sessions/:sessionId/end", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para finalizar llamada segura")) return;
+
+    const { id, sessionId } = req.params;
+    const { reason = "HANGUP" } = req.body || {};
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const ended = await finalizeTicketVoiceSession({
+      session,
+      outcome: "ENDED",
+      actorRole: "OPERATOR",
+      actorUserId: req.panel_session?.sub || null,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada finalizada",
+      voice_session: voiceSessionForParticipant(ended, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE END ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible finalizar la llamada"
+    });
+  }
+});
+
 app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/join", async (req, res) => {
   try {
     const { ticketId, sessionId } = req.params;
@@ -7874,6 +8215,162 @@ app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/join", async (re
     res.status(error.statusCode || 500).json({
       status: "error",
       message: error.message || "No fue posible atender la llamada segura"
+    });
+  }
+});
+
+app.get("/resolver/tickets/:ticketId/voice/sessions/:sessionId/status", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id } = req.query || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      voice_session: voiceSessionForParticipant(session, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE STATUS ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible consultar la llamada segura"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/accept", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+    if (String(session.requested_by || "").toUpperCase() !== "NEIGHBOR" ||
+        String(session.target_type || "").toUpperCase() !== "RESOLVER") {
+      return res.status(409).json({ status: "error", message: "Esta sesión no es una llamada entrante del vecino" });
+    }
+    if (isVoiceTerminalStatus(session.status)) {
+      return res.status(409).json({ status: "error", message: "La llamada ya finalizó" });
+    }
+
+    const updated = await pool.query(
+      `
+      UPDATE ticket_voice_sessions
+      SET status = CASE WHEN status = 'CONNECTED' THEN status ELSE 'RINGING' END, updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [session.id]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id, actor_user_id, actor_role, action_type, description, metadata
+      )
+      VALUES ($1,$2,'RESOLVER','VOICE_ACCEPTED','Resolutor aceptó la llamada del vecino',$3)
+      `,
+      [
+        ticketId,
+        resolver_user_id,
+        JSON.stringify({
+          voice_session_id: session.id,
+          wa_center_session_id: session.wa_center_session_id
+        })
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Llamada aceptada",
+      voice_session: voiceSessionForParticipant(
+        sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: false }),
+        'party_b'
+      )
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE ACCEPT ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible aceptar la llamada"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/reject", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id, reason = "REJECTED_BY_RESOLVER" } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+    if (String(session.requested_by || "").toUpperCase() !== "NEIGHBOR" ||
+        String(session.target_type || "").toUpperCase() !== "RESOLVER") {
+      return res.status(409).json({ status: "error", message: "Esta sesión no es una llamada entrante del vecino" });
+    }
+
+    const rejected = await finalizeTicketVoiceSession({
+      session,
+      outcome: "REJECTED",
+      actorRole: "RESOLVER",
+      actorUserId: resolver_user_id,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada rechazada",
+      voice_session: voiceSessionForParticipant(rejected, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE REJECT ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible rechazar la llamada"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/end", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id, reason = "HANGUP" } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const ended = await finalizeTicketVoiceSession({
+      session,
+      outcome: "ENDED",
+      actorRole: "RESOLVER",
+      actorUserId: resolver_user_id,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada finalizada",
+      voice_session: voiceSessionForParticipant(ended, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE END ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible finalizar la llamada"
     });
   }
 });
@@ -7948,7 +8445,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
         SET
           status = $2,
           connected_at = CASE WHEN $3 = 'CONNECTED' THEN COALESCE(connected_at, NOW()) ELSE connected_at END,
-          ended_at = CASE WHEN $3 IN ('ENDED','FAILED','NO_ANSWER','EXPIRED') THEN COALESCE(ended_at, NOW()) ELSE ended_at END,
+          ended_at = CASE WHEN $3 IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED') THEN COALESCE(ended_at, NOW()) ELSE ended_at END,
           duration_seconds = COALESCE($4, duration_seconds),
           failure_reason = COALESCE($5, failure_reason),
           recording_url = COALESCE($6, recording_url),
@@ -7959,7 +8456,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
         [
           session.id,
           normalizedStatus,
-          event,
+          normalizedStatus,
           payload.duration_seconds != null ? Number(payload.duration_seconds) : null,
           payload.failure_reason || null,
           recordingUrl,
