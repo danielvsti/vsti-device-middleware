@@ -3274,7 +3274,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v17-dual-participant-confirmation",
+version: "2.0-v18-bidirectional-ringing",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -4566,7 +4566,7 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
   // - party_a queda reservado para Vecino.
   // - party_b queda reservado para Central/Operador o Resolutor.
   const partyALabel = 'vecino';
-  const partyBLabel = normalizedTargetType === 'RESOLVER'
+  const partyBLabel = normalizedTargetType === 'RESOLVER' || String(requestedBy).toUpperCase() === 'RESOLVER'
     ? 'resolutor'
     : 'central';
 
@@ -8332,7 +8332,7 @@ app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
       req,
       ticket,
       requestedBy: "RESOLVER",
-      targetType: "RESOLVER",
+      targetType: "NEIGHBOR",
       actorUserId: resolver_user_id,
       resolverUserId: resolver_user_id
     });
