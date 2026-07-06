@@ -3274,7 +3274,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v15-neighbor-status",
+version: "2.0-v16-voice-answer-gate",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -4265,7 +4265,45 @@ function scheduleVoiceNoAnswerTimeout(session) {
   const timer = setTimeout(async () => {
     try {
       const latest = await getVoiceSessionForTicket(session.ticket_id, session.id, { includeCredentials: false });
-      if (!latest || isVoiceTerminalStatus(latest.status) || String(latest.status).toUpperCase() === 'CONNECTED') return;
+      if (!latest || isVoiceTerminalStatus(latest.status)) return;
+
+      if (String(latest.status).toUpperCase() === 'CONNECTED') {
+        const confirmation = await pool.query(
+          `
+          SELECT
+            EXISTS (
+              SELECT 1
+              FROM ticket_voice_events
+              WHERE voice_session_id = $1
+                AND event = 'CONNECTED'
+                AND participant_role IS NULL
+            ) AS session_connected,
+            (
+              SELECT COUNT(DISTINCT participant_role)
+              FROM ticket_voice_events
+              WHERE voice_session_id = $1
+                AND event IN ('PARTICIPANT_REGISTERED','CONNECTED')
+                AND participant_role IS NOT NULL
+            )::int AS participant_count,
+            EXISTS (
+              SELECT 1
+              FROM ticket_actions
+              WHERE ticket_id = $2
+                AND action_type = 'VOICE_ACCEPTED'
+                AND metadata->>'voice_session_id' = $1::text
+            ) AS accepted
+          `,
+          [latest.id, latest.ticket_id]
+        );
+        const accepted = String(latest.requested_by || '').toUpperCase() !== 'NEIGHBOR' ||
+          confirmation.rows[0]?.accepted === true;
+        const fullyConnected = accepted && (
+          confirmation.rows[0]?.session_connected === true ||
+          Number(confirmation.rows[0]?.participant_count || 0) >= 2
+        );
+        if (fullyConnected) return;
+      }
+
       await finalizeTicketVoiceSession({
         session: latest,
         outcome: 'NO_ANSWER',
@@ -4279,6 +4317,138 @@ function scheduleVoiceNoAnswerTimeout(session) {
 
   if (typeof timer.unref === 'function') timer.unref();
 }
+
+async function resolveWebhookVoiceStatus(session, normalizedStatus, payload = {}) {
+  const currentStatus = String(session?.status || 'CREATED').toUpperCase();
+  if (isVoiceTerminalStatus(currentStatus)) return currentStatus;
+
+  if (normalizedStatus === 'CONNECTED' &&
+      String(session?.requested_by || '').toUpperCase() === 'NEIGHBOR') {
+    const acceptance = await pool.query(
+      `
+      SELECT 1
+      FROM ticket_actions
+      WHERE ticket_id = $1
+        AND action_type = 'VOICE_ACCEPTED'
+        AND metadata->>'voice_session_id' = $2
+      LIMIT 1
+      `,
+      [session.ticket_id, String(session.id)]
+    );
+
+    // Entrar al bridge no equivale a que Central/Resolutor haya contestado.
+    if (acceptance.rows.length === 0) return 'RINGING';
+  }
+
+  const participantRole = payload.participant_role || null;
+  if (participantRole && ['WAITING', 'CONNECTED'].includes(normalizedStatus)) {
+    const participants = await pool.query(
+      `
+      SELECT COUNT(DISTINCT participant_role)::int AS participant_count
+      FROM ticket_voice_events
+      WHERE voice_session_id = $1
+        AND event IN ('PARTICIPANT_REGISTERED','CONNECTED')
+        AND participant_role IS NOT NULL
+      `,
+      [session.id]
+    );
+
+    // Un solo anexo dentro del bridge sigue siendo una llamada sonando.
+    if (Number(participants.rows[0]?.participant_count || 0) < 2) return 'RINGING';
+    return 'CONNECTED';
+  }
+
+  // Los webhooks pueden llegar fuera de orden; nunca retroceder desde CONNECTED.
+  if (currentStatus === 'CONNECTED' && ['CREATED', 'WAITING', 'RINGING'].includes(normalizedStatus)) {
+    return 'CONNECTED';
+  }
+
+  return normalizedStatus;
+}
+
+let voiceMaintenanceStarted = false;
+
+function startVoiceSessionMaintenance() {
+  if (voiceMaintenanceStarted) return;
+  voiceMaintenanceStarted = true;
+
+  const sweep = async () => {
+    try {
+      await ensureVoiceSchema();
+      const stale = await pool.query(
+        `
+        SELECT tvs.*
+        FROM ticket_voice_sessions tvs
+        WHERE tvs.status NOT IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED')
+          AND (
+            (
+              tvs.status <> 'CONNECTED'
+              AND tvs.created_at < NOW() - INTERVAL '45 seconds'
+            )
+            OR (
+              tvs.status = 'CONNECTED'
+              AND tvs.created_at < NOW() - INTERVAL '45 seconds'
+              AND (
+                (
+                  tvs.requested_by = 'NEIGHBOR'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM ticket_actions ta
+                    WHERE ta.ticket_id = tvs.ticket_id
+                      AND ta.action_type = 'VOICE_ACCEPTED'
+                      AND ta.metadata->>'voice_session_id' = tvs.id::text
+                  )
+                )
+                OR (
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM ticket_voice_events tve
+                    WHERE tve.voice_session_id = tvs.id
+                      AND tve.event = 'CONNECTED'
+                      AND tve.participant_role IS NULL
+                  )
+                  AND (
+                    SELECT COUNT(DISTINCT tve.participant_role)
+                    FROM ticket_voice_events tve
+                    WHERE tve.voice_session_id = tvs.id
+                      AND tve.event IN ('PARTICIPANT_REGISTERED','CONNECTED')
+                      AND tve.participant_role IS NOT NULL
+                  ) < 2
+                )
+              )
+            )
+            OR (
+              tvs.status = 'CONNECTED'
+              AND tvs.updated_at < NOW() - INTERVAL '20 minutes'
+            )
+          )
+        ORDER BY tvs.created_at ASC
+        LIMIT 50
+        `
+      );
+
+      for (const row of stale.rows) {
+        await finalizeTicketVoiceSession({
+          session: sanitizeVoiceSessionRow(row, { includeCredentials: false }),
+          outcome: String(row.status).toUpperCase() === 'CONNECTED' ? 'ENDED' : 'NO_ANSWER',
+          actorRole: 'SYSTEM',
+          reason: 'VOICE_SESSION_MAINTENANCE'
+        }).catch((error) => {
+          console.error('[VOICE SESSION MAINTENANCE FINALIZE ERROR]', error);
+        });
+      }
+    } catch (error) {
+      console.error('[VOICE SESSION MAINTENANCE ERROR]', error);
+    }
+  };
+
+  const initial = setTimeout(sweep, 5_000);
+  const interval = setInterval(sweep, 30_000);
+  if (typeof initial.unref === 'function') initial.unref();
+  if (typeof interval.unref === 'function') interval.unref();
+}
+
+startVoiceSessionMaintenance();
 
 async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, actorUserId = null, resolverUserId = null }) {
   await ensureVoiceSchema();
@@ -5332,6 +5502,8 @@ function buildNeighborProgress(event) {
   return {
     ticket_id: event.ticket_id || null,
     ticket_state: state,
+    alert_type: event.ticket_alert_type || event.alert_type || null,
+    ticket_alert_type: event.ticket_alert_type || null,
     report_count: reportCount,
     is_primary_report: isPrimaryReport,
     headline,
@@ -5406,6 +5578,7 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
     }
 
     const event = result.rows[0];
+    event.alert_type = event.ticket_alert_type || event.alert_type || null;
     const terminalTicketStates = ["RESOLVED", "CLOSED", "CANCELLED"];
     const effectiveState = terminalTicketStates.includes(event.ticket_state)
       ? event.ticket_state
@@ -5563,6 +5736,7 @@ app.get("/public/mobile/active", async (req, res) => {
     }
 
     const event = result.rows[0];
+    event.alert_type = event.ticket_alert_type || event.alert_type || null;
     const terminalTicketStates = ["RESOLVED", "CLOSED", "CANCELLED"];
     const effectiveState = terminalTicketStates.includes(event.ticket_state)
       ? event.ticket_state
@@ -8134,6 +8308,43 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
       });
     }
 
+    if (String(session.requested_by || "").toUpperCase() === "NEIGHBOR") {
+      await pool.query(
+        `
+        UPDATE ticket_voice_sessions
+        SET status = CASE WHEN status = 'CONNECTED' THEN status ELSE 'RINGING' END,
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [session.id]
+      );
+
+      await pool.query(
+        `
+        INSERT INTO ticket_actions (
+          ticket_id, actor_user_id, actor_role, action_type, description, metadata
+        )
+        SELECT $1,$2,'OPERATOR','VOICE_ACCEPTED','Central aceptó la llamada del vecino',$3
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM ticket_actions
+          WHERE ticket_id = $1
+            AND action_type = 'VOICE_ACCEPTED'
+            AND metadata->>'voice_session_id' = $4
+        )
+        `,
+        [
+          id,
+          req.panel_session?.sub || null,
+          JSON.stringify({
+            voice_session_id: session.id,
+            wa_center_session_id: session.wa_center_session_id
+          }),
+          String(session.id)
+        ]
+      );
+    }
+
     res.json({
       status: "ok",
       message: "Credenciales de llamada segura entregadas",
@@ -8276,7 +8487,14 @@ app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/accept", async (
       INSERT INTO ticket_actions (
         ticket_id, actor_user_id, actor_role, action_type, description, metadata
       )
-      VALUES ($1,$2,'RESOLVER','VOICE_ACCEPTED','Resolutor aceptó la llamada del vecino',$3)
+      SELECT $1,$2,'RESOLVER','VOICE_ACCEPTED','Resolutor aceptó la llamada del vecino',$3
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM ticket_actions
+        WHERE ticket_id = $1
+          AND action_type = 'VOICE_ACCEPTED'
+          AND metadata->>'voice_session_id' = $4
+      )
       `,
       [
         ticketId,
@@ -8284,7 +8502,8 @@ app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/accept", async (
         JSON.stringify({
           voice_session_id: session.id,
           wa_center_session_id: session.wa_center_session_id
-        })
+        }),
+        String(session.id)
       ]
     );
 
@@ -8436,6 +8655,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
     );
 
     if (session) {
+      const effectiveStatus = await resolveWebhookVoiceStatus(session, normalizedStatus, payload);
       const recordingUrl = payload.recording_url || payload.recording?.url || null;
       const recordingId = payload.recording_id || payload.recording?.id || null;
 
@@ -8455,8 +8675,8 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
         `,
         [
           session.id,
-          normalizedStatus,
-          normalizedStatus,
+          effectiveStatus,
+          effectiveStatus,
           payload.duration_seconds != null ? Number(payload.duration_seconds) : null,
           payload.failure_reason || null,
           recordingUrl,
