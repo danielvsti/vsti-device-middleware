@@ -3274,7 +3274,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v18-bidirectional-ringing",
+version: "2.0-v19-central-voice-lifecycle",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -8397,6 +8397,29 @@ app.get("/tickets/:id/voice/sessions", async (req, res) => {
   }
 });
 
+app.get("/tickets/:id/voice/sessions/:sessionId/status", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para consultar llamada segura")) return;
+    const { id, sessionId } = req.params;
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      voice_session: voiceSessionForParticipant(session, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE STATUS ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible consultar la llamada segura"
+    });
+  }
+});
+
 app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
   try {
     if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para atender llamada segura")) return;
@@ -8466,6 +8489,68 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
   }
 });
 
+app.post("/tickets/:id/voice/sessions/:sessionId/connected", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para confirmar llamada segura")) return;
+    const { id, sessionId } = req.params;
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const updated = await registerVoiceParticipantConnected(session, 'OPERATOR');
+    res.json({
+      status: "ok",
+      message: "Entrada de Central al canal confirmada",
+      voice_session: voiceSessionForParticipant(updated, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE CONNECTED ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible confirmar la conexión de Central"
+    });
+  }
+});
+
+app.post("/tickets/:id/voice/sessions/:sessionId/reject", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para rechazar llamada segura")) return;
+    const { id, sessionId } = req.params;
+    const { reason = "REJECTED_BY_OPERATOR" } = req.body || {};
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+    if (String(session.requested_by || "").toUpperCase() !== "NEIGHBOR" ||
+        String(session.target_type || "").toUpperCase() !== "CENTRAL") {
+      return res.status(409).json({ status: "error", message: "Esta sesión no es una llamada entrante para Central" });
+    }
+
+    const rejected = await finalizeTicketVoiceSession({
+      session,
+      outcome: "REJECTED",
+      actorRole: "OPERATOR",
+      actorUserId: req.panel_session?.sub || null,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada rechazada",
+      voice_session: voiceSessionForParticipant(rejected, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE REJECT ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible rechazar la llamada"
+    });
+  }
+});
+
 app.post("/tickets/:id/voice/sessions/:sessionId/end", async (req, res) => {
   try {
     if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para finalizar llamada segura")) return;
@@ -8478,9 +8563,16 @@ app.post("/tickets/:id/voice/sessions/:sessionId/end", async (req, res) => {
       return res.status(404).json({ status: "error", message: "Voice session not found" });
     }
 
+    const normalizedReason = String(reason || "HANGUP").toUpperCase();
+    const outcome = normalizedReason === "NO_ANSWER"
+      ? "NO_ANSWER"
+      : ["REGISTRATION_FAILED", "WEBRTC_DISCONNECTED", "WEBRTC_FAILED", "REQUEST_FAILED", "ANSWER_FAILED", "ERROR"]
+          .some((value) => normalizedReason.includes(value))
+        ? "FAILED"
+        : "ENDED";
     const ended = await finalizeTicketVoiceSession({
       session,
-      outcome: "ENDED",
+      outcome,
       actorRole: "OPERATOR",
       actorUserId: req.panel_session?.sub || null,
       reason
