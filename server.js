@@ -3274,7 +3274,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v16-voice-answer-gate",
+version: "2.0-v17-dual-participant-confirmation",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -3947,7 +3947,9 @@ function sanitizeVoiceSessionRow(row, options = {}) {
     if (!value || typeof value !== 'object') return value || null;
     if (includeCredentials) return value;
     const copy = { ...value };
-    if (copy.password) copy.password = '***';
+    delete copy.password;
+    delete copy.ha1;
+    delete copy.password_hash;
     return copy;
   };
 
@@ -4364,6 +4366,85 @@ async function resolveWebhookVoiceStatus(session, normalizedStatus, payload = {}
   }
 
   return normalizedStatus;
+}
+
+async function registerVoiceParticipantConnected(session, participantRole) {
+  const role = String(participantRole || '').toUpperCase();
+  if (!session?.id || !['NEIGHBOR', 'RESOLVER', 'OPERATOR'].includes(role)) {
+    const err = new Error('Invalid voice participant');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (isVoiceTerminalStatus(session.status)) return session;
+
+  await pool.query(
+    `
+    INSERT INTO ticket_voice_events (
+      voice_session_id,
+      ticket_id,
+      wa_center_session_id,
+      external_reference,
+      event,
+      participant_role,
+      payload
+    )
+    SELECT $1,$2,$3,$4,'CONNECTED',$5,$6
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM ticket_voice_events
+      WHERE voice_session_id = $1
+        AND event = 'CONNECTED'
+        AND participant_role = $5
+    )
+    `,
+    [
+      session.id,
+      session.ticket_id,
+      session.wa_center_session_id,
+      session.external_reference,
+      role,
+      JSON.stringify({ source: 'client_bridge_confirmation', participant_role: role })
+    ]
+  );
+
+  const confirmation = await pool.query(
+    `
+    SELECT
+      (
+        SELECT COUNT(DISTINCT participant_role)
+        FROM ticket_voice_events
+        WHERE voice_session_id = $1
+          AND event = 'CONNECTED'
+          AND participant_role IS NOT NULL
+      )::int AS participant_count,
+      EXISTS (
+        SELECT 1
+        FROM ticket_actions
+        WHERE ticket_id = $2
+          AND action_type = 'VOICE_ACCEPTED'
+          AND metadata->>'voice_session_id' = $1::text
+      ) AS accepted
+    `,
+    [session.id, session.ticket_id]
+  );
+
+  const accepted = String(session.requested_by || '').toUpperCase() !== 'NEIGHBOR' ||
+    confirmation.rows[0]?.accepted === true;
+  const connected = accepted && Number(confirmation.rows[0]?.participant_count || 0) >= 2;
+  const updated = await pool.query(
+    `
+    UPDATE ticket_voice_sessions
+    SET status = CASE WHEN $2 THEN 'CONNECTED' ELSE 'RINGING' END,
+        connected_at = CASE WHEN $2 THEN COALESCE(connected_at, NOW()) ELSE connected_at END,
+        updated_at = NOW()
+    WHERE id = $1
+      AND status NOT IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED')
+    RETURNING *
+    `,
+    [session.id, connected]
+  );
+
+  return sanitizeVoiceSessionRow(updated.rows[0] || session, { includeCredentials: false });
 }
 
 let voiceMaintenanceStarted = false;
@@ -8164,6 +8245,32 @@ app.get("/public/mobile/events/:eventId/voice/sessions/:sessionId/status", async
   }
 });
 
+app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/connected", async (req, res) => {
+  try {
+    const { eventId, sessionId } = req.params;
+    const { user_id = null } = req.body || {};
+    const access = await getMobileVoiceAccess(eventId, user_id);
+    const session = await getVoiceSessionForTicket(access.ticket_id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const updated = await registerVoiceParticipantConnected(session, 'NEIGHBOR');
+    res.json({
+      status: "ok",
+      message: "Entrada del vecino al canal confirmada",
+      voice_session: voiceSessionForParticipant(updated, 'party_a')
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE CONNECTED ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible confirmar la conexión del vecino"
+    });
+  }
+});
+
 app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/end", async (req, res) => {
   try {
     const { eventId, sessionId } = req.params;
@@ -8450,6 +8557,32 @@ app.get("/resolver/tickets/:ticketId/voice/sessions/:sessionId/status", async (r
     res.status(error.statusCode || 500).json({
       status: "error",
       message: error.message || "No fue posible consultar la llamada segura"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/connected", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const updated = await registerVoiceParticipantConnected(session, 'RESOLVER');
+    res.json({
+      status: "ok",
+      message: "Entrada del resolutor al canal confirmada",
+      voice_session: voiceSessionForParticipant(updated, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE CONNECTED ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible confirmar la conexión del resolutor"
     });
   }
 });
