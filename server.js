@@ -3925,8 +3925,8 @@ function voiceEventDescription(event, payload = {}) {
   const normalized = String(event || '').toUpperCase();
   const role = payload.participant_role ? ` (${payload.participant_role})` : '';
   const descriptions = {
-    SESSION_CREATED: 'WA-Center creó la sesión de llamada segura',
-    PARTICIPANT_REGISTERED: `Participante registrado en llamada segura${role}`,
+    SESSION_CREATED: 'Se preparó la llamada segura',
+    PARTICIPANT_REGISTERED: `Participante disponible en la llamada segura${role}`,
     RINGING: `Llamada segura sonando${role}`,
     CONNECTED: 'Llamada segura conectada',
     PARTICIPANT_DISCONNECTED: `Participante desconectado de llamada segura${role}`,
@@ -3937,7 +3937,7 @@ function voiceEventDescription(event, payload = {}) {
     EXPIRED: 'Sesión de llamada segura expirada',
     RECORDING_AVAILABLE: 'Grabación de llamada segura disponible'
   };
-  return descriptions[normalized] || `Evento técnico de llamada segura: ${normalized || 'UPDATED'}`;
+  return descriptions[normalized] || `Actualización de llamada segura: ${normalized || 'UPDATED'}`;
 }
 
 function sanitizeVoiceSessionRow(row, options = {}) {
@@ -3997,6 +3997,14 @@ function voiceParticipantForRequester({ requestedBy, targetType }) {
   const requester = String(requestedBy || '').toUpperCase();
   if (requester === 'NEIGHBOR') return 'party_a';
   return 'party_b';
+}
+
+function operatorCanHandleVoiceSession(session, ticket = null) {
+  if (!session) return false;
+  const requestedBy = String(session.requested_by || '').toUpperCase();
+  const targetType = String(session.target_type || '').toUpperCase();
+  const hasResolver = Boolean(ticket?.assigned_resolver_id || ticket?.resolver_id);
+  return requestedBy === 'NEIGHBOR' && (targetType === 'CENTRAL' || (!hasResolver && targetType !== 'RESOLVER'));
 }
 
 async function getVoiceSessionForTicket(ticketId, sessionId = 'latest', options = {}) {
@@ -4071,13 +4079,13 @@ async function fetchTicketVoiceContext(ticketId) {
 
 async function callWaCenterCreateVoiceSession(payload) {
   if (!WA_CENTER_VOICE_ENABLED) {
-    const err = new Error('WA-Center Voice no está habilitado en este ambiente.');
+    const err = new Error('El servicio de llamadas no está habilitado en este ambiente.');
     err.code = 'WA_CENTER_VOICE_DISABLED';
     throw err;
   }
 
   if (!WA_CENTER_BASE_URL || !WA_CENTER_API_TOKEN) {
-    const err = new Error('WA-Center Voice no está configurado.');
+    const err = new Error('El servicio de llamadas no está configurado.');
     err.code = 'WA_CENTER_VOICE_NOT_CONFIGURED';
     throw err;
   }
@@ -4096,7 +4104,7 @@ async function callWaCenterCreateVoiceSession(payload) {
   try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
 
   if (!response.ok || data?.ok === false) {
-    const err = new Error(data?.message || data?.error || `WA-Center HTTP ${response.status}`);
+    const err = new Error(data?.message || data?.error || `Servicio de llamadas HTTP ${response.status}`);
     err.code = 'WA_CENTER_CREATE_FAILED';
     err.status = response.status;
     err.response = data;
@@ -4115,20 +4123,20 @@ function isVoiceTerminalStatus(status) {
 
 async function callWaCenterVoiceAction(session, action) {
   if (!WA_CENTER_VOICE_ENABLED) {
-    const err = new Error('WA-Center Voice no está habilitado en este ambiente.');
+    const err = new Error('El servicio de llamadas no está habilitado en este ambiente.');
     err.code = 'WA_CENTER_VOICE_DISABLED';
     throw err;
   }
 
   if (!WA_CENTER_BASE_URL || !WA_CENTER_API_TOKEN) {
-    const err = new Error('WA-Center Voice no está configurado.');
+    const err = new Error('El servicio de llamadas no está configurado.');
     err.code = 'WA_CENTER_VOICE_NOT_CONFIGURED';
     throw err;
   }
 
   const waSessionId = session?.wa_center_session_id;
   if (!waSessionId) {
-    const err = new Error('La sesión no tiene identificador WA-Center.');
+    const err = new Error('La llamada no está disponible para finalizar.');
     err.code = 'WA_CENTER_SESSION_ID_MISSING';
     throw err;
   }
@@ -4150,9 +4158,9 @@ async function callWaCenterVoiceAction(session, action) {
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
 
-  // Una sesión que WA-Center ya cerró cumple el objetivo de una limpieza idempotente.
+  // Una sesión que el proveedor ya cerró cumple el objetivo de una limpieza idempotente.
   if (!response.ok && ![404, 409, 410].includes(response.status)) {
-    const err = new Error(data?.message || data?.error || `WA-Center HTTP ${response.status}`);
+    const err = new Error(data?.message || data?.error || `Servicio de llamadas HTTP ${response.status}`);
     err.code = 'WA_CENTER_FINALIZE_FAILED';
     err.status = response.status;
     err.response = data;
@@ -4560,9 +4568,9 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
   const externalReference = `sos-ticket-${ticket.id}`;
   const normalizedTargetType = String(targetType || '').toUpperCase();
 
-  // Contrato WA-Center v0.8:
+  // Contrato del proveedor de voz:
   // - SOS conserva toda la lógica del caso/ticket.
-  // - WA-Center solo ve una referencia externa y participantes genéricos.
+  // - El proveedor solo ve una referencia externa y participantes genéricos.
   // - party_a queda reservado para Vecino.
   // - party_b queda reservado para Central/Operador o Resolutor.
   const partyALabel = 'vecino';
@@ -4711,7 +4719,7 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
         ticket.id,
         actorUserId,
         requestedBy,
-        'No fue posible crear la llamada segura en WA-Center',
+        'No fue posible crear la llamada segura',
         JSON.stringify({
           channel: 'voice',
           provider: 'wa_center',
@@ -8431,6 +8439,7 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
       return res.status(404).json({ status: "error", message: "Voice session not found" });
     }
 
+    const ticket = await fetchTicketVoiceContext(id);
     if (String(session.target_type || "").toUpperCase() === "RESOLVER") {
       return res.status(409).json({
         status: "error",
@@ -8438,7 +8447,7 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
       });
     }
 
-    if (String(session.requested_by || "").toUpperCase() === "NEIGHBOR") {
+    if (operatorCanHandleVoiceSession(session, ticket)) {
       await pool.query(
         `
         UPDATE ticket_voice_sessions
@@ -8524,8 +8533,8 @@ app.post("/tickets/:id/voice/sessions/:sessionId/reject", async (req, res) => {
     if (!session) {
       return res.status(404).json({ status: "error", message: "Voice session not found" });
     }
-    if (String(session.requested_by || "").toUpperCase() !== "NEIGHBOR" ||
-        String(session.target_type || "").toUpperCase() !== "CENTRAL") {
+    const ticket = await fetchTicketVoiceContext(id);
+    if (!operatorCanHandleVoiceSession(session, ticket)) {
       return res.status(409).json({ status: "error", message: "Esta sesión no es una llamada entrante para Central" });
     }
 
@@ -8825,7 +8834,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
       const provided = req.headers["x-wa-center-webhook-secret"] ||
         String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
       if (provided !== WA_CENTER_WEBHOOK_SECRET) {
-        return res.status(401).json({ status: "error", message: "Invalid WA-Center webhook secret" });
+        return res.status(401).json({ status: "error", message: "Invalid voice webhook secret" });
       }
     }
 
