@@ -3274,7 +3274,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v19-central-voice-lifecycle",
+version: "2.0-v20-central-operator-call-flow",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
