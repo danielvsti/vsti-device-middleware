@@ -637,6 +637,7 @@ function allowedRolesForPanel(panelType) {
 */
 
 let geofenceSchemaReady = false;
+let neighborProvisioningSchemaReady = false;
 
 async function ensureGeofenceSchema() {
   if (geofenceSchemaReady) return;
@@ -672,6 +673,23 @@ async function ensureGeofenceSchema() {
   `);
 
   geofenceSchemaReady = true;
+}
+
+async function ensureNeighborProvisioningSchema() {
+  if (neighborProvisioningSchemaReady) return;
+
+  await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS provisional_expires_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_users_neighbor_validation_review
+    ON users(control_center_id, validation_status, provisional_expires_at)
+    WHERE role = 'NEIGHBOR'
+  `);
+
+  neighborProvisioningSchemaReady = true;
 }
 
 function normalizeGeoJsonGeometry(input) {
@@ -816,6 +834,98 @@ function evaluateJurisdiction(controlCenter, latitude, longitude) {
     reason: `Evento fuera del territorio autorizado del centro de control${distance != null ? ` (${Math.round(distance)} m del límite)` : ''}`,
     distance_meters: distance == null ? null : Math.round(distance)
   };
+}
+
+async function resolveControlCenterForNeighborRegistration(latitude, longitude) {
+  await ensureGeofenceSchema();
+
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    const error = new Error("Para registrarte necesitamos obtener tu ubicación GPS.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const ccResult = await pool.query(`
+    SELECT id, code, name, latitude, longitude, boundary_geojson, geofence_buffer_meters
+    FROM control_centers
+    ORDER BY code
+  `);
+
+  const centers = ccResult.rows || [];
+  const geofencedCenters = centers.filter((center) => normalizeGeoJsonGeometry(center.boundary_geojson));
+  const matches = [];
+
+  for (const center of geofencedCenters) {
+    const jurisdiction = evaluateJurisdiction(center, lat, lon);
+    if (jurisdiction.valid && jurisdiction.status !== 'NO_GEOFENCE_CONFIGURED') {
+      matches.push({ controlCenter: center, jurisdiction });
+    }
+  }
+
+  if (matches.length) {
+    matches.sort((a, b) => {
+      const aDistance = a.jurisdiction.distance_meters ?? 0;
+      const bDistance = b.jurisdiction.distance_meters ?? 0;
+      const aExact = a.jurisdiction.status === 'IN_JURISDICTION' ? 0 : 1;
+      const bExact = b.jurisdiction.status === 'IN_JURISDICTION' ? 0 : 1;
+      return aExact - bExact || aDistance - bDistance || String(a.controlCenter.code).localeCompare(String(b.controlCenter.code));
+    });
+    return matches[0];
+  }
+
+  if (geofencedCenters.length) {
+    const candidates = geofencedCenters
+      .map((center) => {
+        const distance = minDistanceToGeoJsonMeters(lon, lat, center.boundary_geojson);
+        return {
+          controlCenter: center,
+          distance_meters: distance == null ? null : Math.round(distance)
+        };
+      })
+      .filter((item) => item.distance_meters != null)
+      .sort((a, b) => a.distance_meters - b.distance_meters);
+
+    const nearest = candidates[0];
+    const error = new Error(
+      nearest
+        ? `Tu ubicación GPS no corresponde a una zona cubierta por un Centro de Control. Centro más cercano: ${nearest.controlCenter.name || nearest.controlCenter.code}, a ${nearest.distance_meters} m del límite.`
+        : "Tu ubicación GPS no corresponde a una zona cubierta por un Centro de Control."
+    );
+    error.statusCode = 422;
+    error.details = nearest ? {
+      nearest_control_center_code: nearest.controlCenter.code,
+      nearest_control_center_name: nearest.controlCenter.name,
+      distance_meters: nearest.distance_meters
+    } : null;
+    throw error;
+  }
+
+  const coordinateCandidates = centers
+    .filter((center) => Number.isFinite(Number(center.latitude)) && Number.isFinite(Number(center.longitude)))
+    .map((center) => ({
+      controlCenter: center,
+      distance_meters: Math.round(distanceMeters(lat, lon, Number(center.latitude), Number(center.longitude)))
+    }))
+    .sort((a, b) => a.distance_meters - b.distance_meters);
+
+  if (coordinateCandidates.length) {
+    const nearest = coordinateCandidates[0];
+    return {
+      controlCenter: nearest.controlCenter,
+      jurisdiction: {
+        valid: true,
+        status: 'NEAREST_CONTROL_CENTER',
+        reason: `Centro de control más cercano por GPS (${nearest.distance_meters} m)`,
+        distance_meters: nearest.distance_meters
+      }
+    };
+  }
+
+  const error = new Error("No hay Centros de Control configurados para asignar el registro.");
+  error.statusCode = 500;
+  throw error;
 }
 
 app.get('/admin/control-centers/:code/geofence', async (req, res) => {
@@ -3202,6 +3312,7 @@ function publicUserPayload(user, controlCenter = null) {
     control_center_name: user.control_center_name || controlCenter?.name || null,
     role: user.role,
     validation_status: user.validation_status,
+    provisional_expires_at: user.provisional_expires_at || null,
     is_active: user.is_active === true,
     full_name: user.full_name,
     phone: user.phone,
@@ -3236,6 +3347,16 @@ function canNeighborUseSos(user) {
       ok: false,
       reason: `El usuario no está habilitado para generar SOS (${user.validation_status})`
     };
+  }
+
+  if (user.validation_status === "PROVISIONAL_ACTIVE" && user.provisional_expires_at) {
+    const expiresAt = new Date(user.provisional_expires_at).getTime();
+    if (Number.isFinite(expiresAt) && expiresAt < Date.now()) {
+      return {
+        ok: false,
+        reason: "El registro provisional expiró. Debe ser validado por la municipalidad."
+      };
+    }
   }
 
   return { ok: true };
@@ -4860,6 +4981,8 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    await ensureNeighborProvisioningSchema();
+
     const userResult = await pool.query(
       `
       SELECT
@@ -4867,6 +4990,7 @@ app.post("/public/mobile/sos", async (req, res) => {
         u.control_center_id,
         u.role,
         u.validation_status,
+        u.provisional_expires_at,
         u.is_active,
         u.full_name,
         u.phone,
@@ -6057,13 +6181,6 @@ app.post("/auth/register", async (req, res) => {
       otp_channel
     } = req.body;
 
-    if (!control_center_code) {
-      return res.status(400).json({
-        status: "error",
-        message: "control_center_code is required"
-      });
-    }
-
     if (!full_name || !phone || !declared_address) {
       return res.status(400).json({
         status: "error",
@@ -6071,24 +6188,12 @@ app.post("/auth/register", async (req, res) => {
       });
     }
 
-    const ccResult = await pool.query(
-      `
-      SELECT id, code, name
-      FROM control_centers
-      WHERE code = $1
-      `,
-      [control_center_code]
-    );
-
-    if (ccResult.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Unknown control_center_code"
-      });
-    }
-
-    const controlCenter = ccResult.rows[0];
+    await ensureNeighborProvisioningSchema();
+    const resolvedControlCenter = await resolveControlCenterForNeighborRegistration(latitude, longitude);
+    const controlCenter = resolvedControlCenter.controlCenter;
+    const registrationJurisdiction = resolvedControlCenter.jurisdiction;
     const cleanPhone = normalizePhoneForAuth(phone);
+    const provisionalExpiresAtSql = "NOW() + INTERVAL '7 days'";
 
     const existingResult = await pool.query(
       `
@@ -6127,6 +6232,10 @@ app.post("/auth/register", async (req, res) => {
           latitude = $6,
           longitude = $7,
           validation_status = COALESCE(validation_status, 'PROVISIONAL_ACTIVE'),
+          provisional_expires_at = CASE
+            WHEN validation_status = 'VALIDATED' THEN provisional_expires_at
+            ELSE ${provisionalExpiresAtSql}
+          END,
           is_active = true,
           updated_at = NOW()
         WHERE id = $8
@@ -6159,13 +6268,15 @@ app.post("/auth/register", async (req, res) => {
           email,
           declared_address,
           latitude,
-          longitude
+          longitude,
+          provisional_expires_at
         )
         VALUES (
           $1,
           'NEIGHBOR',
           'PROVISIONAL_ACTIVE',
-          $2,$3,$4,$5,$6,$7,$8
+          $2,$3,$4,$5,$6,$7,$8,
+          ${provisionalExpiresAtSql}
         )
         RETURNING *
         `,
@@ -6228,7 +6339,12 @@ app.post("/auth/register", async (req, res) => {
       metadata: {
         user_id: user.id,
         operation,
-        control_center_code: controlCenter.code
+        control_center_code: controlCenter.code,
+        requested_control_center_code: control_center_code || null,
+        assignment_source: "GPS_GEOFENCE",
+        assignment_status: registrationJurisdiction.status,
+        assignment_reason: registrationJurisdiction.reason,
+        assignment_distance_meters: registrationJurisdiction.distance_meters ?? null
       }
     });
 
@@ -6242,13 +6358,21 @@ app.post("/auth/register", async (req, res) => {
       otp_channel: otp.channel,
       otp_expires_minutes: otp.expires_minutes,
       ...(otp.demo_code ? { demo_code: otp.demo_code } : {}),
+      assignment: {
+        source: "GPS_GEOFENCE",
+        control_center_code: controlCenter.code,
+        control_center_name: controlCenter.name,
+        status: registrationJurisdiction.status,
+        reason: registrationJurisdiction.reason,
+        distance_meters: registrationJurisdiction.distance_meters ?? null
+      },
       user: publicUserPayload(user, controlCenter)
     });
 
   } catch (error) {
     console.error("[AUTH REGISTER ERROR]", error);
 
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       status: "error",
       message: error.message || "Database error registering user"
     });
