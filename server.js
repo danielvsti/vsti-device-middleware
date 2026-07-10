@@ -159,6 +159,21 @@ function getRemoteIp(req) {
 */
 
 let controlCenterSettingsSchemaReady = false;
+let emergencyCategoryCatalogSchemaReady = false;
+
+const DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES = Object.freeze([
+  { type: 'SOS_MANUAL', title: 'SOS General', icon: '🚨', color: '#dc2626', priority: 1, enabled: true, order: 10, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'MEDICAL', title: 'Médica', icon: '🚑', color: '#16a34a', priority: 1, enabled: true, order: 20, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'FIRE', title: 'Incendio', icon: '🔥', color: '#f97316', priority: 1, enabled: true, order: 30, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
+  { type: 'SECURITY', title: 'Seguridad', icon: '👮', color: '#7c3aed', priority: 2, enabled: true, order: 40, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: true },
+  { type: 'VIF', title: 'VIF', icon: '🏠', color: '#8b5cf6', priority: 1, enabled: true, order: 50, sensitive: true, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'TRAFFIC_ACCIDENT', title: 'Accidente', icon: '🚗', color: '#2563eb', priority: 2, enabled: true, order: 60, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'URBAN_RISK', title: 'Riesgo', icon: '⚠️', color: '#eab308', priority: 3, enabled: true, order: 70, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'OTHER', title: 'Otro', icon: '📝', color: '#64748b', priority: 3, enabled: true, order: 80, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false }
+]);
+
+let emergencyCategoryCatalogCache = DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES.map(category => ({ ...category }));
+const AUTOMATIC_MOBILE_ALERT_TYPES = new Set(['VIF_SILENT_SHAKE', 'FALL_DETECTED']);
 
 const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
   features: {
@@ -201,6 +216,9 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     auto_assignment_enabled: true,
     max_location_age_seconds: 180,
     max_active_tickets: 1
+  },
+  neighbor_app: {
+    emergency_categories: DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES
   }
 });
 
@@ -241,6 +259,204 @@ function clampPolicyNumber(value, fallback, min, max) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function currentEmergencyCategoryCatalog() {
+  return Array.isArray(emergencyCategoryCatalogCache) && emergencyCategoryCatalogCache.length
+    ? emergencyCategoryCatalogCache
+    : DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES;
+}
+
+function normalizeEmergencyCategoryCatalogItem(raw = {}, fallback = {}) {
+  const type = String(raw.type || raw.category_type || fallback.type || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 48);
+  const title = String(raw.title || raw.label || fallback.title || type || 'Categoría').trim().slice(0, 48);
+  const icon = String(raw.icon || fallback.icon || '🆘').trim().slice(0, 12);
+  const color = String(raw.color || fallback.color || '#2563eb').trim().slice(0, 24);
+
+  return {
+    type,
+    title: title || type,
+    icon: icon || '🆘',
+    color,
+    priority: clampPolicyNumber(raw.priority, fallback.priority || 3, 1, 5),
+    enabled: normalizePolicyBoolean(raw.enabled, fallback.enabled !== false),
+    order: clampPolicyNumber(raw.order ?? raw.display_order, fallback.order || 100, 1, 9999),
+    sensitive: normalizePolicyBoolean(raw.sensitive, fallback.sensitive === true),
+    allow_voice: normalizePolicyBoolean(raw.allow_voice, fallback.allow_voice !== false),
+    allow_evidence: normalizePolicyBoolean(raw.allow_evidence, fallback.allow_evidence !== false),
+    allow_nearby_notifications: normalizePolicyBoolean(raw.allow_nearby_notifications, fallback.allow_nearby_notifications === true),
+    allow_sirens: normalizePolicyBoolean(raw.allow_sirens, fallback.allow_sirens === true)
+  };
+}
+
+function normalizeEmergencyCategoryCatalog(input = []) {
+  const byType = new Map(DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES.map(category => [category.type, { ...category }]));
+  const source = Array.isArray(input) ? input : [];
+
+  for (const raw of source) {
+    if (!isPlainObject(raw)) continue;
+    const fallbackType = String(raw.type || raw.category_type || '').trim().toUpperCase();
+    const fallback = byType.get(fallbackType) || {};
+    const item = normalizeEmergencyCategoryCatalogItem(raw, fallback);
+    if (!item.type) continue;
+    byType.set(item.type, item);
+  }
+
+  return Array.from(byType.values()).sort((a, b) => {
+    if (a.order !== b.order) return a.order - b.order;
+    return a.title.localeCompare(b.title, 'es');
+  });
+}
+
+function normalizeNeighborEmergencyCategories(input = [], catalog = currentEmergencyCategoryCatalog()) {
+  const availableCatalog = normalizeEmergencyCategoryCatalog(catalog).filter(category => category.enabled !== false);
+  const byType = new Map(availableCatalog.map(category => [category.type, {
+    type: category.type,
+    title: category.title,
+    icon: category.icon,
+    color: category.color,
+    priority: category.priority,
+    enabled: category.enabled !== false,
+    order: category.order,
+    title_override: null
+  }]));
+  const source = Array.isArray(input) ? input : [];
+
+  for (const [index, raw] of source.entries()) {
+    if (!isPlainObject(raw)) continue;
+    const type = String(raw.type || raw.alert_type || raw.code || '').trim().toUpperCase();
+    if (!byType.has(type)) continue;
+
+    const fallback = byType.get(type);
+    const titleOverride = String(raw.title_override || raw.alias || '').trim().slice(0, 48) || null;
+    const title = String(raw.title || raw.label || titleOverride || fallback.title || type).trim().slice(0, 48);
+    const icon = String(raw.icon || fallback.icon || '🆘').trim().slice(0, 8);
+
+    byType.set(type, {
+      type,
+      title: title || fallback.title,
+      title_override: titleOverride,
+      icon: icon || fallback.icon,
+      color: String(raw.color || fallback.color || '#2563eb').trim().slice(0, 24),
+      priority: clampPolicyNumber(raw.priority, fallback.priority, 1, 5),
+      enabled: normalizePolicyBoolean(raw.enabled, fallback.enabled !== false),
+      order: clampPolicyNumber(raw.order, fallback.order || ((index + 1) * 10), 1, 999)
+    });
+  }
+
+  const categories = Array.from(byType.values()).sort((a, b) => {
+    if (a.order !== b.order) return a.order - b.order;
+    return a.title.localeCompare(b.title, 'es');
+  });
+
+  if (!categories.some(category => category.enabled)) {
+    const sos = categories.find(category => category.type === 'SOS_MANUAL');
+    if (sos) sos.enabled = true;
+  }
+
+  return categories;
+}
+
+function isNeighborEmergencyCategoryEnabled(settings, alertType) {
+  const type = String(alertType || 'SOS_MANUAL').trim().toUpperCase();
+  if (AUTOMATIC_MOBILE_ALERT_TYPES.has(type)) return true;
+  const normalized = normalizeControlCenterSettings(settings || {});
+  const categories = normalized.neighbor_app?.emergency_categories || DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES;
+  return categories.some(category => category.type === type && category.enabled !== false);
+}
+
+async function ensureEmergencyCategoryCatalogSchema() {
+  if (emergencyCategoryCatalogSchemaReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS emergency_category_catalog (
+      category_type TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      icon TEXT NOT NULL DEFAULT '🆘',
+      color TEXT DEFAULT '#2563eb',
+      priority INTEGER NOT NULL DEFAULT 3,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      display_order INTEGER NOT NULL DEFAULT 100,
+      sensitive BOOLEAN NOT NULL DEFAULT false,
+      allow_voice BOOLEAN NOT NULL DEFAULT true,
+      allow_evidence BOOLEAN NOT NULL DEFAULT true,
+      allow_nearby_notifications BOOLEAN NOT NULL DEFAULT false,
+      allow_sirens BOOLEAN NOT NULL DEFAULT false,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  for (const category of DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES) {
+    await pool.query(
+      `
+      INSERT INTO emergency_category_catalog (
+        category_type,
+        title,
+        icon,
+        color,
+        priority,
+        enabled,
+        display_order,
+        sensitive,
+        allow_voice,
+        allow_evidence,
+        allow_nearby_notifications,
+        allow_sirens
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT (category_type) DO NOTHING
+      `,
+      [
+        category.type,
+        category.title,
+        category.icon,
+        category.color,
+        category.priority,
+        category.enabled !== false,
+        category.order,
+        category.sensitive === true,
+        category.allow_voice !== false,
+        category.allow_evidence !== false,
+        category.allow_nearby_notifications === true,
+        category.allow_sirens === true
+      ]
+    );
+  }
+
+  await refreshEmergencyCategoryCatalogCache();
+  emergencyCategoryCatalogSchemaReady = true;
+}
+
+async function refreshEmergencyCategoryCatalogCache() {
+  const result = await pool.query(`
+    SELECT
+      category_type AS type,
+      title,
+      icon,
+      color,
+      priority,
+      enabled,
+      display_order AS "order",
+      sensitive,
+      allow_voice,
+      allow_evidence,
+      allow_nearby_notifications,
+      allow_sirens,
+      metadata
+    FROM emergency_category_catalog
+    ORDER BY display_order ASC, title ASC
+  `);
+
+  emergencyCategoryCatalogCache = normalizeEmergencyCategoryCatalog(result.rows);
+  return emergencyCategoryCatalogCache;
+}
+
+async function loadEmergencyCategoryCatalog({ includeDisabled = true } = {}) {
+  await ensureEmergencyCategoryCatalogSchema();
+  const catalog = emergencyCategoryCatalogCache || DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES;
+  return includeDisabled ? catalog : catalog.filter(category => category.enabled !== false);
 }
 
 function normalizeControlCenterSettings(input = {}) {
@@ -298,11 +514,16 @@ function normalizeControlCenterSettings(input = {}) {
   merged.resolver_policy.max_location_age_seconds = clampPolicyNumber(merged.resolver_policy.max_location_age_seconds, 180, 30, 86400);
   merged.resolver_policy.max_active_tickets = clampPolicyNumber(merged.resolver_policy.max_active_tickets, 1, 1, 20);
 
+  merged.neighbor_app = merged.neighbor_app || {};
+  merged.neighbor_app.emergency_categories = normalizeNeighborEmergencyCategories(merged.neighbor_app.emergency_categories);
+
   return merged;
 }
 
 async function ensureControlCenterSettingsSchema() {
   if (controlCenterSettingsSchemaReady) return;
+
+  await ensureEmergencyCategoryCatalogSchema();
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS control_center_settings (
@@ -420,7 +641,10 @@ function publicSettingsPayload(settings) {
     },
     notification_policy: normalized.notification_policy,
     incident_policy: normalized.incident_policy,
-    resolver_policy: normalized.resolver_policy
+    resolver_policy: normalized.resolver_policy,
+    neighbor_app: {
+      emergency_categories: normalized.neighbor_app.emergency_categories
+    }
   };
 }
 
@@ -3764,6 +3988,29 @@ res.json({
 
 });
 
+app.get("/public/control-centers/:code/settings", async (req, res) => {
+  try {
+    const requestedCode = req.params.code || req.query.control_center_code || 'CC-VINA';
+    const row = await getControlCenterSettingsByCode(requestedCode);
+    if (!row) {
+      return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    }
+
+    return res.json({
+      status: "ok",
+      control_center: {
+        id: row.control_center_id,
+        code: row.control_center_code,
+        name: row.control_center_name
+      },
+      platform_settings: publicSettingsPayload(row.settings)
+    });
+  } catch (error) {
+    console.error("[PUBLIC CONTROL CENTER SETTINGS ERROR]", error);
+    return res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
 
 app.post("/public/sirens/activate", async (req, res) => {
 		const { siren_id, duration_seconds, control_center_code } = req.body;
@@ -5103,6 +5350,34 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    const normalizedAlert = normalizeMobileSosPayload({
+      alert_type,
+      title,
+      priority,
+      description,
+      sensor_event_type,
+      silent,
+      confidence,
+      source
+    });
+
+    const settingsRow = await getControlCenterSettingsById(controlCenterId);
+    const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+
+    if (platformSettings.features?.mobile_app_enabled === false) {
+      return res.status(403).json({
+        status: "error",
+        message: "La App Vecino no está habilitada para este centro de control."
+      });
+    }
+
+    if (!isNeighborEmergencyCategoryEnabled(platformSettings, normalizedAlert.alert_type)) {
+      return res.status(403).json({
+        status: "error",
+        message: "Esta categoría no está habilitada para tu Centro de Control."
+      });
+    }
+
     await pool.query(
       `
       UPDATE mobile_events
@@ -5154,26 +5429,6 @@ app.post("/public/mobile/sos", async (req, res) => {
     );
 
     const event = result.rows[0];
-    const normalizedAlert = normalizeMobileSosPayload({
-      alert_type,
-      title,
-      priority,
-      description,
-      sensor_event_type,
-      silent,
-      confidence,
-      source
-    });
-
-    const settingsRow = await getControlCenterSettingsById(controlCenterId);
-    const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
-
-    if (platformSettings.features?.mobile_app_enabled === false) {
-      return res.status(403).json({
-        status: "error",
-        message: "La App Vecino no está habilitada para este centro de control."
-      });
-    }
 
     const existingIncident = platformSettings.features?.multi_report_incidents_enabled === false
       ? null
@@ -12213,6 +12468,86 @@ app.get("/superadmin/control-centers", async (req, res) => {
   } catch (error) {
     console.error("[SUPERADMIN CONTROL CENTERS LIST ERROR]", error);
     res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.get("/superadmin/emergency-categories", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const includeDisabled = String(req.query.include_disabled || 'true').toLowerCase() !== 'false';
+    const categories = await loadEmergencyCategoryCatalog({ includeDisabled });
+    res.json({ status: "ok", total: categories.length, categories });
+  } catch (error) {
+    console.error("[SUPERADMIN EMERGENCY CATEGORIES LIST ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.put("/superadmin/emergency-categories", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    await ensureEmergencyCategoryCatalogSchema();
+    const categories = normalizeEmergencyCategoryCatalog(req.body?.categories || req.body || []);
+
+    if (!categories.length) {
+      return res.status(400).json({ status: "error", message: "Debe enviar al menos una categoría" });
+    }
+
+    for (const category of categories) {
+      await pool.query(
+        `
+        INSERT INTO emergency_category_catalog (
+          category_type,
+          title,
+          icon,
+          color,
+          priority,
+          enabled,
+          display_order,
+          sensitive,
+          allow_voice,
+          allow_evidence,
+          allow_nearby_notifications,
+          allow_sirens,
+          updated_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+        ON CONFLICT (category_type) DO UPDATE SET
+          title = EXCLUDED.title,
+          icon = EXCLUDED.icon,
+          color = EXCLUDED.color,
+          priority = EXCLUDED.priority,
+          enabled = EXCLUDED.enabled,
+          display_order = EXCLUDED.display_order,
+          sensitive = EXCLUDED.sensitive,
+          allow_voice = EXCLUDED.allow_voice,
+          allow_evidence = EXCLUDED.allow_evidence,
+          allow_nearby_notifications = EXCLUDED.allow_nearby_notifications,
+          allow_sirens = EXCLUDED.allow_sirens,
+          updated_at = NOW()
+        `,
+        [
+          category.type,
+          category.title,
+          category.icon,
+          category.color,
+          category.priority,
+          category.enabled !== false,
+          category.order,
+          category.sensitive === true,
+          category.allow_voice !== false,
+          category.allow_evidence !== false,
+          category.allow_nearby_notifications === true,
+          category.allow_sirens === true
+        ]
+      );
+    }
+
+    const saved = await refreshEmergencyCategoryCatalogCache();
+    res.json({ status: "ok", message: "Catálogo de categorías actualizado", total: saved.length, categories: saved });
+  } catch (error) {
+    console.error("[SUPERADMIN EMERGENCY CATEGORIES SAVE ERROR]", error);
+    res.status(400).json({ status: "error", message: error.message });
   }
 });
 
