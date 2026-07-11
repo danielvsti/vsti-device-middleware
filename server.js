@@ -60,7 +60,7 @@ app.use(cors({
     return callback(error);
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Admin-Token", "X-SOS-Token", "X-Request-Id"],
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "X-Admin-Token", "X-SOS-Token", "X-Request-Id"],
   maxAge: 86400
 }));
 app.use((req, res, next) => {

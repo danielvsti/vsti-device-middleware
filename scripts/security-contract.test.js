@@ -20,6 +20,7 @@ assert(server.includes("OTP_PROVIDER"), "Debe existir configuración de proveedo
 assert(server.includes("TWILIO_VERIFY_SERVICE_SID"), "Debe existir integración Twilio Verify");
 assert(server.includes('selectedChannel === "demo" && OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE'), "El código demo solo debe exponerse para desafíos demo");
 assert(server.includes("CORS_ALLOWED_ORIGINS"), "Debe existir allowlist CORS");
+assert(server.includes('"Cache-Control"'), "CORS debe permitir Cache-Control usado por paneles web");
 
 for (const signature of [
   'app.get("/debug/users"',
