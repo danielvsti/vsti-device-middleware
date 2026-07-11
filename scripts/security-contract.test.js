@@ -60,5 +60,6 @@ assert(!panelLoginSql.includes("source_event."), "El login de panel no debe refe
 const ticketDetailSql = routeBlock('app.get("/tickets/:id"', 4200);
 assert(ticketDetailSql.includes("LEFT JOIN mobile_events source_event"), "El detalle del ticket debe enlazar el evento móvil");
 assert(ticketDetailSql.includes("LEFT JOIN municipal_qr_points qr_point"), "El detalle del ticket debe enlazar la atribución QR");
+assert(server.includes("LONGITUDE_HEMISPHERE_SIGN"), "El backend debe defenderse de longitudes con hemisferio invertido");
 
 console.log("Security contract OK");

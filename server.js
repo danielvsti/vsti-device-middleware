@@ -5461,10 +5461,11 @@ app.post("/public/mobile/sos", async (req, res) => {
     }
 
     const latNum = Number(latitude);
-    const lonNum = Number(longitude);
+    const rawLonNum = Number(longitude);
+    let lonNum = rawLonNum;
     const accuracyNum = accuracy == null || accuracy === "" ? null : Number(accuracy);
 
-    if (!Number.isFinite(latNum) || !Number.isFinite(lonNum) || Math.abs(latNum) > 90 || Math.abs(lonNum) > 180) {
+    if (!Number.isFinite(latNum) || !Number.isFinite(rawLonNum) || Math.abs(latNum) > 90 || Math.abs(rawLonNum) > 180) {
       return res.status(400).json({
         status: "error",
         message: "Coordenadas GPS inválidas"
@@ -12428,10 +12429,17 @@ app.post("/resolver/location", async (req, res) => {
 
     const userResult = await pool.query(
       `
-      SELECT id, control_center_id, role, full_name
-      FROM users
-      WHERE id = $1
-        AND is_active = true
+      SELECT
+        u.id,
+        u.control_center_id,
+        u.role,
+        u.full_name,
+        COALESCE(cc.map_center_lat, cc.latitude) AS control_center_latitude,
+        COALESCE(cc.map_center_lon, cc.longitude) AS control_center_longitude
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.id = $1
+        AND u.is_active = true
       `,
       [user_id]
     );
@@ -12450,6 +12458,27 @@ app.post("/resolver/location", async (req, res) => {
         status: "error",
         message: "User is not a resolver"
       });
+    }
+
+    // Algunos escenarios manuales del simulador iOS omiten el signo oeste y
+    // reportan +70.x en vez de -70.x. Sólo corregimos cuando invertir el signo
+    // acerca inequívocamente el punto al centro municipal configurado.
+    let coordinateCorrection = null;
+    const centerLat = Number(user.control_center_latitude);
+    const centerLon = Number(user.control_center_longitude);
+    if (Number.isFinite(centerLat) && Number.isFinite(centerLon) && rawLonNum !== 0) {
+      const originalDistance = distanceMeters(latNum, rawLonNum, centerLat, centerLon);
+      const flippedDistance = distanceMeters(latNum, -rawLonNum, centerLat, centerLon);
+      if (originalDistance > 1000000 && flippedDistance < 250000 && flippedDistance * 5 < originalDistance) {
+        lonNum = -rawLonNum;
+        coordinateCorrection = "LONGITUDE_HEMISPHERE_SIGN";
+        console.warn("[RESOLVER GPS COORDINATE CORRECTED]", {
+          user_id: user.id,
+          received_longitude: rawLonNum,
+          corrected_longitude: lonNum,
+          source: source || null
+        });
+      }
     }
 
     const requestedStatus = String(status || "AVAILABLE").toUpperCase();
@@ -12520,6 +12549,7 @@ app.post("/resolver/location", async (req, res) => {
       active_tickets_count: activeTickets.length,
       active_tickets: activeTickets,
       resolver_location: result.rows[0],
+      coordinate_correction: coordinateCorrection,
       next_assignment: nextAssignment,
       source
     });
