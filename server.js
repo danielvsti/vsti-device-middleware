@@ -5461,11 +5461,10 @@ app.post("/public/mobile/sos", async (req, res) => {
     }
 
     const latNum = Number(latitude);
-    const rawLonNum = Number(longitude);
-    let lonNum = rawLonNum;
+    const lonNum = Number(longitude);
     const accuracyNum = accuracy == null || accuracy === "" ? null : Number(accuracy);
 
-    if (!Number.isFinite(latNum) || !Number.isFinite(rawLonNum) || Math.abs(latNum) > 90 || Math.abs(rawLonNum) > 180) {
+    if (!Number.isFinite(latNum) || !Number.isFinite(lonNum) || Math.abs(latNum) > 90 || Math.abs(lonNum) > 180) {
       return res.status(400).json({
         status: "error",
         message: "Coordenadas GPS inválidas"
@@ -12406,10 +12405,11 @@ app.post("/resolver/location", async (req, res) => {
     }
 
     const latNum = Number(latitude);
-    const lonNum = Number(longitude);
+    const rawLonNum = Number(longitude);
+    let lonNum = rawLonNum;
     const accuracyNum = accuracy == null || accuracy === "" ? null : Number(accuracy);
 
-    if (!Number.isFinite(latNum) || !Number.isFinite(lonNum) || Math.abs(latNum) > 90 || Math.abs(lonNum) > 180) {
+    if (!Number.isFinite(latNum) || !Number.isFinite(rawLonNum) || Math.abs(latNum) > 90 || Math.abs(rawLonNum) > 180) {
       return res.status(400).json({
         status: "error",
         message: "Coordenadas GPS inválidas"
