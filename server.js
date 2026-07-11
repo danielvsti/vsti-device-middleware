@@ -6575,10 +6575,14 @@ app.get("/auth/session", async (req, res) => {
       });
     }
 
+    const sessionSettingsRow = await getControlCenterSettingsById(result.rows[0].control_center_id).catch(() => null);
+    const sessionPlatformSettings = sessionSettingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+
     res.json({
       status: "ok",
       session,
-      user: result.rows[0]
+      user: result.rows[0],
+      platform_settings: publicSettingsPayload(sessionPlatformSettings)
     });
   } catch (error) {
     console.error("[SESSION CHECK ERROR]", error);
