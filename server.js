@@ -100,6 +100,12 @@ const authRateLimit = rateLimit({
   key: (req) => `${req.ip}:${String(req.body?.phone || "").replace(/\s+/g, "")}`,
   message: "Demasiados intentos de autenticación. Espera unos minutos."
 });
+const qrVisitRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.QR_VISIT_RATE_LIMIT_MAX || 60),
+  key: (req) => getRemoteIp(req),
+  message: "Demasiados accesos QR desde este dispositivo. Intenta nuevamente en un minuto."
+});
 
 function requireDebugAccess(req, res) {
   if (process.env.SOS_DEBUG_ENDPOINTS_ENABLED !== "true") {
@@ -9832,7 +9838,7 @@ app.get("/public/qr/:code", async (req, res) => {
   }
 });
 
-app.post("/public/qr/:code/visit", async (req, res) => {
+app.post("/public/qr/:code/visit", qrVisitRateLimit, async (req, res) => {
   try {
     await ensureMunicipalQrSchema();
     const pointResult = await pool.query(
@@ -12243,8 +12249,12 @@ app.get("/tickets/:id", async (req, res) => {
         tr.distance_meters,
         tr.match_score,
         tr.is_primary_report,
-        tr.created_at
+        tr.created_at,
+        qr.code AS qr_code,
+        qr.name AS qr_point_name
       FROM ticket_reports tr
+      LEFT JOIN mobile_events report_event ON report_event.id = tr.mobile_event_id
+      LEFT JOIN municipal_qr_points qr ON qr.id = report_event.qr_point_id
       WHERE tr.ticket_id = $1
       ORDER BY tr.created_at ASC
       `,
