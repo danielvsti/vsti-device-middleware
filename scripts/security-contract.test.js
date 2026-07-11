@@ -54,4 +54,11 @@ for (const signature of [
   assert(routeBlock(signature).includes("checkTicketParticipantAccess"), `${signature} debe validar pertenencia al ticket`);
 }
 
+const panelLoginSql = routeBlock('app.post("/auth/panel-login"', 2200);
+assert(!panelLoginSql.includes("source_event."), "El login de panel no debe referenciar tablas de eventos sin JOIN");
+
+const ticketDetailSql = routeBlock('app.get("/tickets/:id"', 4200);
+assert(ticketDetailSql.includes("LEFT JOIN mobile_events source_event"), "El detalle del ticket debe enlazar el evento móvil");
+assert(ticketDetailSql.includes("LEFT JOIN municipal_qr_points qr_point"), "El detalle del ticket debe enlazar la atribución QR");
+
 console.log("Security contract OK");

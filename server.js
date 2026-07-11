@@ -6559,11 +6559,6 @@ app.post("/auth/panel-login", authRateLimit, async (req, res) => {
         u.control_center_id,
         cc.code AS control_center_code,
         cc.name AS control_center_name,
-        source_event.qr_context,
-        qr_point.code AS qr_code,
-        qr_point.name AS qr_point_name,
-        qr_point.latitude AS qr_installed_latitude,
-        qr_point.longitude AS qr_installed_longitude,
         u.role,
         u.validation_status,
         u.is_active,
@@ -12124,6 +12119,11 @@ app.get("/tickets/:id", async (req, res) => {
         t.event_sector_source AS incident_sector_source,
         cc.code AS control_center_code,
         cc.name AS control_center_name,
+        source_event.qr_context,
+        qr_point.code AS qr_code,
+        qr_point.name AS qr_point_name,
+        qr_point.latitude AS qr_installed_latitude,
+        qr_point.longitude AS qr_installed_longitude,
 
         citizen.full_name AS citizen_name,
         citizen.phone AS citizen_phone,
@@ -12142,6 +12142,13 @@ app.get("/tickets/:id", async (req, res) => {
 
       JOIN control_centers cc
         ON cc.id = t.control_center_id
+
+      LEFT JOIN mobile_events source_event
+        ON t.source_type = 'MOBILE_APP'
+       AND source_event.id = t.source_event_id
+
+      LEFT JOIN municipal_qr_points qr_point
+        ON qr_point.id = source_event.qr_point_id
 
       LEFT JOIN users citizen
         ON citizen.id = t.citizen_user_id
