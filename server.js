@@ -40,8 +40,80 @@ const cors = require("cors");
 const app = express();
 
 app.set("trust proxy", true);
-app.use(cors());
+const SECURITY_DEMO_MODE = process.env.SOS_SECURITY_DEMO_MODE === "true" || process.env.OTP_DEMO_MODE === "true";
+const CORS_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+function corsOriginAllowed(origin) {
+  if (!origin) return true;
+  if (SECURITY_DEMO_MODE && CORS_ALLOWED_ORIGINS.length === 0) return true;
+  return CORS_ALLOWED_ORIGINS.includes(String(origin).replace(/\/+$/, ""));
+}
+
+app.use(cors({
+  origin(origin, callback) {
+    if (corsOriginAllowed(origin)) return callback(null, true);
+    const error = new Error("Origen no autorizado por CORS");
+    error.status = 403;
+    return callback(error);
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Admin-Token", "X-SOS-Token", "X-Request-Id"],
+  maxAge: 86400
+}));
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  if (req.secure) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
 app.use(express.json({ limit: "30mb" }));
+
+const securityRateBuckets = new Map();
+function rateLimit({ windowMs, max, key = (req) => req.ip, message }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const bucketKey = `${req.path}:${key(req) || "unknown"}`;
+    const current = securityRateBuckets.get(bucketKey);
+    if (!current || current.resetAt <= now) {
+      securityRateBuckets.set(bucketKey, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    current.count += 1;
+    if (current.count <= max) return next();
+    res.setHeader("Retry-After", String(Math.ceil((current.resetAt - now) / 1000)));
+    return res.status(429).json({
+      status: "error",
+      message: message || "Demasiadas solicitudes. Intenta nuevamente más tarde."
+    });
+  };
+}
+
+const authRateLimit = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: Number(process.env.AUTH_RATE_LIMIT_MAX || 20),
+  key: (req) => `${req.ip}:${String(req.body?.phone || "").replace(/\s+/g, "")}`,
+  message: "Demasiados intentos de autenticación. Espera unos minutos."
+});
+
+function requireDebugAccess(req, res) {
+  if (process.env.SOS_DEBUG_ENDPOINTS_ENABLED !== "true") {
+    res.status(404).json({ status: "error", message: "Not found" });
+    return false;
+  }
+  const expected = process.env.ADMIN_TOKEN || "";
+  const provided = req.headers["x-admin-token"] || req.headers.authorization?.replace(/^Bearer\s+/i, "") || "";
+  if (!expected || provided !== expected) {
+    res.status(401).json({ status: "error", message: "Debug access denied" });
+    return false;
+  }
+  return true;
+}
 
 const UPLOAD_DIR = process.env.SOS_UPLOAD_DIR || "/tmp/sos_uploads";
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -49,6 +121,7 @@ app.use("/uploads", express.static(UPLOAD_DIR));
 
 
 app.get("/debug/db", async (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   try {
     const result = await pool.query(`
       SELECT table_name
@@ -67,6 +140,7 @@ app.get("/debug/db", async (req, res) => {
 });
 
 app.get("/debug/tickets", async (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   try {
     const result = await pool.query(`
       SELECT
@@ -97,7 +171,11 @@ app.get("/debug/tickets", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const TOKEN = process.env.VSTI_TOKEN || "VSTI_MIDDLEWARE_2026_Q7xF92Lp_4MNd8Rk_91AB";
+const TOKEN = process.env.VSTI_TOKEN
+  || (SECURITY_DEMO_MODE ? "VSTI_MIDDLEWARE_DEMO_ONLY" : crypto.randomBytes(32).toString("hex"));
+if (!process.env.VSTI_TOKEN && !SECURITY_DEMO_MODE) {
+  console.warn("[SECURITY] VSTI_TOKEN no configurado: integraciones de dispositivos usarán una clave efímera.");
+}
 
 const SAYVU_API_URL = process.env.SAYVU_API_URL || "";
 const SAYVU_TOKEN = process.env.SAYVU_TOKEN || "";
@@ -133,7 +211,7 @@ function nowChile() {
 }
 
 function checkToken(req, res) {
-	const token = req.query.token || req.headers["x-vsti-token"];
+	const token = req.headers["x-vsti-token"];
 	if (token !== TOKEN) {
 		res.status(401).json({ status: "error", message: "Unauthorized" });
 		return false;
@@ -723,7 +801,12 @@ async function findSirenByIdForPublicControlCenter(sirenId, controlCenterCode = 
    =========================================================
 */
 
-const SESSION_SECRET = process.env.SOS_SESSION_SECRET || process.env.ADMIN_TOKEN || TOKEN || "SOS_SESSION_DEV_SECRET";
+const SESSION_SECRET = process.env.SOS_SESSION_SECRET
+  || process.env.ADMIN_TOKEN
+  || (SECURITY_DEMO_MODE ? (process.env.VSTI_TOKEN || TOKEN) : crypto.randomBytes(48).toString("hex"));
+if (!process.env.SOS_SESSION_SECRET && !process.env.ADMIN_TOKEN && !SECURITY_DEMO_MODE) {
+  console.warn("[SECURITY] SOS_SESSION_SECRET no configurado: se usará una clave efímera y las sesiones expirarán al reiniciar.");
+}
 const PANEL_SESSION_TTL_HOURS = Number(process.env.PANEL_SESSION_TTL_HOURS || 12);
 
 function base64UrlEncode(value) {
@@ -778,7 +861,7 @@ function getBearerOrPanelToken(req) {
     return auth.slice(7).trim();
   }
 
-  return req.headers["x-sos-token"] || req.query.sos_token || "";
+  return req.headers["x-sos-token"] || "";
 }
 
 function verifyPanelSessionToken(token) {
@@ -834,6 +917,69 @@ function checkRoleAccess(req, res, allowedRoles, message = "Unauthorized panel r
   }
 
   req.panel_session = session;
+  return true;
+}
+
+function checkAuthenticatedAccess(req, res, allowedRoles, message = "Sesión requerida") {
+  return checkRoleAccess(req, res, allowedRoles, message);
+}
+
+function checkIdentityAccess(req, res, allowedRoles, claimedUserId, message = "No autorizado para este usuario") {
+  if (!checkRoleAccess(req, res, allowedRoles, message)) return false;
+  if (isSuperAdminSession(req.panel_session) || ["ADMIN", "OPERATOR"].includes(String(req.panel_session.role || "").toUpperCase())) {
+    return true;
+  }
+  if (!claimedUserId || String(req.panel_session.sub) !== String(claimedUserId)) {
+    res.status(403).json({ status: "error", message });
+    return false;
+  }
+  return true;
+}
+
+async function checkTicketParticipantAccess(req, res, ticketId) {
+  const session = panelSessionFromRequest(req);
+  if (!session) {
+    res.status(401).json({ status: "error", message: "Sesión requerida" });
+    return false;
+  }
+  req.panel_session = session;
+  await ensureIncidentAggregationSchema();
+  const role = String(session.role || "").toUpperCase();
+  const result = await pool.query(
+    `
+    SELECT
+      t.citizen_user_id,
+      t.assigned_resolver_id,
+      t.control_center_id,
+      EXISTS (
+        SELECT 1
+        FROM ticket_reports tr
+        JOIN mobile_events me ON me.id = tr.mobile_event_id
+        WHERE tr.ticket_id = t.id AND me.user_id = $2
+      ) AS is_reporting_neighbor
+    FROM tickets t
+    WHERE t.id = $1
+    LIMIT 1
+    `,
+    [ticketId, session.sub]
+  );
+  if (!result.rows.length) {
+    res.status(404).json({ status: "error", message: "Ticket not found" });
+    return false;
+  }
+  const ticket = result.rows[0];
+  if (role === "SUPER_ADMIN") return true;
+  if (["ADMIN", "OPERATOR"].includes(role)) {
+    if (String(ticket.control_center_id) === String(session.control_center_id)) return true;
+    res.status(403).json({ status: "error", message: "Ticket de otro centro de control" });
+    return false;
+  }
+  const allowed = (role === "NEIGHBOR" && (String(ticket.citizen_user_id) === String(session.sub) || ticket.is_reporting_neighbor === true))
+    || (role === "RESOLVER" && String(ticket.assigned_resolver_id) === String(session.sub));
+  if (!allowed) {
+    res.status(403).json({ status: "error", message: "No autorizado para este ticket" });
+    return false;
+  }
   return true;
 }
 
@@ -1206,6 +1352,7 @@ app.post('/admin/control-centers/:code/geofence', async (req, res) => {
 });
 
 app.post('/debug/geofence/check', async (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   try {
     await ensureGeofenceSchema();
     const code = req.body.control_center_code || 'CC-VINA';
@@ -3433,7 +3580,7 @@ async function createAndSendOtp({ phone, email = null, channel = null, purpose =
   return {
     channel: selectedChannel,
     delivery,
-    demo_code: OTP_EXPOSE_DEMO_CODE ? code : undefined,
+    demo_code: selectedChannel === "demo" && OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE ? code : undefined,
     expires_minutes: OTP_TTL_MINUTES
   };
 }
@@ -3442,12 +3589,26 @@ async function verifyOtpForPhone({ phone, code, purpose = null }) {
   await ensureAuthOtpTable();
 
   const cleanPhone = normalizePhoneForAuth(phone);
+  const pendingOtpResult = await pool.query(
+    `
+    SELECT *
+    FROM auth_otps
+    WHERE phone = $1
+      AND consumed_at IS NULL
+      AND expires_at > NOW()
+      ${purpose ? "AND purpose = $2" : ""}
+    ORDER BY created_at DESC
+    LIMIT 1
+    `,
+    purpose ? [cleanPhone, purpose] : [cleanPhone]
+  );
+  const pendingOtp = pendingOtpResult.rows[0] || null;
 
-  if (isTwilioVerifyOtpEnabled(OTP_DEFAULT_CHANNEL)) {
+  if (pendingOtp && pendingOtp.channel !== "demo" && isTwilioVerifyOtpEnabled(pendingOtp.channel)) {
     const twilioVerification = await checkTwilioVerifyCode({
       phone: cleanPhone,
       code,
-      channel: OTP_DEFAULT_CHANNEL
+      channel: pendingOtp.channel
     });
 
     if (!twilioVerification.ok) {
@@ -3487,19 +3648,7 @@ async function verifyOtpForPhone({ phone, code, purpose = null }) {
 
   const codeHash = hashOtpCode(cleanPhone, String(code || "").trim());
 
-  const result = await pool.query(
-    `
-    SELECT *
-    FROM auth_otps
-    WHERE phone = $1
-      AND consumed_at IS NULL
-      AND expires_at > NOW()
-      ${purpose ? "AND purpose = $2" : ""}
-    ORDER BY created_at DESC
-    LIMIT 1
-    `,
-    purpose ? [cleanPhone, purpose] : [cleanPhone]
-  );
+  const result = pendingOtpResult;
 
   if (result.rows.length === 0) {
     return { ok: false, reason: "invalid_or_expired" };
@@ -3606,6 +3755,7 @@ async function getNeighborById(userId) {
 
 
 app.get("/debug/physical-buttons", (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   res.json({
     status: "ok",
     total: loadPhysicalSosButtons().length,
@@ -3806,6 +3956,7 @@ const publicSirens = [
 ];
 
 app.get("/public/map-state", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional para consultar el mapa")) return;
 		const now = Date.now();
     const controlCenterCode = req.query.control_center_code || 'CC-VINA';
     const settingsRow = await getControlCenterSettingsByCode(controlCenterCode);
@@ -4013,6 +4164,7 @@ app.get("/public/control-centers/:code/settings", async (req, res) => {
 
 
 app.post("/public/sirens/activate", async (req, res) => {
+		if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional para activar sirenas")) return;
 		const { siren_id, duration_seconds, control_center_code } = req.body;
 
 		if (!siren_id) {
@@ -4023,7 +4175,8 @@ message: "siren_id is required"
 		}
 
     try {
-      const { settingsRow, siren } = await findSirenByIdForPublicControlCenter(siren_id, control_center_code || 'CC-VINA');
+      const authorizedCode = requestedControlCenterForSession(req, control_center_code, 'CC-VINA');
+      const { settingsRow, siren } = await findSirenByIdForPublicControlCenter(siren_id, authorizedCode);
       const settings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
       if (!settings.features.sirens_enabled) {
@@ -4070,6 +4223,7 @@ message: "siren_id is required"
 });
 
 app.post("/public/sirens/deactivate", async (req, res) => {
+		if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional para desactivar sirenas")) return;
 		const { siren_id, control_center_code } = req.body;
 
 		if (!siren_id) {
@@ -4080,7 +4234,8 @@ message: "siren_id is required"
 		}
 
     try {
-      const { settingsRow, siren } = await findSirenByIdForPublicControlCenter(siren_id, control_center_code || 'CC-VINA');
+      const authorizedCode = requestedControlCenterForSession(req, control_center_code, 'CC-VINA');
+      const { settingsRow, siren } = await findSirenByIdForPublicControlCenter(siren_id, authorizedCode);
       const settings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
       if (!settings.features.sirens_enabled) {
@@ -4117,6 +4272,7 @@ message: "siren_id is required"
 });
 
 app.post("/public/devices/ack-sos", (req, res) => {
+		if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional para reconocer dispositivos")) return;
 		const { device_id } = req.body;
 
 		if (!device_id) {
@@ -5192,6 +5348,8 @@ app.post("/public/mobile/sos", async (req, res) => {
       control_center_code = "CC-VINA"
     } = req.body;
 
+    if (!checkIdentityAccess(req, res, ["NEIGHBOR", "ADMIN", "SUPER_ADMIN"], user_id, "Sesión de vecino requerida para generar SOS")) return;
+
     if (!user_id) {
       return res.status(400).json({
         status: "error",
@@ -5592,6 +5750,8 @@ app.post("/public/mobile/cancel", async (req, res) => {
   try {
     const { event_id, user_id } = req.body;
 
+    if (!checkIdentityAccess(req, res, ["NEIGHBOR", "ADMIN", "SUPER_ADMIN"], user_id, "Sesión de vecino requerida para cancelar SOS")) return;
+
     if (!event_id) {
       return res.status(400).json({
         status: "error",
@@ -5704,6 +5864,7 @@ app.post("/public/mobile/cancel", async (req, res) => {
 
 
 app.post("/public/mobile/ack", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional para reconocer alertas")) return;
   try {
     const { event_id, operator } = req.body;
 
@@ -5989,6 +6150,7 @@ function buildNeighborProgress(event) {
 
 app.get("/public/mobile/status/:event_id", async (req, res) => {
   try {
+    if (!checkAuthenticatedAccess(req, res, ["NEIGHBOR", "OPERATOR", "ADMIN", "SUPER_ADMIN"], "Sesión requerida para consultar el evento")) return;
     await ensureIncidentAggregationSchema();
     const { event_id } = req.params;
 
@@ -6047,6 +6209,9 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
 
     const event = result.rows[0];
     event.alert_type = event.ticket_alert_type || event.alert_type || null;
+    if (String(req.panel_session.role || "").toUpperCase() === "NEIGHBOR" && String(event.user_id) !== String(req.panel_session.sub)) {
+      return res.status(403).json({ status: "error", message: "No autorizado para este evento" });
+    }
     const terminalTicketStates = ["RESOLVED", "CLOSED", "CANCELLED"];
     const effectiveState = terminalTicketStates.includes(event.ticket_state)
       ? event.ticket_state
@@ -6128,6 +6293,8 @@ app.get("/public/mobile/active", async (req, res) => {
   try {
     await ensureIncidentAggregationSchema();
     const { user_id } = req.query;
+
+    if (!checkIdentityAccess(req, res, ["NEIGHBOR", "ADMIN", "SUPER_ADMIN"], user_id, "Sesión de vecino requerida")) return;
 
     if (!user_id) {
       return res.status(400).json({
@@ -6243,11 +6410,13 @@ app.get("/public/mobile/active", async (req, res) => {
 
 
 
-app.post("/auth/panel-login", async (req, res) => {
+app.post("/auth/panel-login", authRateLimit, async (req, res) => {
   try {
     const {
       phone,
-      panel_type = "CONTROL_CENTER"
+      panel_type = "CONTROL_CENTER",
+      code = null,
+      channel = null
     } = req.body || {};
 
     const cleanPhone = normalizePhoneForAuth(phone);
@@ -6309,7 +6478,43 @@ app.post("/auth/panel-login", async (req, res) => {
       });
     }
 
-    const token = createPanelSessionToken(user, panel_type);
+    const normalizedPanelType = String(panel_type || "CONTROL_CENTER").trim().toUpperCase();
+    const purpose = `PANEL_LOGIN_${normalizedPanelType}`;
+
+    if (!code) {
+      const otp = await createAndSendOtp({
+        phone: cleanPhone,
+        email: user.email || null,
+        channel: channel || null,
+        purpose,
+        metadata: {
+          user_id: user.id,
+          role: user.role,
+          panel_type: normalizedPanelType,
+          control_center_code: user.control_center_code
+        }
+      });
+      return res.json({
+        status: "ok",
+        requires_verification: true,
+        message: "Código de acceso enviado",
+        otp_channel: otp.channel,
+        otp_expires_minutes: otp.expires_minutes,
+        ...(otp.demo_code ? { demo_code: otp.demo_code } : {})
+      });
+    }
+
+    const verification = await verifyOtpForPhone({ phone: cleanPhone, code, purpose });
+    if (!verification.ok) {
+      return res.status(401).json({
+        status: "error",
+        message: verification.reason === "too_many_attempts"
+          ? "Demasiados intentos. Solicita un nuevo código."
+          : "Código inválido o expirado."
+      });
+    }
+
+    const token = createPanelSessionToken(user, normalizedPanelType);
 
     res.json({
       status: "ok",
@@ -6388,6 +6593,8 @@ app.get("/auth/me", async (req, res) => {
   try {
     const userId = req.query.user_id || req.headers["x-user-id"];
 
+    if (!checkIdentityAccess(req, res, ["NEIGHBOR", "ADMIN", "SUPER_ADMIN"], userId, "Sesión de vecino requerida")) return;
+
     if (!userId) {
       return res.status(400).json({
         status: "error",
@@ -6421,7 +6628,7 @@ app.get("/auth/me", async (req, res) => {
   }
 });
 
-app.post("/auth/register", async (req, res) => {
+app.post("/auth/register", authRateLimit, async (req, res) => {
   try {
     const {
       control_center_code,
@@ -6634,7 +6841,7 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-app.post("/auth/request-code", async (req, res) => {
+app.post("/auth/request-code", authRateLimit, async (req, res) => {
   try {
     const {
       phone,
@@ -6718,7 +6925,7 @@ app.post("/auth/request-code", async (req, res) => {
   }
 });
 
-app.post("/auth/verify-code", async (req, res) => {
+app.post("/auth/verify-code", authRateLimit, async (req, res) => {
   try {
     const {
       phone,
@@ -6791,7 +6998,8 @@ app.post("/auth/verify-code", async (req, res) => {
     res.json({
       status: "ok",
       message: "Código verificado",
-      token: `otp-token-${user.id}`,
+      token: createPanelSessionToken(user, "NEIGHBOR"),
+      expires_hours: PANEL_SESSION_TTL_HOURS,
       user: publicUserPayload(user)
     });
 
@@ -6813,9 +7021,9 @@ app.post("/auth/logout", async (req, res) => {
 });
 
 
-app.post("/resolver/auth/login", async (req, res) => {
+app.post("/resolver/auth/login", authRateLimit, async (req, res) => {
   try {
-    const { phone } = req.body || {};
+    const { phone, code = null, channel = null } = req.body || {};
 
     if (!phone) {
       return res.status(400).json({
@@ -6862,9 +7070,46 @@ app.post("/resolver/auth/login", async (req, res) => {
 
     const user = result.rows[0];
 
+    const purpose = "RESOLVER_LOGIN";
+    if (!code) {
+      const otp = await createAndSendOtp({
+        phone: normalizedPhone,
+        email: user.email || null,
+        channel: channel || null,
+        purpose,
+        metadata: {
+          user_id: user.id,
+          role: user.role,
+          control_center_code: user.control_center_code
+        }
+      });
+      return res.json({
+        status: "ok",
+        requires_verification: true,
+        message: "Código de acceso enviado",
+        otp_channel: otp.channel,
+        otp_expires_minutes: otp.expires_minutes,
+        ...(otp.demo_code ? { demo_code: otp.demo_code } : {})
+      });
+    }
+
+    const verification = await verifyOtpForPhone({ phone: normalizedPhone, code, purpose });
+    if (!verification.ok) {
+      return res.status(401).json({
+        status: "error",
+        message: verification.reason === "too_many_attempts"
+          ? "Demasiados intentos. Solicita un nuevo código."
+          : "Código inválido o expirado."
+      });
+    }
+
+    const token = createPanelSessionToken(user, "RESOLVER");
+
     res.json({
       status: "ok",
       message: "Resolver login OK",
+      token,
+      expires_hours: PANEL_SESSION_TTL_HOURS,
       user
     });
 
@@ -6878,7 +7123,7 @@ app.post("/resolver/auth/login", async (req, res) => {
   }
 });
 
-app.post("/auth/login-demo", async (req, res) => {
+app.post("/auth/login-demo", authRateLimit, async (req, res) => {
   if (process.env.AUTH_DEMO_LOGIN_ENABLED !== "true") {
     return res.status(404).json({
       status: "error",
@@ -7042,6 +7287,8 @@ app.get("/tickets", async (req, res) => {
 
 
 app.post("/tickets/:id/acknowledge", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
+  if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
   try {
     const { id } = req.params;
     const { operator_user_id } = req.body;
@@ -7103,6 +7350,7 @@ app.post("/tickets/:id/acknowledge", async (req, res) => {
 });
 
 app.post("/debug/set-role", async (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   try {
     const { phone, role } = req.body;
 
@@ -7154,6 +7402,7 @@ app.post("/debug/set-role", async (req, res) => {
 });
 
 app.get("/debug/users", async (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   try {
     const result = await pool.query(`
       SELECT
@@ -7182,11 +7431,9 @@ app.get("/debug/users", async (req, res) => {
 
 function requireAdminTokenIfConfigured(req, res) {
   const configured = process.env.ADMIN_TOKEN;
-  if (!configured) return true;
   const provided = req.headers["x-admin-token"] || req.headers["authorization"]?.replace(/^Bearer\s+/i, "");
-  if (provided === configured) return true;
-  res.status(401).json({ status: "error", message: "ADMIN_TOKEN requerido" });
-  return false;
+  if (configured && provided === configured) return true;
+  return checkRoleAccess(req, res, ["ADMIN", "SUPER_ADMIN"], "Se requiere sesión ADMIN o ADMIN_TOKEN");
 }
 
 function maxResolverGpsAccuracyMeters() {
@@ -7194,6 +7441,7 @@ function maxResolverGpsAccuracyMeters() {
 }
 
 app.post("/debug/resolver-location", async (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   try {
     const {
       user_id,
@@ -7266,6 +7514,7 @@ app.post("/debug/resolver-location", async (req, res) => {
 
 
 app.post("/tickets/:id/accept", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { id } = req.params;
     const { resolver_user_id } = req.body;
@@ -7367,6 +7616,7 @@ app.post("/tickets/:id/accept", async (req, res) => {
 });
 
 app.post("/tickets/:id/en-route", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { id } = req.params;
     const { resolver_user_id } = req.body;
@@ -7444,6 +7694,7 @@ app.post("/tickets/:id/en-route", async (req, res) => {
 });
 
 app.post("/tickets/:id/on-site", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { id } = req.params;
     const { resolver_user_id } = req.body;
@@ -7521,6 +7772,7 @@ app.post("/tickets/:id/on-site", async (req, res) => {
 });
 
 app.post("/tickets/:id/resolve", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { id } = req.params;
     const {
@@ -7635,6 +7887,8 @@ app.post("/tickets/:id/resolve", async (req, res) => {
 });
 
 app.post("/tickets/:id/close", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
+  if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
   try {
     const { id } = req.params;
     const {
@@ -7724,6 +7978,7 @@ app.post("/tickets/:id/close", async (req, res) => {
 });
 
 app.post("/tickets/:id/reject", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { id } = req.params;
     const {
@@ -7908,6 +8163,8 @@ app.post("/tickets/:id/reject", async (req, res) => {
 
 
 app.post("/tickets/:id/manual-assign", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
+  if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
   try {
     const { id } = req.params;
     const {
@@ -7960,6 +8217,8 @@ app.post("/tickets/:id/manual-assign", async (req, res) => {
 
 
 app.post("/tickets/:id/auto-assign", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
+  if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
   try {
     const { id } = req.params;
 
@@ -8061,6 +8320,7 @@ app.post("/tickets/:id/auto-assign", async (req, res) => {
 app.post("/tickets/:id/messages", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
     const {
       message,
       sender_role = "NEIGHBOR",
@@ -8140,6 +8400,7 @@ app.post("/tickets/:id/messages", async (req, res) => {
 app.post("/tickets/:id/media", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
     const {
       media_type,
       data_url,
@@ -8252,6 +8513,7 @@ app.post("/tickets/:id/media", async (req, res) => {
 app.post("/tickets/:id/call-start", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
     const {
       mode = "video",
       sender_role = "NEIGHBOR",
@@ -8335,6 +8597,7 @@ app.post("/tickets/:id/call-start", async (req, res) => {
 app.post("/tickets/:id/call-response", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
     const {
       request_action_id = null,
       response,
@@ -8493,6 +8756,7 @@ app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
   try {
     const { eventId } = req.params;
     const { user_id = null } = req.body || {};
+    if (!checkIdentityAccess(req, res, ["NEIGHBOR", "ADMIN", "SUPER_ADMIN"], user_id, "Sesión de vecino requerida")) return;
 
     const eventResult = await pool.query(
       `
@@ -8556,6 +8820,7 @@ app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/join", async 
   try {
     const { eventId, sessionId } = req.params;
     const { user_id = null } = req.body || {};
+    if (!checkIdentityAccess(req, res, ["NEIGHBOR", "ADMIN", "SUPER_ADMIN"], user_id, "Sesión de vecino requerida")) return;
 
     const eventResult = await pool.query(
       `
@@ -8698,6 +8963,7 @@ app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/end", async (
 });
 
 app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { ticketId } = req.params;
     const { resolver_user_id } = req.body || {};
@@ -8743,6 +9009,7 @@ app.post("/tickets/:id/voice/request", async (req, res) => {
     if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para iniciar llamada segura")) return;
 
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
     const { target_type = "NEIGHBOR" } = req.body || {};
     const ticket = await fetchTicketVoiceContext(id);
 
@@ -8774,6 +9041,7 @@ app.post("/tickets/:id/voice/request", async (req, res) => {
 });
 
 app.get("/tickets/:id/voice/sessions", async (req, res) => {
+  if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
   try {
     const { id } = req.params;
     const sessions = await getVoiceSessionsForTicket(id, { includeCredentials: false, limit: 20 });
@@ -8812,6 +9080,7 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
     if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para atender llamada segura")) return;
 
     const { id, sessionId } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
     const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: true });
 
     if (!session) {
@@ -8981,6 +9250,7 @@ app.post("/tickets/:id/voice/sessions/:sessionId/end", async (req, res) => {
 });
 
 app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/join", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { ticketId, sessionId } = req.params;
     const { resolver_user_id } = req.body || {};
@@ -9338,6 +9608,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
 app.get("/tickets/:id/actions", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
 
     const result = await pool.query(
       `
@@ -9377,6 +9648,7 @@ app.get("/tickets/:id/actions", async (req, res) => {
 app.get("/tickets/:id/notes", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
 
     const result = await pool.query(
       `
@@ -9487,6 +9759,7 @@ function minutesToHuman(minutes) {
 }
 
 app.get("/debug/resolver-status-summary", async (req, res) => {
+  if (!requireDebugAccess(req, res)) return;
   try {
     const adminToken = req.headers["x-admin-token"] || req.query.admin_token;
     if (process.env.ADMIN_TOKEN && adminToken !== process.env.ADMIN_TOKEN) {
@@ -11508,6 +11781,7 @@ app.get("/tickets/:id", async (req, res) => {
   try {
     await ensureIncidentAggregationSchema();
     const { id } = req.params;
+    if (!(await checkTicketParticipantAccess(req, res, id))) return;
 
     const ticketResult = await pool.query(
       `
@@ -11681,6 +11955,7 @@ app.get("/tickets/:id", async (req, res) => {
 
 
 app.post("/resolvers/:id/reconcile-status", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
   try {
     const { id } = req.params;
     const { offline = false } = req.body || {};
@@ -11701,6 +11976,7 @@ app.post("/resolvers/:id/reconcile-status", async (req, res) => {
 });
 
 app.post("/resolvers/reconcile-states", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
   try {
     const { control_center_code = null } = req.body || {};
     const params = [];
@@ -11747,6 +12023,7 @@ app.post("/resolvers/reconcile-states", async (req, res) => {
  */
 
 app.post("/resolver/location", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.user_id, "Sesión de resolutor requerida")) return;
   try {
     const {
       user_id,
@@ -11987,6 +12264,7 @@ app.post("/resolvers/:id/location/clear", async (req, res) => {
 });
 
 app.post("/resolvers/:id/status/offline", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.params.id, "Sesión de resolutor requerida")) return;
   try {
     const { id } = req.params;
     if (!(await requireSameControlCenterForUser(req, res, id))) return;
@@ -12021,6 +12299,7 @@ app.post("/resolvers/:id/status/offline", async (req, res) => {
 });
 
 app.get("/resolver/:user_id/state", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.params.user_id, "Sesión de resolutor requerida")) return;
   try {
     const { user_id } = req.params;
 
@@ -12216,6 +12495,7 @@ app.get("/resolver/:user_id/state", async (req, res) => {
 });
 
 app.post("/tickets/:id/take", async (req, res) => {
+  if (!checkIdentityAccess(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"], req.body?.resolver_user_id, "Sesión de resolutor requerida")) return;
   try {
     const { id } = req.params;
     const { resolver_user_id } = req.body;
@@ -12671,7 +12951,6 @@ function checkAdminToken(req, res) {
   const expected = process.env.ADMIN_TOKEN || "";
   const legacyAdminToken =
     req.headers["x-admin-token"] ||
-    req.query.admin_token ||
     "";
 
   // Compatibilidad: si se define ADMIN_TOKEN, sigue funcionando como llave maestra.
