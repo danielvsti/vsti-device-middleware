@@ -238,6 +238,7 @@ function getRemoteIp(req) {
 
 let controlCenterSettingsSchemaReady = false;
 let emergencyCategoryCatalogSchemaReady = false;
+let municipalQrSchemaReady = false;
 
 const DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES = Object.freeze([
   { type: 'SOS_MANUAL', title: 'SOS General', icon: '🚨', color: '#dc2626', priority: 1, enabled: true, order: 10, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
@@ -294,6 +295,15 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     auto_assignment_enabled: true,
     max_location_age_seconds: 180,
     max_active_tickets: 1
+  },
+  operator_tools: {
+    dashboard_roles: ['OPERATOR', 'ADMIN', 'SUPER_ADMIN'],
+    emergency_contacts: [
+      { key: 'AMBULANCE', label: 'Ambulancia / SAMU', phone: '131', icon: '🚑', enabled: true, order: 10 },
+      { key: 'FIRE_DEPARTMENT', label: 'Bomberos', phone: '132', icon: '🚒', enabled: true, order: 20 },
+      { key: 'POLICE', label: 'Carabineros', phone: '133', icon: '🚓', enabled: true, order: 30 },
+      { key: 'MUNICIPAL_SECURITY', label: 'Seguridad Municipal', phone: '', icon: '🛡️', enabled: false, order: 40 }
+    ]
   },
   neighbor_app: {
     emergency_categories: DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES
@@ -592,6 +602,23 @@ function normalizeControlCenterSettings(input = {}) {
   merged.resolver_policy.max_location_age_seconds = clampPolicyNumber(merged.resolver_policy.max_location_age_seconds, 180, 30, 86400);
   merged.resolver_policy.max_active_tickets = clampPolicyNumber(merged.resolver_policy.max_active_tickets, 1, 1, 20);
 
+  merged.operator_tools = merged.operator_tools || {};
+  const defaultDashboardRoles = DEFAULT_CONTROL_CENTER_SETTINGS.operator_tools.dashboard_roles;
+  merged.operator_tools.dashboard_roles = Array.isArray(merged.operator_tools.dashboard_roles)
+    ? merged.operator_tools.dashboard_roles.map(role => String(role || '').trim().toUpperCase()).filter(Boolean)
+    : [...defaultDashboardRoles];
+  const contactSource = Array.isArray(merged.operator_tools.emergency_contacts)
+    ? merged.operator_tools.emergency_contacts
+    : DEFAULT_CONTROL_CENTER_SETTINGS.operator_tools.emergency_contacts;
+  merged.operator_tools.emergency_contacts = contactSource.map((contact, index) => ({
+    key: String(contact?.key || `CONTACT_${index + 1}`).trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 48),
+    label: String(contact?.label || contact?.name || `Contacto ${index + 1}`).trim().slice(0, 80),
+    phone: String(contact?.phone || '').trim().slice(0, 32),
+    icon: String(contact?.icon || '☎️').trim().slice(0, 12),
+    enabled: normalizePolicyBoolean(contact?.enabled, true),
+    order: clampPolicyNumber(contact?.order, (index + 1) * 10, 1, 999)
+  })).sort((a, b) => a.order - b.order);
+
   merged.neighbor_app = merged.neighbor_app || {};
   merged.neighbor_app.emergency_categories = normalizeNeighborEmergencyCategories(merged.neighbor_app.emergency_categories);
 
@@ -720,6 +747,7 @@ function publicSettingsPayload(settings) {
     notification_policy: normalized.notification_policy,
     incident_policy: normalized.incident_policy,
     resolver_policy: normalized.resolver_policy,
+    operator_tools: normalized.operator_tools,
     neighbor_app: {
       emergency_categories: normalized.neighbor_app.emergency_categories
     }
@@ -737,6 +765,67 @@ function adminSettingsPayload(row) {
     settings: normalizeControlCenterSettings(row.settings || {}),
     updated_at: row.updated_at || null,
     updated_by: row.updated_by || null
+  };
+}
+
+async function ensureMunicipalQrSchema() {
+  if (municipalQrSchemaReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS municipal_qr_points (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      description TEXT,
+      latitude DOUBLE PRECISION NOT NULL,
+      longitude DOUBLE PRECISION NOT NULL,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_municipal_qr_points_cc ON municipal_qr_points(control_center_id, enabled, created_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS municipal_qr_visits (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      qr_point_id UUID NOT NULL REFERENCES municipal_qr_points(id) ON DELETE CASCADE,
+      visit_token TEXT,
+      ip_hash TEXT,
+      user_agent TEXT,
+      referrer TEXT,
+      visited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_municipal_qr_visits_point_date ON municipal_qr_visits(qr_point_id, visited_at DESC)`);
+  await pool.query(`
+    ALTER TABLE mobile_events
+      ADD COLUMN IF NOT EXISTS qr_point_id UUID REFERENCES municipal_qr_points(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS qr_visit_id UUID REFERENCES municipal_qr_visits(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS qr_context JSONB
+  `);
+  municipalQrSchemaReady = true;
+}
+
+function municipalQrPublicPayload(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    description: row.description || null,
+    latitude: Number(row.latitude),
+    longitude: Number(row.longitude),
+    enabled: row.enabled !== false,
+    control_center_code: row.control_center_code || null,
+    control_center_name: row.control_center_name || null,
+    pwa_url: `${process.env.SOS_PWA_BASE_URL || 'https://sos-pwa.onrender.com'}/?qr=${encodeURIComponent(row.code)}&lat=${encodeURIComponent(Number(row.latitude).toFixed(6))}&lng=${encodeURIComponent(Number(row.longitude).toFixed(6))}&cc=${encodeURIComponent(row.control_center_code || '')}`,
+    visit_count: Number(row.visit_count || 0),
+    unique_visitors: Number(row.unique_visitors || 0),
+    last_visit_at: row.last_visit_at || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null
   };
 }
 
@@ -5345,6 +5434,7 @@ app.post("/public/mobile/sos", async (req, res) => {
       sensor_event_type,
       silent,
       confidence,
+      qr_context,
       control_center_code = "CC-VINA"
     } = req.body;
 
@@ -5536,6 +5626,21 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    await ensureMunicipalQrSchema();
+    let qrAttribution = null;
+    if (qr_context && typeof qr_context === 'object' && qr_context.code) {
+      const qrResult = await pool.query(
+        `SELECT q.id, q.code, q.name, q.latitude, q.longitude, q.control_center_id,
+                v.id AS visit_id
+         FROM municipal_qr_points q
+         LEFT JOIN municipal_qr_visits v ON v.id = $2 AND v.qr_point_id = q.id
+         WHERE q.code = $1 AND q.enabled = true AND q.control_center_id = $3
+         LIMIT 1`,
+        [String(qr_context.code).trim(), qr_context.visit_id || null, controlCenterId]
+      );
+      if (qrResult.rows.length) qrAttribution = qrResult.rows[0];
+    }
+
     await pool.query(
       `
       UPDATE mobile_events
@@ -5567,9 +5672,12 @@ app.post("/public/mobile/sos", async (req, res) => {
         acknowledged,
         cancelled,
         jurisdiction_status,
-        jurisdiction_reason
+        jurisdiction_reason,
+        qr_point_id,
+        qr_visit_id,
+        qr_context
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',false,false,$9,$10)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',false,false,$9,$10,$11,$12,$13)
       RETURNING *
       `,
       [
@@ -5582,7 +5690,16 @@ app.post("/public/mobile/sos", async (req, res) => {
         accuracy ?? null,
         battery ?? null,
         jurisdiction.status,
-        jurisdiction.reason
+        jurisdiction.reason,
+        qrAttribution?.id || null,
+        qrAttribution?.visit_id || null,
+        qrAttribution ? JSON.stringify({
+          code: qrAttribution.code,
+          name: qrAttribution.name,
+          installed_latitude: Number(qrAttribution.latitude),
+          installed_longitude: Number(qrAttribution.longitude),
+          visit_id: qrAttribution.visit_id || null
+        }) : null
       ]
     );
 
@@ -6436,6 +6553,11 @@ app.post("/auth/panel-login", authRateLimit, async (req, res) => {
         u.control_center_id,
         cc.code AS control_center_code,
         cc.name AS control_center_name,
+        source_event.qr_context,
+        qr_point.code AS qr_code,
+        qr_point.name AS qr_point_name,
+        qr_point.latitude AS qr_installed_latitude,
+        qr_point.longitude AS qr_installed_longitude,
         u.role,
         u.validation_status,
         u.is_active,
@@ -7261,6 +7383,12 @@ app.get("/tickets", async (req, res) => {
       FROM tickets t
       JOIN control_centers cc
         ON cc.id = t.control_center_id
+
+      LEFT JOIN mobile_events source_event
+        ON source_event.id = t.source_event_id
+
+      LEFT JOIN municipal_qr_points qr_point
+        ON qr_point.id = source_event.qr_point_id
       LEFT JOIN users u
         ON u.id = t.citizen_user_id
       LEFT JOIN users resolver
@@ -9686,6 +9814,197 @@ app.get("/tickets/:id/notes", async (req, res) => {
   }
 });
 
+app.get("/public/qr/:code", async (req, res) => {
+  try {
+    await ensureMunicipalQrSchema();
+    const result = await pool.query(
+      `SELECT q.*, cc.code AS control_center_code, cc.name AS control_center_name
+       FROM municipal_qr_points q
+       JOIN control_centers cc ON cc.id = q.control_center_id
+       WHERE q.code = $1 AND q.enabled = true LIMIT 1`,
+      [String(req.params.code || '').trim()]
+    );
+    if (!result.rows.length) return res.status(404).json({ status: 'error', message: 'Punto QR no encontrado o inactivo' });
+    res.json({ status: 'ok', qr_point: municipalQrPublicPayload(result.rows[0]) });
+  } catch (error) {
+    console.error('[PUBLIC QR LOOKUP ERROR]', error);
+    res.status(500).json({ status: 'error', message: 'No fue posible consultar el punto QR' });
+  }
+});
+
+app.post("/public/qr/:code/visit", async (req, res) => {
+  try {
+    await ensureMunicipalQrSchema();
+    const pointResult = await pool.query(
+      `SELECT q.*, cc.code AS control_center_code, cc.name AS control_center_name
+       FROM municipal_qr_points q
+       JOIN control_centers cc ON cc.id = q.control_center_id
+       WHERE q.code = $1 AND q.enabled = true LIMIT 1`,
+      [String(req.params.code || '').trim()]
+    );
+    if (!pointResult.rows.length) return res.status(404).json({ status: 'error', message: 'Punto QR no encontrado o inactivo' });
+    const ipHash = crypto.createHash('sha256').update(`${getRemoteIp(req)}:${SESSION_SECRET}`).digest('hex');
+    const visit = await pool.query(
+      `INSERT INTO municipal_qr_visits (qr_point_id, visit_token, ip_hash, user_agent, referrer)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id, visited_at`,
+      [
+        pointResult.rows[0].id,
+        String(req.body?.visit_token || '').trim().slice(0, 120) || null,
+        ipHash,
+        String(req.headers['user-agent'] || '').slice(0, 500) || null,
+        String(req.body?.referrer || req.headers.referer || '').slice(0, 500) || null
+      ]
+    );
+    res.json({
+      status: 'ok',
+      visit_id: visit.rows[0].id,
+      visited_at: visit.rows[0].visited_at,
+      qr_point: municipalQrPublicPayload(pointResult.rows[0])
+    });
+  } catch (error) {
+    console.error('[PUBLIC QR VISIT ERROR]', error);
+    res.status(500).json({ status: 'error', message: 'No fue posible registrar el acceso QR' });
+  }
+});
+
+app.get("/admin/control-centers/:code/qr-points", async (req, res) => {
+  if (!checkRoleAccess(req, res, ['ADMIN', 'SUPER_ADMIN'], 'Se requiere usuario ADMIN para gestionar QR')) return;
+  try {
+    await ensureMunicipalQrSchema();
+    const code = requestedControlCenterForSession(req, req.params.code, 'CC-VINA');
+    const result = await pool.query(
+      `SELECT q.*, cc.code AS control_center_code, cc.name AS control_center_name,
+              COUNT(v.id)::int AS visit_count,
+              COUNT(DISTINCT NULLIF(v.visit_token,''))::int AS unique_visitors,
+              MAX(v.visited_at) AS last_visit_at
+       FROM municipal_qr_points q
+       JOIN control_centers cc ON cc.id = q.control_center_id
+       LEFT JOIN municipal_qr_visits v ON v.qr_point_id = q.id
+       WHERE cc.code = $1
+       GROUP BY q.id, cc.code, cc.name
+       ORDER BY q.created_at DESC`,
+      [code]
+    );
+    res.json({ status: 'ok', qr_points: result.rows.map(municipalQrPublicPayload) });
+  } catch (error) {
+    console.error('[ADMIN QR LIST ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post("/admin/control-centers/:code/qr-points", async (req, res) => {
+  if (!checkRoleAccess(req, res, ['ADMIN', 'SUPER_ADMIN'], 'Se requiere usuario ADMIN para gestionar QR')) return;
+  try {
+    await ensureMunicipalQrSchema();
+    const code = requestedControlCenterForSession(req, req.params.code, 'CC-VINA');
+    const cc = await pool.query('SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1', [code]);
+    if (!cc.rows.length) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    const name = String(req.body?.name || '').trim();
+    if (!name || !Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+      return res.status(400).json({ status: 'error', message: 'Nombre y coordenadas GPS válidas son obligatorios' });
+    }
+    const qrCode = `QR-${code.replace(/[^A-Z0-9]/g, '')}-${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
+    const result = await pool.query(
+      `INSERT INTO municipal_qr_points (control_center_id, code, name, description, latitude, longitude, enabled, metadata, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [
+        cc.rows[0].id,
+        qrCode,
+        name.slice(0, 120),
+        String(req.body?.description || '').trim().slice(0, 500) || null,
+        latitude,
+        longitude,
+        req.body?.enabled !== false,
+        JSON.stringify(req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {}),
+        req.panel_session.sub
+      ]
+    );
+    res.status(201).json({ status: 'ok', qr_point: municipalQrPublicPayload({ ...result.rows[0], control_center_code: cc.rows[0].code, control_center_name: cc.rows[0].name }) });
+  } catch (error) {
+    console.error('[ADMIN QR CREATE ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.patch("/admin/qr-points/:id", async (req, res) => {
+  if (!checkRoleAccess(req, res, ['ADMIN', 'SUPER_ADMIN'], 'Se requiere usuario ADMIN para gestionar QR')) return;
+  try {
+    await ensureMunicipalQrSchema();
+    const allowedCode = requestedControlCenterForSession(req, req.body?.control_center_code, 'CC-VINA');
+    const latitude = req.body?.latitude == null ? null : Number(req.body.latitude);
+    const longitude = req.body?.longitude == null ? null : Number(req.body.longitude);
+    if ((latitude != null && !Number.isFinite(latitude)) || (longitude != null && !Number.isFinite(longitude))) {
+      return res.status(400).json({ status: 'error', message: 'Coordenadas GPS inválidas' });
+    }
+    const result = await pool.query(
+      `UPDATE municipal_qr_points q SET
+         name = COALESCE(NULLIF($3,''), q.name),
+         description = CASE WHEN $4::text IS NULL THEN q.description ELSE NULLIF($4,'') END,
+         latitude = COALESCE($5, q.latitude), longitude = COALESCE($6, q.longitude),
+         enabled = COALESCE($7, q.enabled), updated_at = NOW()
+       FROM control_centers cc
+       WHERE q.id = $1 AND cc.id = q.control_center_id AND cc.code = $2
+       RETURNING q.*, cc.code AS control_center_code, cc.name AS control_center_name`,
+      [req.params.id, allowedCode, String(req.body?.name || '').trim(), req.body?.description == null ? null : String(req.body.description).trim(), latitude, longitude, typeof req.body?.enabled === 'boolean' ? req.body.enabled : null]
+    );
+    if (!result.rows.length) return res.status(404).json({ status: 'error', message: 'Punto QR no encontrado' });
+    res.json({ status: 'ok', qr_point: municipalQrPublicPayload(result.rows[0]) });
+  } catch (error) {
+    console.error('[ADMIN QR UPDATE ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.use("/dashboard", async (req, res, next) => {
+  try {
+    const session = panelSessionFromRequest(req);
+    if (!session || !roleHasAccess(session.role, ['OPERATOR', 'ADMIN', 'SUPER_ADMIN'])) {
+      return res.status(401).json({ status: 'error', message: 'Se requiere acceso autorizado al Dashboard' });
+    }
+    const settingsRow = session.control_center_id ? await getControlCenterSettingsById(session.control_center_id).catch(() => null) : null;
+    const settings = normalizeControlCenterSettings(settingsRow?.settings || {});
+    const allowedRoles = settings.operator_tools?.dashboard_roles || ['ADMIN', 'SUPER_ADMIN'];
+    if (!allowedRoles.includes(String(session.role || '').toUpperCase())) {
+      return res.status(403).json({ status: 'error', code: 'DASHBOARD_ACCESS_DISABLED', message: 'Tu cuenta no está autorizada para consultar el Dashboard' });
+    }
+    req.panel_session = session;
+    next();
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: 'No fue posible validar acceso al Dashboard' });
+  }
+});
+
+app.get("/dashboard/qr-analytics", async (req, res) => {
+  if (!checkRoleAccess(req, res, ['OPERATOR', 'ADMIN', 'SUPER_ADMIN'], 'Se requiere acceso al Dashboard')) return;
+  try {
+    await ensureMunicipalQrSchema();
+    const code = dashboardAuthorizedControlCenterCode(req);
+    const days = Math.max(1, Math.min(365, Number(req.query.days || 30)));
+    const result = await pool.query(
+      `SELECT q.id, q.code, q.name, q.latitude, q.longitude,
+              COUNT(DISTINCT v.id) FILTER (WHERE v.visited_at >= NOW() - ($2::int * INTERVAL '1 day'))::int AS visits,
+              COUNT(DISTINCT NULLIF(v.visit_token,'')) FILTER (WHERE v.visited_at >= NOW() - ($2::int * INTERVAL '1 day'))::int AS unique_visitors,
+              COUNT(DISTINCT m.id) FILTER (WHERE m.created_at >= NOW() - ($2::int * INTERVAL '1 day'))::int AS sos_events,
+              MAX(v.visited_at) AS last_visit_at
+       FROM municipal_qr_points q
+       JOIN control_centers cc ON cc.id = q.control_center_id
+       LEFT JOIN municipal_qr_visits v ON v.qr_point_id = q.id
+       LEFT JOIN mobile_events m ON m.qr_point_id = q.id
+       WHERE cc.code = $1
+       GROUP BY q.id
+       ORDER BY visits DESC, q.name ASC`,
+      [code, days]
+    );
+    res.json({ status: 'ok', days, points: result.rows });
+  } catch (error) {
+    console.error('[DASHBOARD QR ANALYTICS ERROR]', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
 app.get("/dashboard/summary", async (req, res) => {
   if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al dashboard")) return;
   try {
@@ -11415,7 +11734,7 @@ app.get("/dashboard/tickets", async (req, res) => {
     if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(10, Math.max(1, Number(req.query.page_size || 10)));
+    const pageSize = Math.min(1000, Math.max(1, Number(req.query.page_size || 10)));
     const offset = (page - 1) * pageSize;
     const state = String(req.query.state || "").trim().toUpperCase();
     const alertType = String(req.query.alert_type || "").trim().toUpperCase();
@@ -11784,6 +12103,7 @@ const sirensForDashboard = sirensResult.rows.map((siren) => {
 app.get("/tickets/:id", async (req, res) => {
   try {
     await ensureIncidentAggregationSchema();
+    await ensureMunicipalQrSchema();
     const { id } = req.params;
     if (!(await checkTicketParticipantAccess(req, res, id))) return;
 
