@@ -159,6 +159,21 @@ function getRemoteIp(req) {
 */
 
 let controlCenterSettingsSchemaReady = false;
+let emergencyCategoryCatalogSchemaReady = false;
+
+const DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES = Object.freeze([
+  { type: 'SOS_MANUAL', title: 'SOS General', icon: '🚨', color: '#dc2626', priority: 1, enabled: true, order: 10, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'MEDICAL', title: 'Médica', icon: '🚑', color: '#16a34a', priority: 1, enabled: true, order: 20, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'FIRE', title: 'Incendio', icon: '🔥', color: '#f97316', priority: 1, enabled: true, order: 30, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
+  { type: 'SECURITY', title: 'Seguridad', icon: '👮', color: '#7c3aed', priority: 2, enabled: true, order: 40, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: true },
+  { type: 'VIF', title: 'VIF', icon: '🏠', color: '#8b5cf6', priority: 1, enabled: true, order: 50, sensitive: true, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'TRAFFIC_ACCIDENT', title: 'Accidente', icon: '🚗', color: '#2563eb', priority: 2, enabled: true, order: 60, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'URBAN_RISK', title: 'Riesgo', icon: '⚠️', color: '#eab308', priority: 3, enabled: true, order: 70, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'OTHER', title: 'Otro', icon: '📝', color: '#64748b', priority: 3, enabled: true, order: 80, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false }
+]);
+
+let emergencyCategoryCatalogCache = DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES.map(category => ({ ...category }));
+const AUTOMATIC_MOBILE_ALERT_TYPES = new Set(['VIF_SILENT_SHAKE', 'FALL_DETECTED']);
 
 const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
   features: {
@@ -201,6 +216,9 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     auto_assignment_enabled: true,
     max_location_age_seconds: 180,
     max_active_tickets: 1
+  },
+  neighbor_app: {
+    emergency_categories: DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES
   }
 });
 
@@ -241,6 +259,204 @@ function clampPolicyNumber(value, fallback, min, max) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function currentEmergencyCategoryCatalog() {
+  return Array.isArray(emergencyCategoryCatalogCache) && emergencyCategoryCatalogCache.length
+    ? emergencyCategoryCatalogCache
+    : DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES;
+}
+
+function normalizeEmergencyCategoryCatalogItem(raw = {}, fallback = {}) {
+  const type = String(raw.type || raw.category_type || fallback.type || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 48);
+  const title = String(raw.title || raw.label || fallback.title || type || 'Categoría').trim().slice(0, 48);
+  const icon = String(raw.icon || fallback.icon || '🆘').trim().slice(0, 12);
+  const color = String(raw.color || fallback.color || '#2563eb').trim().slice(0, 24);
+
+  return {
+    type,
+    title: title || type,
+    icon: icon || '🆘',
+    color,
+    priority: clampPolicyNumber(raw.priority, fallback.priority || 3, 1, 5),
+    enabled: normalizePolicyBoolean(raw.enabled, fallback.enabled !== false),
+    order: clampPolicyNumber(raw.order ?? raw.display_order, fallback.order || 100, 1, 9999),
+    sensitive: normalizePolicyBoolean(raw.sensitive, fallback.sensitive === true),
+    allow_voice: normalizePolicyBoolean(raw.allow_voice, fallback.allow_voice !== false),
+    allow_evidence: normalizePolicyBoolean(raw.allow_evidence, fallback.allow_evidence !== false),
+    allow_nearby_notifications: normalizePolicyBoolean(raw.allow_nearby_notifications, fallback.allow_nearby_notifications === true),
+    allow_sirens: normalizePolicyBoolean(raw.allow_sirens, fallback.allow_sirens === true)
+  };
+}
+
+function normalizeEmergencyCategoryCatalog(input = []) {
+  const byType = new Map(DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES.map(category => [category.type, { ...category }]));
+  const source = Array.isArray(input) ? input : [];
+
+  for (const raw of source) {
+    if (!isPlainObject(raw)) continue;
+    const fallbackType = String(raw.type || raw.category_type || '').trim().toUpperCase();
+    const fallback = byType.get(fallbackType) || {};
+    const item = normalizeEmergencyCategoryCatalogItem(raw, fallback);
+    if (!item.type) continue;
+    byType.set(item.type, item);
+  }
+
+  return Array.from(byType.values()).sort((a, b) => {
+    if (a.order !== b.order) return a.order - b.order;
+    return a.title.localeCompare(b.title, 'es');
+  });
+}
+
+function normalizeNeighborEmergencyCategories(input = [], catalog = currentEmergencyCategoryCatalog()) {
+  const availableCatalog = normalizeEmergencyCategoryCatalog(catalog).filter(category => category.enabled !== false);
+  const byType = new Map(availableCatalog.map(category => [category.type, {
+    type: category.type,
+    title: category.title,
+    icon: category.icon,
+    color: category.color,
+    priority: category.priority,
+    enabled: category.enabled !== false,
+    order: category.order,
+    title_override: null
+  }]));
+  const source = Array.isArray(input) ? input : [];
+
+  for (const [index, raw] of source.entries()) {
+    if (!isPlainObject(raw)) continue;
+    const type = String(raw.type || raw.alert_type || raw.code || '').trim().toUpperCase();
+    if (!byType.has(type)) continue;
+
+    const fallback = byType.get(type);
+    const titleOverride = String(raw.title_override || raw.alias || '').trim().slice(0, 48) || null;
+    const title = String(raw.title || raw.label || titleOverride || fallback.title || type).trim().slice(0, 48);
+    const icon = String(raw.icon || fallback.icon || '🆘').trim().slice(0, 8);
+
+    byType.set(type, {
+      type,
+      title: title || fallback.title,
+      title_override: titleOverride,
+      icon: icon || fallback.icon,
+      color: String(raw.color || fallback.color || '#2563eb').trim().slice(0, 24),
+      priority: clampPolicyNumber(raw.priority, fallback.priority, 1, 5),
+      enabled: normalizePolicyBoolean(raw.enabled, fallback.enabled !== false),
+      order: clampPolicyNumber(raw.order, fallback.order || ((index + 1) * 10), 1, 999)
+    });
+  }
+
+  const categories = Array.from(byType.values()).sort((a, b) => {
+    if (a.order !== b.order) return a.order - b.order;
+    return a.title.localeCompare(b.title, 'es');
+  });
+
+  if (!categories.some(category => category.enabled)) {
+    const sos = categories.find(category => category.type === 'SOS_MANUAL');
+    if (sos) sos.enabled = true;
+  }
+
+  return categories;
+}
+
+function isNeighborEmergencyCategoryEnabled(settings, alertType) {
+  const type = String(alertType || 'SOS_MANUAL').trim().toUpperCase();
+  if (AUTOMATIC_MOBILE_ALERT_TYPES.has(type)) return true;
+  const normalized = normalizeControlCenterSettings(settings || {});
+  const categories = normalized.neighbor_app?.emergency_categories || DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES;
+  return categories.some(category => category.type === type && category.enabled !== false);
+}
+
+async function ensureEmergencyCategoryCatalogSchema() {
+  if (emergencyCategoryCatalogSchemaReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS emergency_category_catalog (
+      category_type TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      icon TEXT NOT NULL DEFAULT '🆘',
+      color TEXT DEFAULT '#2563eb',
+      priority INTEGER NOT NULL DEFAULT 3,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      display_order INTEGER NOT NULL DEFAULT 100,
+      sensitive BOOLEAN NOT NULL DEFAULT false,
+      allow_voice BOOLEAN NOT NULL DEFAULT true,
+      allow_evidence BOOLEAN NOT NULL DEFAULT true,
+      allow_nearby_notifications BOOLEAN NOT NULL DEFAULT false,
+      allow_sirens BOOLEAN NOT NULL DEFAULT false,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  for (const category of DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES) {
+    await pool.query(
+      `
+      INSERT INTO emergency_category_catalog (
+        category_type,
+        title,
+        icon,
+        color,
+        priority,
+        enabled,
+        display_order,
+        sensitive,
+        allow_voice,
+        allow_evidence,
+        allow_nearby_notifications,
+        allow_sirens
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT (category_type) DO NOTHING
+      `,
+      [
+        category.type,
+        category.title,
+        category.icon,
+        category.color,
+        category.priority,
+        category.enabled !== false,
+        category.order,
+        category.sensitive === true,
+        category.allow_voice !== false,
+        category.allow_evidence !== false,
+        category.allow_nearby_notifications === true,
+        category.allow_sirens === true
+      ]
+    );
+  }
+
+  await refreshEmergencyCategoryCatalogCache();
+  emergencyCategoryCatalogSchemaReady = true;
+}
+
+async function refreshEmergencyCategoryCatalogCache() {
+  const result = await pool.query(`
+    SELECT
+      category_type AS type,
+      title,
+      icon,
+      color,
+      priority,
+      enabled,
+      display_order AS "order",
+      sensitive,
+      allow_voice,
+      allow_evidence,
+      allow_nearby_notifications,
+      allow_sirens,
+      metadata
+    FROM emergency_category_catalog
+    ORDER BY display_order ASC, title ASC
+  `);
+
+  emergencyCategoryCatalogCache = normalizeEmergencyCategoryCatalog(result.rows);
+  return emergencyCategoryCatalogCache;
+}
+
+async function loadEmergencyCategoryCatalog({ includeDisabled = true } = {}) {
+  await ensureEmergencyCategoryCatalogSchema();
+  const catalog = emergencyCategoryCatalogCache || DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES;
+  return includeDisabled ? catalog : catalog.filter(category => category.enabled !== false);
 }
 
 function normalizeControlCenterSettings(input = {}) {
@@ -298,11 +514,16 @@ function normalizeControlCenterSettings(input = {}) {
   merged.resolver_policy.max_location_age_seconds = clampPolicyNumber(merged.resolver_policy.max_location_age_seconds, 180, 30, 86400);
   merged.resolver_policy.max_active_tickets = clampPolicyNumber(merged.resolver_policy.max_active_tickets, 1, 1, 20);
 
+  merged.neighbor_app = merged.neighbor_app || {};
+  merged.neighbor_app.emergency_categories = normalizeNeighborEmergencyCategories(merged.neighbor_app.emergency_categories);
+
   return merged;
 }
 
 async function ensureControlCenterSettingsSchema() {
   if (controlCenterSettingsSchemaReady) return;
+
+  await ensureEmergencyCategoryCatalogSchema();
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS control_center_settings (
@@ -420,7 +641,10 @@ function publicSettingsPayload(settings) {
     },
     notification_policy: normalized.notification_policy,
     incident_policy: normalized.incident_policy,
-    resolver_policy: normalized.resolver_policy
+    resolver_policy: normalized.resolver_policy,
+    neighbor_app: {
+      emergency_categories: normalized.neighbor_app.emergency_categories
+    }
   };
 }
 
@@ -637,6 +861,7 @@ function allowedRolesForPanel(panelType) {
 */
 
 let geofenceSchemaReady = false;
+let neighborProvisioningSchemaReady = false;
 
 async function ensureGeofenceSchema() {
   if (geofenceSchemaReady) return;
@@ -672,6 +897,23 @@ async function ensureGeofenceSchema() {
   `);
 
   geofenceSchemaReady = true;
+}
+
+async function ensureNeighborProvisioningSchema() {
+  if (neighborProvisioningSchemaReady) return;
+
+  await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS provisional_expires_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_users_neighbor_validation_review
+    ON users(control_center_id, validation_status, provisional_expires_at)
+    WHERE role = 'NEIGHBOR'
+  `);
+
+  neighborProvisioningSchemaReady = true;
 }
 
 function normalizeGeoJsonGeometry(input) {
@@ -816,6 +1058,98 @@ function evaluateJurisdiction(controlCenter, latitude, longitude) {
     reason: `Evento fuera del territorio autorizado del centro de control${distance != null ? ` (${Math.round(distance)} m del límite)` : ''}`,
     distance_meters: distance == null ? null : Math.round(distance)
   };
+}
+
+async function resolveControlCenterForNeighborRegistration(latitude, longitude) {
+  await ensureGeofenceSchema();
+
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    const error = new Error("Para registrarte necesitamos obtener tu ubicación GPS.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const ccResult = await pool.query(`
+    SELECT id, code, name, latitude, longitude, boundary_geojson, geofence_buffer_meters
+    FROM control_centers
+    ORDER BY code
+  `);
+
+  const centers = ccResult.rows || [];
+  const geofencedCenters = centers.filter((center) => normalizeGeoJsonGeometry(center.boundary_geojson));
+  const matches = [];
+
+  for (const center of geofencedCenters) {
+    const jurisdiction = evaluateJurisdiction(center, lat, lon);
+    if (jurisdiction.valid && jurisdiction.status !== 'NO_GEOFENCE_CONFIGURED') {
+      matches.push({ controlCenter: center, jurisdiction });
+    }
+  }
+
+  if (matches.length) {
+    matches.sort((a, b) => {
+      const aDistance = a.jurisdiction.distance_meters ?? 0;
+      const bDistance = b.jurisdiction.distance_meters ?? 0;
+      const aExact = a.jurisdiction.status === 'IN_JURISDICTION' ? 0 : 1;
+      const bExact = b.jurisdiction.status === 'IN_JURISDICTION' ? 0 : 1;
+      return aExact - bExact || aDistance - bDistance || String(a.controlCenter.code).localeCompare(String(b.controlCenter.code));
+    });
+    return matches[0];
+  }
+
+  if (geofencedCenters.length) {
+    const candidates = geofencedCenters
+      .map((center) => {
+        const distance = minDistanceToGeoJsonMeters(lon, lat, center.boundary_geojson);
+        return {
+          controlCenter: center,
+          distance_meters: distance == null ? null : Math.round(distance)
+        };
+      })
+      .filter((item) => item.distance_meters != null)
+      .sort((a, b) => a.distance_meters - b.distance_meters);
+
+    const nearest = candidates[0];
+    const error = new Error(
+      nearest
+        ? `Tu ubicación GPS no corresponde a una zona cubierta por un Centro de Control. Centro más cercano: ${nearest.controlCenter.name || nearest.controlCenter.code}, a ${nearest.distance_meters} m del límite.`
+        : "Tu ubicación GPS no corresponde a una zona cubierta por un Centro de Control."
+    );
+    error.statusCode = 422;
+    error.details = nearest ? {
+      nearest_control_center_code: nearest.controlCenter.code,
+      nearest_control_center_name: nearest.controlCenter.name,
+      distance_meters: nearest.distance_meters
+    } : null;
+    throw error;
+  }
+
+  const coordinateCandidates = centers
+    .filter((center) => Number.isFinite(Number(center.latitude)) && Number.isFinite(Number(center.longitude)))
+    .map((center) => ({
+      controlCenter: center,
+      distance_meters: Math.round(distanceMeters(lat, lon, Number(center.latitude), Number(center.longitude)))
+    }))
+    .sort((a, b) => a.distance_meters - b.distance_meters);
+
+  if (coordinateCandidates.length) {
+    const nearest = coordinateCandidates[0];
+    return {
+      controlCenter: nearest.controlCenter,
+      jurisdiction: {
+        valid: true,
+        status: 'NEAREST_CONTROL_CENTER',
+        reason: `Centro de control más cercano por GPS (${nearest.distance_meters} m)`,
+        distance_meters: nearest.distance_meters
+      }
+    };
+  }
+
+  const error = new Error("No hay Centros de Control configurados para asignar el registro.");
+  error.statusCode = 500;
+  throw error;
 }
 
 app.get('/admin/control-centers/:code/geofence', async (req, res) => {
@@ -3202,6 +3536,7 @@ function publicUserPayload(user, controlCenter = null) {
     control_center_name: user.control_center_name || controlCenter?.name || null,
     role: user.role,
     validation_status: user.validation_status,
+    provisional_expires_at: user.provisional_expires_at || null,
     is_active: user.is_active === true,
     full_name: user.full_name,
     phone: user.phone,
@@ -3236,6 +3571,16 @@ function canNeighborUseSos(user) {
       ok: false,
       reason: `El usuario no está habilitado para generar SOS (${user.validation_status})`
     };
+  }
+
+  if (user.validation_status === "PROVISIONAL_ACTIVE" && user.provisional_expires_at) {
+    const expiresAt = new Date(user.provisional_expires_at).getTime();
+    if (Number.isFinite(expiresAt) && expiresAt < Date.now()) {
+      return {
+        ok: false,
+        reason: "El registro provisional expiró. Debe ser validado por la municipalidad."
+      };
+    }
   }
 
   return { ok: true };
@@ -3274,7 +3619,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v15-neighbor-status",
+version: "2.0-v20-central-operator-call-flow",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -3643,6 +3988,29 @@ res.json({
 
 });
 
+app.get("/public/control-centers/:code/settings", async (req, res) => {
+  try {
+    const requestedCode = req.params.code || req.query.control_center_code || 'CC-VINA';
+    const row = await getControlCenterSettingsByCode(requestedCode);
+    if (!row) {
+      return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    }
+
+    return res.json({
+      status: "ok",
+      control_center: {
+        id: row.control_center_id,
+        code: row.control_center_code,
+        name: row.control_center_name
+      },
+      platform_settings: publicSettingsPayload(row.settings)
+    });
+  } catch (error) {
+    console.error("[PUBLIC CONTROL CENTER SETTINGS ERROR]", error);
+    return res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
 
 app.post("/public/sirens/activate", async (req, res) => {
 		const { siren_id, duration_seconds, control_center_code } = req.body;
@@ -3911,8 +4279,9 @@ function normalizeVoiceStatus(event) {
   if (raw === 'PARTICIPANT_REGISTERED') return 'WAITING';
   if (raw === 'RINGING') return 'RINGING';
   if (raw === 'CONNECTED') return 'CONNECTED';
-  if (raw === 'PARTICIPANT_DISCONNECTED') return 'CONNECTED';
+  if (raw === 'PARTICIPANT_DISCONNECTED') return 'ENDED';
   if (raw === 'ENDED') return 'ENDED';
+  if (raw === 'REJECTED') return 'REJECTED';
   if (raw === 'FAILED') return 'FAILED';
   if (raw === 'NO_ANSWER') return 'NO_ANSWER';
   if (raw === 'EXPIRED') return 'EXPIRED';
@@ -3924,18 +4293,19 @@ function voiceEventDescription(event, payload = {}) {
   const normalized = String(event || '').toUpperCase();
   const role = payload.participant_role ? ` (${payload.participant_role})` : '';
   const descriptions = {
-    SESSION_CREATED: 'WA-Center creó la sesión de llamada segura',
-    PARTICIPANT_REGISTERED: `Participante registrado en llamada segura${role}`,
+    SESSION_CREATED: 'Se preparó la llamada segura',
+    PARTICIPANT_REGISTERED: `Participante disponible en la llamada segura${role}`,
     RINGING: `Llamada segura sonando${role}`,
     CONNECTED: 'Llamada segura conectada',
     PARTICIPANT_DISCONNECTED: `Participante desconectado de llamada segura${role}`,
     ENDED: 'Llamada segura finalizada',
+    REJECTED: 'Llamada segura rechazada',
     FAILED: 'Llamada segura fallida',
     NO_ANSWER: 'Llamada segura sin respuesta',
     EXPIRED: 'Sesión de llamada segura expirada',
     RECORDING_AVAILABLE: 'Grabación de llamada segura disponible'
   };
-  return descriptions[normalized] || `Evento técnico de llamada segura: ${normalized || 'UPDATED'}`;
+  return descriptions[normalized] || `Actualización de llamada segura: ${normalized || 'UPDATED'}`;
 }
 
 function sanitizeVoiceSessionRow(row, options = {}) {
@@ -3945,7 +4315,9 @@ function sanitizeVoiceSessionRow(row, options = {}) {
     if (!value || typeof value !== 'object') return value || null;
     if (includeCredentials) return value;
     const copy = { ...value };
-    if (copy.password) copy.password = '***';
+    delete copy.password;
+    delete copy.ha1;
+    delete copy.password_hash;
     return copy;
   };
 
@@ -3995,6 +4367,14 @@ function voiceParticipantForRequester({ requestedBy, targetType }) {
   return 'party_b';
 }
 
+function operatorCanHandleVoiceSession(session, ticket = null) {
+  if (!session) return false;
+  const requestedBy = String(session.requested_by || '').toUpperCase();
+  const targetType = String(session.target_type || '').toUpperCase();
+  const hasResolver = Boolean(ticket?.assigned_resolver_id || ticket?.resolver_id);
+  return requestedBy === 'NEIGHBOR' && (targetType === 'CENTRAL' || (!hasResolver && targetType !== 'RESOLVER'));
+}
+
 async function getVoiceSessionForTicket(ticketId, sessionId = 'latest', options = {}) {
   await ensureVoiceSchema();
   const latest = !sessionId || String(sessionId).toLowerCase() === 'latest';
@@ -4004,7 +4384,7 @@ async function getVoiceSessionForTicket(ticketId, sessionId = 'latest', options 
       SELECT *
       FROM ticket_voice_sessions
       WHERE ticket_id = $1
-        AND status NOT IN ('FAILED','ENDED','EXPIRED','NO_ANSWER')
+        AND status NOT IN ('FAILED','ENDED','EXPIRED','NO_ANSWER','REJECTED')
       ORDER BY created_at DESC
       LIMIT 1
       `
@@ -4067,13 +4447,13 @@ async function fetchTicketVoiceContext(ticketId) {
 
 async function callWaCenterCreateVoiceSession(payload) {
   if (!WA_CENTER_VOICE_ENABLED) {
-    const err = new Error('WA-Center Voice no está habilitado en este ambiente.');
+    const err = new Error('El servicio de llamadas no está habilitado en este ambiente.');
     err.code = 'WA_CENTER_VOICE_DISABLED';
     throw err;
   }
 
   if (!WA_CENTER_BASE_URL || !WA_CENTER_API_TOKEN) {
-    const err = new Error('WA-Center Voice no está configurado.');
+    const err = new Error('El servicio de llamadas no está configurado.');
     err.code = 'WA_CENTER_VOICE_NOT_CONFIGURED';
     throw err;
   }
@@ -4092,7 +4472,7 @@ async function callWaCenterCreateVoiceSession(payload) {
   try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
 
   if (!response.ok || data?.ok === false) {
-    const err = new Error(data?.message || data?.error || `WA-Center HTTP ${response.status}`);
+    const err = new Error(data?.message || data?.error || `Servicio de llamadas HTTP ${response.status}`);
     err.code = 'WA_CENTER_CREATE_FAILED';
     err.status = response.status;
     err.response = data;
@@ -4101,6 +4481,431 @@ async function callWaCenterCreateVoiceSession(payload) {
 
   return data;
 }
+
+const VOICE_TERMINAL_STATUSES = new Set(['ENDED', 'FAILED', 'NO_ANSWER', 'EXPIRED', 'REJECTED']);
+const VOICE_NO_ANSWER_TIMEOUT_MS = 45_000;
+
+function isVoiceTerminalStatus(status) {
+  return VOICE_TERMINAL_STATUSES.has(String(status || '').toUpperCase());
+}
+
+async function callWaCenterVoiceAction(session, action) {
+  if (!WA_CENTER_VOICE_ENABLED) {
+    const err = new Error('El servicio de llamadas no está habilitado en este ambiente.');
+    err.code = 'WA_CENTER_VOICE_DISABLED';
+    throw err;
+  }
+
+  if (!WA_CENTER_BASE_URL || !WA_CENTER_API_TOKEN) {
+    const err = new Error('El servicio de llamadas no está configurado.');
+    err.code = 'WA_CENTER_VOICE_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const waSessionId = session?.wa_center_session_id;
+  if (!waSessionId) {
+    const err = new Error('La llamada no está disponible para finalizar.');
+    err.code = 'WA_CENTER_SESSION_ID_MISSING';
+    throw err;
+  }
+
+  const normalizedAction = action === 'end' ? 'end' : 'revoke';
+  const response = await fetch(
+    `${WA_CENTER_BASE_URL}/voice/sessions/${encodeURIComponent(waSessionId)}/${normalizedAction}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${WA_CENTER_API_TOKEN}`
+      },
+      body: JSON.stringify({})
+    }
+  );
+
+  const text = await response.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+
+  // Una sesión que el proveedor ya cerró cumple el objetivo de una limpieza idempotente.
+  if (!response.ok && ![404, 409, 410].includes(response.status)) {
+    const err = new Error(data?.message || data?.error || `Servicio de llamadas HTTP ${response.status}`);
+    err.code = 'WA_CENTER_FINALIZE_FAILED';
+    err.status = response.status;
+    err.response = data;
+    throw err;
+  }
+
+  return data;
+}
+
+async function finalizeTicketVoiceSession({
+  session,
+  outcome = 'ENDED',
+  actorRole = 'SYSTEM',
+  actorUserId = null,
+  reason = null
+}) {
+  if (!session?.id) {
+    const err = new Error('Voice session not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const currentStatus = String(session.status || '').toUpperCase();
+  if (isVoiceTerminalStatus(currentStatus)) return session;
+
+  const normalizedOutcome = VOICE_TERMINAL_STATUSES.has(String(outcome).toUpperCase())
+    ? String(outcome).toUpperCase()
+    : 'ENDED';
+  const action = currentStatus === 'CONNECTED' || session.connected_at ? 'end' : 'revoke';
+
+  await callWaCenterVoiceAction(session, action);
+
+  const updated = await pool.query(
+    `
+    UPDATE ticket_voice_sessions
+    SET
+      status = $2,
+      ended_at = COALESCE(ended_at, NOW()),
+      failure_reason = CASE WHEN $3::text IS NULL THEN failure_reason ELSE $3 END,
+      updated_at = NOW()
+    WHERE id = $1
+      AND status NOT IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED')
+    RETURNING *
+    `,
+    [session.id, normalizedOutcome, reason]
+  );
+
+  if (updated.rows.length === 0) {
+    return getVoiceSessionForTicket(session.ticket_id, session.id, { includeCredentials: false });
+  }
+
+  const eventName = normalizedOutcome;
+  await pool.query(
+    `
+    INSERT INTO ticket_voice_events (
+      voice_session_id,
+      ticket_id,
+      wa_center_session_id,
+      external_reference,
+      event,
+      failure_reason,
+      payload
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `,
+    [
+      session.id,
+      session.ticket_id,
+      session.wa_center_session_id,
+      session.external_reference,
+      eventName,
+      reason,
+      JSON.stringify({ source: 'sos_lifecycle', action, outcome: normalizedOutcome, reason })
+    ]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_user_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,$2,$3,$4,$5,$6)
+    `,
+    [
+      session.ticket_id,
+      actorUserId,
+      actorRole,
+      `VOICE_${normalizedOutcome}`,
+      voiceEventDescription(eventName, { failure_reason: reason }),
+      JSON.stringify({
+        provider: 'wa_center',
+        voice_session_id: session.id,
+        wa_center_session_id: session.wa_center_session_id,
+        action,
+        outcome: normalizedOutcome,
+        reason
+      })
+    ]
+  );
+
+  return sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: false });
+}
+
+function scheduleVoiceNoAnswerTimeout(session) {
+  if (!session?.id || !session?.ticket_id) return;
+
+  const timer = setTimeout(async () => {
+    try {
+      const latest = await getVoiceSessionForTicket(session.ticket_id, session.id, { includeCredentials: false });
+      if (!latest || isVoiceTerminalStatus(latest.status)) return;
+
+      if (String(latest.status).toUpperCase() === 'CONNECTED') {
+        const confirmation = await pool.query(
+          `
+          SELECT
+            EXISTS (
+              SELECT 1
+              FROM ticket_voice_events
+              WHERE voice_session_id = $1
+                AND event = 'CONNECTED'
+                AND participant_role IS NULL
+            ) AS session_connected,
+            (
+              SELECT COUNT(DISTINCT participant_role)
+              FROM ticket_voice_events
+              WHERE voice_session_id = $1
+                AND event IN ('PARTICIPANT_REGISTERED','CONNECTED')
+                AND participant_role IS NOT NULL
+            )::int AS participant_count,
+            EXISTS (
+              SELECT 1
+              FROM ticket_actions
+              WHERE ticket_id = $2
+                AND action_type = 'VOICE_ACCEPTED'
+                AND metadata->>'voice_session_id' = $1::text
+            ) AS accepted
+          `,
+          [latest.id, latest.ticket_id]
+        );
+        const accepted = String(latest.requested_by || '').toUpperCase() !== 'NEIGHBOR' ||
+          confirmation.rows[0]?.accepted === true;
+        const fullyConnected = accepted && (
+          confirmation.rows[0]?.session_connected === true ||
+          Number(confirmation.rows[0]?.participant_count || 0) >= 2
+        );
+        if (fullyConnected) return;
+      }
+
+      await finalizeTicketVoiceSession({
+        session: latest,
+        outcome: 'NO_ANSWER',
+        actorRole: 'SYSTEM',
+        reason: 'Tiempo de espera agotado (45 segundos)'
+      });
+    } catch (error) {
+      console.error('[VOICE NO ANSWER TIMEOUT ERROR]', error);
+    }
+  }, VOICE_NO_ANSWER_TIMEOUT_MS);
+
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
+async function resolveWebhookVoiceStatus(session, normalizedStatus, payload = {}) {
+  const currentStatus = String(session?.status || 'CREATED').toUpperCase();
+  if (isVoiceTerminalStatus(currentStatus)) return currentStatus;
+
+  if (normalizedStatus === 'CONNECTED' &&
+      String(session?.requested_by || '').toUpperCase() === 'NEIGHBOR') {
+    const acceptance = await pool.query(
+      `
+      SELECT 1
+      FROM ticket_actions
+      WHERE ticket_id = $1
+        AND action_type = 'VOICE_ACCEPTED'
+        AND metadata->>'voice_session_id' = $2
+      LIMIT 1
+      `,
+      [session.ticket_id, String(session.id)]
+    );
+
+    // Entrar al bridge no equivale a que Central/Resolutor haya contestado.
+    if (acceptance.rows.length === 0) return 'RINGING';
+  }
+
+  const participantRole = payload.participant_role || null;
+  if (participantRole && ['WAITING', 'CONNECTED'].includes(normalizedStatus)) {
+    const participants = await pool.query(
+      `
+      SELECT COUNT(DISTINCT participant_role)::int AS participant_count
+      FROM ticket_voice_events
+      WHERE voice_session_id = $1
+        AND event IN ('PARTICIPANT_REGISTERED','CONNECTED')
+        AND participant_role IS NOT NULL
+      `,
+      [session.id]
+    );
+
+    // Un solo anexo dentro del bridge sigue siendo una llamada sonando.
+    if (Number(participants.rows[0]?.participant_count || 0) < 2) return 'RINGING';
+    return 'CONNECTED';
+  }
+
+  // Los webhooks pueden llegar fuera de orden; nunca retroceder desde CONNECTED.
+  if (currentStatus === 'CONNECTED' && ['CREATED', 'WAITING', 'RINGING'].includes(normalizedStatus)) {
+    return 'CONNECTED';
+  }
+
+  return normalizedStatus;
+}
+
+async function registerVoiceParticipantConnected(session, participantRole) {
+  const role = String(participantRole || '').toUpperCase();
+  if (!session?.id || !['NEIGHBOR', 'RESOLVER', 'OPERATOR'].includes(role)) {
+    const err = new Error('Invalid voice participant');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (isVoiceTerminalStatus(session.status)) return session;
+
+  await pool.query(
+    `
+    INSERT INTO ticket_voice_events (
+      voice_session_id,
+      ticket_id,
+      wa_center_session_id,
+      external_reference,
+      event,
+      participant_role,
+      payload
+    )
+    SELECT $1,$2,$3,$4,'CONNECTED',$5,$6
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM ticket_voice_events
+      WHERE voice_session_id = $1
+        AND event = 'CONNECTED'
+        AND participant_role = $5
+    )
+    `,
+    [
+      session.id,
+      session.ticket_id,
+      session.wa_center_session_id,
+      session.external_reference,
+      role,
+      JSON.stringify({ source: 'client_bridge_confirmation', participant_role: role })
+    ]
+  );
+
+  const confirmation = await pool.query(
+    `
+    SELECT
+      (
+        SELECT COUNT(DISTINCT participant_role)
+        FROM ticket_voice_events
+        WHERE voice_session_id = $1
+          AND event = 'CONNECTED'
+          AND participant_role IS NOT NULL
+      )::int AS participant_count,
+      EXISTS (
+        SELECT 1
+        FROM ticket_actions
+        WHERE ticket_id = $2
+          AND action_type = 'VOICE_ACCEPTED'
+          AND metadata->>'voice_session_id' = $1::text
+      ) AS accepted
+    `,
+    [session.id, session.ticket_id]
+  );
+
+  const accepted = String(session.requested_by || '').toUpperCase() !== 'NEIGHBOR' ||
+    confirmation.rows[0]?.accepted === true;
+  const connected = accepted && Number(confirmation.rows[0]?.participant_count || 0) >= 2;
+  const updated = await pool.query(
+    `
+    UPDATE ticket_voice_sessions
+    SET status = CASE WHEN $2 THEN 'CONNECTED' ELSE 'RINGING' END,
+        connected_at = CASE WHEN $2 THEN COALESCE(connected_at, NOW()) ELSE connected_at END,
+        updated_at = NOW()
+    WHERE id = $1
+      AND status NOT IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED')
+    RETURNING *
+    `,
+    [session.id, connected]
+  );
+
+  return sanitizeVoiceSessionRow(updated.rows[0] || session, { includeCredentials: false });
+}
+
+let voiceMaintenanceStarted = false;
+
+function startVoiceSessionMaintenance() {
+  if (voiceMaintenanceStarted) return;
+  voiceMaintenanceStarted = true;
+
+  const sweep = async () => {
+    try {
+      await ensureVoiceSchema();
+      const stale = await pool.query(
+        `
+        SELECT tvs.*
+        FROM ticket_voice_sessions tvs
+        WHERE tvs.status NOT IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED')
+          AND (
+            (
+              tvs.status <> 'CONNECTED'
+              AND tvs.created_at < NOW() - INTERVAL '45 seconds'
+            )
+            OR (
+              tvs.status = 'CONNECTED'
+              AND tvs.created_at < NOW() - INTERVAL '45 seconds'
+              AND (
+                (
+                  tvs.requested_by = 'NEIGHBOR'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM ticket_actions ta
+                    WHERE ta.ticket_id = tvs.ticket_id
+                      AND ta.action_type = 'VOICE_ACCEPTED'
+                      AND ta.metadata->>'voice_session_id' = tvs.id::text
+                  )
+                )
+                OR (
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM ticket_voice_events tve
+                    WHERE tve.voice_session_id = tvs.id
+                      AND tve.event = 'CONNECTED'
+                      AND tve.participant_role IS NULL
+                  )
+                  AND (
+                    SELECT COUNT(DISTINCT tve.participant_role)
+                    FROM ticket_voice_events tve
+                    WHERE tve.voice_session_id = tvs.id
+                      AND tve.event IN ('PARTICIPANT_REGISTERED','CONNECTED')
+                      AND tve.participant_role IS NOT NULL
+                  ) < 2
+                )
+              )
+            )
+            OR (
+              tvs.status = 'CONNECTED'
+              AND tvs.updated_at < NOW() - INTERVAL '20 minutes'
+            )
+          )
+        ORDER BY tvs.created_at ASC
+        LIMIT 50
+        `
+      );
+
+      for (const row of stale.rows) {
+        await finalizeTicketVoiceSession({
+          session: sanitizeVoiceSessionRow(row, { includeCredentials: false }),
+          outcome: String(row.status).toUpperCase() === 'CONNECTED' ? 'ENDED' : 'NO_ANSWER',
+          actorRole: 'SYSTEM',
+          reason: 'VOICE_SESSION_MAINTENANCE'
+        }).catch((error) => {
+          console.error('[VOICE SESSION MAINTENANCE FINALIZE ERROR]', error);
+        });
+      }
+    } catch (error) {
+      console.error('[VOICE SESSION MAINTENANCE ERROR]', error);
+    }
+  };
+
+  const initial = setTimeout(sweep, 5_000);
+  const interval = setInterval(sweep, 30_000);
+  if (typeof initial.unref === 'function') initial.unref();
+  if (typeof interval.unref === 'function') interval.unref();
+}
+
+startVoiceSessionMaintenance();
 
 async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, actorUserId = null, resolverUserId = null }) {
   await ensureVoiceSchema();
@@ -4131,13 +4936,13 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
   const externalReference = `sos-ticket-${ticket.id}`;
   const normalizedTargetType = String(targetType || '').toUpperCase();
 
-  // Contrato WA-Center v0.8:
+  // Contrato del proveedor de voz:
   // - SOS conserva toda la lógica del caso/ticket.
-  // - WA-Center solo ve una referencia externa y participantes genéricos.
+  // - El proveedor solo ve una referencia externa y participantes genéricos.
   // - party_a queda reservado para Vecino.
   // - party_b queda reservado para Central/Operador o Resolutor.
   const partyALabel = 'vecino';
-  const partyBLabel = normalizedTargetType === 'RESOLVER'
+  const partyBLabel = normalizedTargetType === 'RESOLVER' || String(requestedBy).toUpperCase() === 'RESOLVER'
     ? 'resolutor'
     : 'central';
 
@@ -4253,7 +5058,9 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
 
     await pool.query(`UPDATE tickets SET updated_at = NOW() WHERE id = $1`, [ticket.id]);
 
-    return sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: true });
+    const createdSession = sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: true });
+    scheduleVoiceNoAnswerTimeout(createdSession);
+    return createdSession;
   } catch (error) {
     await pool.query(
       `
@@ -4280,7 +5087,7 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
         ticket.id,
         actorUserId,
         requestedBy,
-        'No fue posible crear la llamada segura en WA-Center',
+        'No fue posible crear la llamada segura',
         JSON.stringify({
           channel: 'voice',
           provider: 'wa_center',
@@ -4421,6 +5228,8 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    await ensureNeighborProvisioningSchema();
+
     const userResult = await pool.query(
       `
       SELECT
@@ -4428,6 +5237,7 @@ app.post("/public/mobile/sos", async (req, res) => {
         u.control_center_id,
         u.role,
         u.validation_status,
+        u.provisional_expires_at,
         u.is_active,
         u.full_name,
         u.phone,
@@ -4540,6 +5350,34 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    const normalizedAlert = normalizeMobileSosPayload({
+      alert_type,
+      title,
+      priority,
+      description,
+      sensor_event_type,
+      silent,
+      confidence,
+      source
+    });
+
+    const settingsRow = await getControlCenterSettingsById(controlCenterId);
+    const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+
+    if (platformSettings.features?.mobile_app_enabled === false) {
+      return res.status(403).json({
+        status: "error",
+        message: "La App Vecino no está habilitada para este centro de control."
+      });
+    }
+
+    if (!isNeighborEmergencyCategoryEnabled(platformSettings, normalizedAlert.alert_type)) {
+      return res.status(403).json({
+        status: "error",
+        message: "Esta categoría no está habilitada para tu Centro de Control."
+      });
+    }
+
     await pool.query(
       `
       UPDATE mobile_events
@@ -4591,26 +5429,6 @@ app.post("/public/mobile/sos", async (req, res) => {
     );
 
     const event = result.rows[0];
-    const normalizedAlert = normalizeMobileSosPayload({
-      alert_type,
-      title,
-      priority,
-      description,
-      sensor_event_type,
-      silent,
-      confidence,
-      source
-    });
-
-    const settingsRow = await getControlCenterSettingsById(controlCenterId);
-    const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
-
-    if (platformSettings.features?.mobile_app_enabled === false) {
-      return res.status(403).json({
-        status: "error",
-        message: "La App Vecino no está habilitada para este centro de control."
-      });
-    }
 
     const existingIncident = platformSettings.features?.multi_report_incidents_enabled === false
       ? null
@@ -5152,6 +5970,8 @@ function buildNeighborProgress(event) {
   return {
     ticket_id: event.ticket_id || null,
     ticket_state: state,
+    alert_type: event.ticket_alert_type || event.alert_type || null,
+    ticket_alert_type: event.ticket_alert_type || null,
     report_count: reportCount,
     is_primary_report: isPrimaryReport,
     headline,
@@ -5226,6 +6046,7 @@ app.get("/public/mobile/status/:event_id", async (req, res) => {
     }
 
     const event = result.rows[0];
+    event.alert_type = event.ticket_alert_type || event.alert_type || null;
     const terminalTicketStates = ["RESOLVED", "CLOSED", "CANCELLED"];
     const effectiveState = terminalTicketStates.includes(event.ticket_state)
       ? event.ticket_state
@@ -5383,6 +6204,7 @@ app.get("/public/mobile/active", async (req, res) => {
     }
 
     const event = result.rows[0];
+    event.alert_type = event.ticket_alert_type || event.alert_type || null;
     const terminalTicketStates = ["RESOLVED", "CLOSED", "CANCELLED"];
     const effectiveState = terminalTicketStates.includes(event.ticket_state)
       ? event.ticket_state
@@ -5614,13 +6436,6 @@ app.post("/auth/register", async (req, res) => {
       otp_channel
     } = req.body;
 
-    if (!control_center_code) {
-      return res.status(400).json({
-        status: "error",
-        message: "control_center_code is required"
-      });
-    }
-
     if (!full_name || !phone || !declared_address) {
       return res.status(400).json({
         status: "error",
@@ -5628,24 +6443,12 @@ app.post("/auth/register", async (req, res) => {
       });
     }
 
-    const ccResult = await pool.query(
-      `
-      SELECT id, code, name
-      FROM control_centers
-      WHERE code = $1
-      `,
-      [control_center_code]
-    );
-
-    if (ccResult.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Unknown control_center_code"
-      });
-    }
-
-    const controlCenter = ccResult.rows[0];
+    await ensureNeighborProvisioningSchema();
+    const resolvedControlCenter = await resolveControlCenterForNeighborRegistration(latitude, longitude);
+    const controlCenter = resolvedControlCenter.controlCenter;
+    const registrationJurisdiction = resolvedControlCenter.jurisdiction;
     const cleanPhone = normalizePhoneForAuth(phone);
+    const provisionalExpiresAtSql = "NOW() + INTERVAL '7 days'";
 
     const existingResult = await pool.query(
       `
@@ -5684,6 +6487,10 @@ app.post("/auth/register", async (req, res) => {
           latitude = $6,
           longitude = $7,
           validation_status = COALESCE(validation_status, 'PROVISIONAL_ACTIVE'),
+          provisional_expires_at = CASE
+            WHEN validation_status = 'VALIDATED' THEN provisional_expires_at
+            ELSE ${provisionalExpiresAtSql}
+          END,
           is_active = true,
           updated_at = NOW()
         WHERE id = $8
@@ -5716,13 +6523,15 @@ app.post("/auth/register", async (req, res) => {
           email,
           declared_address,
           latitude,
-          longitude
+          longitude,
+          provisional_expires_at
         )
         VALUES (
           $1,
           'NEIGHBOR',
           'PROVISIONAL_ACTIVE',
-          $2,$3,$4,$5,$6,$7,$8
+          $2,$3,$4,$5,$6,$7,$8,
+          ${provisionalExpiresAtSql}
         )
         RETURNING *
         `,
@@ -5785,7 +6594,12 @@ app.post("/auth/register", async (req, res) => {
       metadata: {
         user_id: user.id,
         operation,
-        control_center_code: controlCenter.code
+        control_center_code: controlCenter.code,
+        requested_control_center_code: control_center_code || null,
+        assignment_source: "GPS_GEOFENCE",
+        assignment_status: registrationJurisdiction.status,
+        assignment_reason: registrationJurisdiction.reason,
+        assignment_distance_meters: registrationJurisdiction.distance_meters ?? null
       }
     });
 
@@ -5799,13 +6613,21 @@ app.post("/auth/register", async (req, res) => {
       otp_channel: otp.channel,
       otp_expires_minutes: otp.expires_minutes,
       ...(otp.demo_code ? { demo_code: otp.demo_code } : {}),
+      assignment: {
+        source: "GPS_GEOFENCE",
+        control_center_code: controlCenter.code,
+        control_center_name: controlCenter.name,
+        status: registrationJurisdiction.status,
+        reason: registrationJurisdiction.reason,
+        distance_meters: registrationJurisdiction.distance_meters ?? null
+      },
       user: publicUserPayload(user, controlCenter)
     });
 
   } catch (error) {
     console.error("[AUTH REGISTER ERROR]", error);
 
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       status: "error",
       message: error.message || "Database error registering user"
     });
@@ -7602,10 +8424,75 @@ app.post("/tickets/:id/call-response", async (req, res) => {
   }
 });
 
+async function getMobileVoiceAccess(eventId, userId = null) {
+  if (!userId) {
+    const err = new Error('user_id is required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      m.id AS event_id,
+      m.user_id,
+      t.id AS ticket_id,
+      t.state AS ticket_state
+    FROM mobile_events m
+    LEFT JOIN tickets t
+      ON t.source_type = 'MOBILE_APP'
+     AND t.source_event_id = m.id
+    WHERE m.id = $1
+    ORDER BY t.created_at DESC NULLS LAST
+    LIMIT 1
+    `,
+    [eventId]
+  );
+
+  const access = result.rows[0] || null;
+  if (!access) {
+    const err = new Error('Mobile event not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (userId && access.user_id && String(userId) !== String(access.user_id)) {
+    const err = new Error('Mobile event does not belong to user');
+    err.statusCode = 403;
+    throw err;
+  }
+  if (!access.ticket_id) {
+    const err = new Error('El caso aún no tiene ticket operacional asociado.');
+    err.statusCode = 409;
+    throw err;
+  }
+  return access;
+}
+
+async function getResolverVoiceAccess(ticketId, resolverUserId) {
+  if (!resolverUserId) {
+    const err = new Error('resolver_user_id is required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const ticket = await fetchTicketVoiceContext(ticketId);
+  if (!ticket) {
+    const err = new Error('Ticket not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (String(ticket.assigned_resolver_id || '') !== String(resolverUserId)) {
+    const err = new Error('El ticket no está asignado a este resolutor');
+    err.statusCode = 403;
+    throw err;
+  }
+  return ticket;
+}
+
 app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
   try {
     const { eventId } = req.params;
-    const { user_id = null, target_type = null } = req.body || {};
+    const { user_id = null } = req.body || {};
 
     const eventResult = await pool.query(
       `
@@ -7644,9 +8531,8 @@ app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
       req,
       ticket,
       requestedBy: "NEIGHBOR",
-      targetType: target_type
-        ? (String(target_type).toUpperCase() === "RESOLVER" ? "RESOLVER" : "CENTRAL")
-        : (ticket?.assigned_resolver_id ? "RESOLVER" : "CENTRAL"),
+      // La decisión de enrutamiento pertenece al backend, nunca al cliente móvil.
+      targetType: ticket?.assigned_resolver_id ? "RESOLVER" : "CENTRAL",
       actorUserId: ticket?.citizen_user_id || null,
       resolverUserId: ticket?.assigned_resolver_id || null
     });
@@ -7722,6 +8608,95 @@ app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/join", async 
   }
 });
 
+app.get("/public/mobile/events/:eventId/voice/sessions/:sessionId/status", async (req, res) => {
+  try {
+    const { eventId, sessionId } = req.params;
+    const { user_id = null } = req.query || {};
+    const access = await getMobileVoiceAccess(eventId, user_id);
+    const session = await getVoiceSessionForTicket(access.ticket_id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      voice_session: voiceSessionForParticipant(session, 'party_a')
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE STATUS ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible consultar la llamada segura"
+    });
+  }
+});
+
+app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/connected", async (req, res) => {
+  try {
+    const { eventId, sessionId } = req.params;
+    const { user_id = null } = req.body || {};
+    const access = await getMobileVoiceAccess(eventId, user_id);
+    const session = await getVoiceSessionForTicket(access.ticket_id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const updated = await registerVoiceParticipantConnected(session, 'NEIGHBOR');
+    res.json({
+      status: "ok",
+      message: "Entrada del vecino al canal confirmada",
+      voice_session: voiceSessionForParticipant(updated, 'party_a')
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE CONNECTED ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible confirmar la conexión del vecino"
+    });
+  }
+});
+
+app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/end", async (req, res) => {
+  try {
+    const { eventId, sessionId } = req.params;
+    const { user_id = null, reason = "HANGUP" } = req.body || {};
+    const access = await getMobileVoiceAccess(eventId, user_id);
+    const session = await getVoiceSessionForTicket(access.ticket_id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const normalizedReason = String(reason || "HANGUP").toUpperCase();
+    const outcome = normalizedReason === "NO_ANSWER"
+      ? "NO_ANSWER"
+      : normalizedReason === "ERROR"
+        ? "FAILED"
+        : "ENDED";
+    const endedSession = await finalizeTicketVoiceSession({
+      session,
+      outcome,
+      actorRole: "NEIGHBOR",
+      actorUserId: access.user_id || null,
+      reason: normalizedReason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada segura finalizada",
+      voice_session: voiceSessionForParticipant(endedSession, 'party_a')
+    });
+  } catch (error) {
+    console.error("[MOBILE VOICE END ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible finalizar la llamada segura"
+    });
+  }
+});
+
 app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
   try {
     const { ticketId } = req.params;
@@ -7744,7 +8719,7 @@ app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
       req,
       ticket,
       requestedBy: "RESOLVER",
-      targetType: "RESOLVER",
+      targetType: "NEIGHBOR",
       actorUserId: resolver_user_id,
       resolverUserId: resolver_user_id
     });
@@ -7809,6 +8784,29 @@ app.get("/tickets/:id/voice/sessions", async (req, res) => {
   }
 });
 
+app.get("/tickets/:id/voice/sessions/:sessionId/status", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para consultar llamada segura")) return;
+    const { id, sessionId } = req.params;
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      voice_session: voiceSessionForParticipant(session, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE STATUS ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible consultar la llamada segura"
+    });
+  }
+});
+
 app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
   try {
     if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para atender llamada segura")) return;
@@ -7820,11 +8818,49 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
       return res.status(404).json({ status: "error", message: "Voice session not found" });
     }
 
+    const ticket = await fetchTicketVoiceContext(id);
     if (String(session.target_type || "").toUpperCase() === "RESOLVER") {
       return res.status(409).json({
         status: "error",
         message: "Esta llamada segura está destinada al resolutor asignado. Debe atenderla desde la App Resolutor."
       });
+    }
+
+    if (operatorCanHandleVoiceSession(session, ticket)) {
+      await pool.query(
+        `
+        UPDATE ticket_voice_sessions
+        SET status = CASE WHEN status = 'CONNECTED' THEN status ELSE 'RINGING' END,
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [session.id]
+      );
+
+      await pool.query(
+        `
+        INSERT INTO ticket_actions (
+          ticket_id, actor_user_id, actor_role, action_type, description, metadata
+        )
+        SELECT $1,$2,'OPERATOR','VOICE_ACCEPTED','Central aceptó la llamada del vecino',$3
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM ticket_actions
+          WHERE ticket_id = $1
+            AND action_type = 'VOICE_ACCEPTED'
+            AND metadata->>'voice_session_id' = $4
+        )
+        `,
+        [
+          id,
+          req.panel_session?.sub || null,
+          JSON.stringify({
+            voice_session_id: session.id,
+            wa_center_session_id: session.wa_center_session_id
+          }),
+          String(session.id)
+        ]
+      );
     }
 
     res.json({
@@ -7837,6 +8873,109 @@ app.post("/tickets/:id/voice/sessions/:sessionId/join", async (req, res) => {
     res.status(error.statusCode || 500).json({
       status: "error",
       message: error.message || "No fue posible atender la llamada segura"
+    });
+  }
+});
+
+app.post("/tickets/:id/voice/sessions/:sessionId/connected", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para confirmar llamada segura")) return;
+    const { id, sessionId } = req.params;
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const updated = await registerVoiceParticipantConnected(session, 'OPERATOR');
+    res.json({
+      status: "ok",
+      message: "Entrada de Central al canal confirmada",
+      voice_session: voiceSessionForParticipant(updated, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE CONNECTED ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible confirmar la conexión de Central"
+    });
+  }
+});
+
+app.post("/tickets/:id/voice/sessions/:sessionId/reject", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para rechazar llamada segura")) return;
+    const { id, sessionId } = req.params;
+    const { reason = "REJECTED_BY_OPERATOR" } = req.body || {};
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+    const ticket = await fetchTicketVoiceContext(id);
+    if (!operatorCanHandleVoiceSession(session, ticket)) {
+      return res.status(409).json({ status: "error", message: "Esta sesión no es una llamada entrante para Central" });
+    }
+
+    const rejected = await finalizeTicketVoiceSession({
+      session,
+      outcome: "REJECTED",
+      actorRole: "OPERATOR",
+      actorUserId: req.panel_session?.sub || null,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada rechazada",
+      voice_session: voiceSessionForParticipant(rejected, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE REJECT ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible rechazar la llamada"
+    });
+  }
+});
+
+app.post("/tickets/:id/voice/sessions/:sessionId/end", async (req, res) => {
+  try {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para finalizar llamada segura")) return;
+
+    const { id, sessionId } = req.params;
+    const { reason = "HANGUP" } = req.body || {};
+    const session = await getVoiceSessionForTicket(id, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const normalizedReason = String(reason || "HANGUP").toUpperCase();
+    const outcome = normalizedReason === "NO_ANSWER"
+      ? "NO_ANSWER"
+      : ["REGISTRATION_FAILED", "WEBRTC_DISCONNECTED", "WEBRTC_FAILED", "REQUEST_FAILED", "ANSWER_FAILED", "ERROR"]
+          .some((value) => normalizedReason.includes(value))
+        ? "FAILED"
+        : "ENDED";
+    const ended = await finalizeTicketVoiceSession({
+      session,
+      outcome,
+      actorRole: "OPERATOR",
+      actorUserId: req.panel_session?.sub || null,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada finalizada",
+      voice_session: voiceSessionForParticipant(ended, 'party_b')
+    });
+  } catch (error) {
+    console.error("[OPERATOR VOICE END ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible finalizar la llamada"
     });
   }
 });
@@ -7878,13 +9017,203 @@ app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/join", async (re
   }
 });
 
+app.get("/resolver/tickets/:ticketId/voice/sessions/:sessionId/status", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id } = req.query || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    res.json({
+      status: "ok",
+      voice_session: voiceSessionForParticipant(session, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE STATUS ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible consultar la llamada segura"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/connected", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const updated = await registerVoiceParticipantConnected(session, 'RESOLVER');
+    res.json({
+      status: "ok",
+      message: "Entrada del resolutor al canal confirmada",
+      voice_session: voiceSessionForParticipant(updated, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE CONNECTED ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible confirmar la conexión del resolutor"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/accept", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+    if (String(session.requested_by || "").toUpperCase() !== "NEIGHBOR" ||
+        String(session.target_type || "").toUpperCase() !== "RESOLVER") {
+      return res.status(409).json({ status: "error", message: "Esta sesión no es una llamada entrante del vecino" });
+    }
+    if (isVoiceTerminalStatus(session.status)) {
+      return res.status(409).json({ status: "error", message: "La llamada ya finalizó" });
+    }
+
+    const updated = await pool.query(
+      `
+      UPDATE ticket_voice_sessions
+      SET status = CASE WHEN status = 'CONNECTED' THEN status ELSE 'RINGING' END, updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [session.id]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO ticket_actions (
+        ticket_id, actor_user_id, actor_role, action_type, description, metadata
+      )
+      SELECT $1,$2,'RESOLVER','VOICE_ACCEPTED','Resolutor aceptó la llamada del vecino',$3
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM ticket_actions
+        WHERE ticket_id = $1
+          AND action_type = 'VOICE_ACCEPTED'
+          AND metadata->>'voice_session_id' = $4
+      )
+      `,
+      [
+        ticketId,
+        resolver_user_id,
+        JSON.stringify({
+          voice_session_id: session.id,
+          wa_center_session_id: session.wa_center_session_id
+        }),
+        String(session.id)
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Llamada aceptada",
+      voice_session: voiceSessionForParticipant(
+        sanitizeVoiceSessionRow(updated.rows[0], { includeCredentials: false }),
+        'party_b'
+      )
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE ACCEPT ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible aceptar la llamada"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/reject", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id, reason = "REJECTED_BY_RESOLVER" } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+    if (String(session.requested_by || "").toUpperCase() !== "NEIGHBOR" ||
+        String(session.target_type || "").toUpperCase() !== "RESOLVER") {
+      return res.status(409).json({ status: "error", message: "Esta sesión no es una llamada entrante del vecino" });
+    }
+
+    const rejected = await finalizeTicketVoiceSession({
+      session,
+      outcome: "REJECTED",
+      actorRole: "RESOLVER",
+      actorUserId: resolver_user_id,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada rechazada",
+      voice_session: voiceSessionForParticipant(rejected, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE REJECT ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible rechazar la llamada"
+    });
+  }
+});
+
+app.post("/resolver/tickets/:ticketId/voice/sessions/:sessionId/end", async (req, res) => {
+  try {
+    const { ticketId, sessionId } = req.params;
+    const { resolver_user_id, reason = "HANGUP" } = req.body || {};
+    await getResolverVoiceAccess(ticketId, resolver_user_id);
+    const session = await getVoiceSessionForTicket(ticketId, sessionId, { includeCredentials: false });
+
+    if (!session) {
+      return res.status(404).json({ status: "error", message: "Voice session not found" });
+    }
+
+    const ended = await finalizeTicketVoiceSession({
+      session,
+      outcome: "ENDED",
+      actorRole: "RESOLVER",
+      actorUserId: resolver_user_id,
+      reason
+    });
+
+    res.json({
+      status: "ok",
+      message: "Llamada finalizada",
+      voice_session: voiceSessionForParticipant(ended, 'party_b')
+    });
+  } catch (error) {
+    console.error("[RESOLVER VOICE END ERROR]", error);
+    res.status(error.statusCode || 500).json({
+      status: "error",
+      message: error.message || "No fue posible finalizar la llamada"
+    });
+  }
+});
+
 app.post("/integrations/wa-center/voice-events", async (req, res) => {
   try {
     if (WA_CENTER_WEBHOOK_SECRET) {
       const provided = req.headers["x-wa-center-webhook-secret"] ||
         String(req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
       if (provided !== WA_CENTER_WEBHOOK_SECRET) {
-        return res.status(401).json({ status: "error", message: "Invalid WA-Center webhook secret" });
+        return res.status(401).json({ status: "error", message: "Invalid voice webhook secret" });
       }
     }
 
@@ -7939,6 +9268,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
     );
 
     if (session) {
+      const effectiveStatus = await resolveWebhookVoiceStatus(session, normalizedStatus, payload);
       const recordingUrl = payload.recording_url || payload.recording?.url || null;
       const recordingId = payload.recording_id || payload.recording?.id || null;
 
@@ -7948,7 +9278,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
         SET
           status = $2,
           connected_at = CASE WHEN $3 = 'CONNECTED' THEN COALESCE(connected_at, NOW()) ELSE connected_at END,
-          ended_at = CASE WHEN $3 IN ('ENDED','FAILED','NO_ANSWER','EXPIRED') THEN COALESCE(ended_at, NOW()) ELSE ended_at END,
+          ended_at = CASE WHEN $3 IN ('ENDED','FAILED','NO_ANSWER','EXPIRED','REJECTED') THEN COALESCE(ended_at, NOW()) ELSE ended_at END,
           duration_seconds = COALESCE($4, duration_seconds),
           failure_reason = COALESCE($5, failure_reason),
           recording_url = COALESCE($6, recording_url),
@@ -7958,8 +9288,8 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
         `,
         [
           session.id,
-          normalizedStatus,
-          event,
+          effectiveStatus,
+          effectiveStatus,
           payload.duration_seconds != null ? Number(payload.duration_seconds) : null,
           payload.failure_reason || null,
           recordingUrl,
@@ -11138,6 +12468,86 @@ app.get("/superadmin/control-centers", async (req, res) => {
   } catch (error) {
     console.error("[SUPERADMIN CONTROL CENTERS LIST ERROR]", error);
     res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.get("/superadmin/emergency-categories", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const includeDisabled = String(req.query.include_disabled || 'true').toLowerCase() !== 'false';
+    const categories = await loadEmergencyCategoryCatalog({ includeDisabled });
+    res.json({ status: "ok", total: categories.length, categories });
+  } catch (error) {
+    console.error("[SUPERADMIN EMERGENCY CATEGORIES LIST ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.put("/superadmin/emergency-categories", async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    await ensureEmergencyCategoryCatalogSchema();
+    const categories = normalizeEmergencyCategoryCatalog(req.body?.categories || req.body || []);
+
+    if (!categories.length) {
+      return res.status(400).json({ status: "error", message: "Debe enviar al menos una categoría" });
+    }
+
+    for (const category of categories) {
+      await pool.query(
+        `
+        INSERT INTO emergency_category_catalog (
+          category_type,
+          title,
+          icon,
+          color,
+          priority,
+          enabled,
+          display_order,
+          sensitive,
+          allow_voice,
+          allow_evidence,
+          allow_nearby_notifications,
+          allow_sirens,
+          updated_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+        ON CONFLICT (category_type) DO UPDATE SET
+          title = EXCLUDED.title,
+          icon = EXCLUDED.icon,
+          color = EXCLUDED.color,
+          priority = EXCLUDED.priority,
+          enabled = EXCLUDED.enabled,
+          display_order = EXCLUDED.display_order,
+          sensitive = EXCLUDED.sensitive,
+          allow_voice = EXCLUDED.allow_voice,
+          allow_evidence = EXCLUDED.allow_evidence,
+          allow_nearby_notifications = EXCLUDED.allow_nearby_notifications,
+          allow_sirens = EXCLUDED.allow_sirens,
+          updated_at = NOW()
+        `,
+        [
+          category.type,
+          category.title,
+          category.icon,
+          category.color,
+          category.priority,
+          category.enabled !== false,
+          category.order,
+          category.sensitive === true,
+          category.allow_voice !== false,
+          category.allow_evidence !== false,
+          category.allow_nearby_notifications === true,
+          category.allow_sirens === true
+        ]
+      );
+    }
+
+    const saved = await refreshEmergencyCategoryCatalogCache();
+    res.json({ status: "ok", message: "Catálogo de categorías actualizado", total: saved.length, categories: saved });
+  } catch (error) {
+    console.error("[SUPERADMIN EMERGENCY CATEGORIES SAVE ERROR]", error);
+    res.status(400).json({ status: "error", message: error.message });
   }
 });
 
