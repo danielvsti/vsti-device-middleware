@@ -218,6 +218,7 @@ const WA_CENTER_VOICE_ENABLED = envFlag("WA_CENTER_VOICE_ENABLED", false);
 const WA_CENTER_VOICE_RECORDING = envFlag("WA_CENTER_VOICE_RECORDING", true);
 const WA_CENTER_VOICE_SUPERVISION = envFlag("WA_CENTER_VOICE_SUPERVISION", true);
 const WA_CENTER_WEBHOOK_SECRET = process.env.WA_CENTER_WEBHOOK_SECRET || "";
+const WA_CENTER_CALLBACK_URL_OVERRIDE = envFlag("WA_CENTER_CALLBACK_URL_OVERRIDE", false);
 const SOS_PUBLIC_BASE_URL = String(process.env.SOS_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
 
 const gpsDevices = {};
@@ -5269,7 +5270,12 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
       { role: 'party_a', type: 'webrtc', label: partyALabel },
       { role: 'party_b', type: 'webrtc', label: partyBLabel }
     ],
-    callback_url: `${sosPublicBaseUrl(req)}/integrations/wa-center/voice-events`
+    // Los tokens WA-Center restringidos usan el webhook global configurado en
+    // el proveedor y rechazan overrides por sesión. La opción queda disponible
+    // solo para instalaciones antiguas que lo permitan explícitamente.
+    ...(WA_CENTER_CALLBACK_URL_OVERRIDE
+      ? { callback_url: `${sosPublicBaseUrl(req)}/integrations/wa-center/voice-events` }
+      : {})
   };
 
   const insertResult = await pool.query(
