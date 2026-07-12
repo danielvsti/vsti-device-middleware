@@ -12726,7 +12726,7 @@ app.get("/tickets/:id", async (req, res) => {
     const voiceSessions = await getVoiceSessionsForTicket(id, { includeCredentials: false, limit: 20 });
     await ensurePhoneLocationRequestSchema();
     const locationRequestsResult = await pool.query(
-      `SELECT id, status, channel, recipient, expires_at, completed_at,
+      `SELECT id, status, NULL::text AS channel, destination_phone AS recipient, expires_at, completed_at,
               latitude, longitude, accuracy, created_at, updated_at
        FROM ticket_location_requests
        WHERE ticket_id = $1
