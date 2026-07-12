@@ -33,7 +33,8 @@ for (const signature of [
 for (const signature of [
   'app.post("/public/sirens/activate"',
   'app.post("/public/sirens/deactivate"',
-  'app.post("/public/mobile/ack"'
+  'app.post("/public/mobile/ack"',
+  'app.post("/tickets/manual"'
 ]) {
   assert(routeBlock(signature).includes("checkRoleAccess"), `${signature} debe exigir rol operacional`);
 }
@@ -66,5 +67,13 @@ assert(resolverLocationSql.includes("LONGITUDE_HEMISPHERE_SIGN"), "La ruta GPS d
 
 const mobileSosSql = routeBlock('app.post("/public/mobile/sos"', 2600);
 assert(!mobileSosSql.includes("rawLonNum"), "La corrección del simulador no debe contaminar la creación de SOS vecino");
+
+const manualTicketSql = routeBlock('app.post("/tickets/manual"', 9000);
+assert(manualTicketSql.includes('source_type: "PHONE_CALL"'), "El ingreso telefónico debe usar una fuente de ticket diferenciada");
+assert(manualTicketSql.includes("wa_center_session_id"), "El ticket telefónico debe permitir asociar la sesión de WA-Center");
+
+const waWebhookSql = routeBlock('app.post("/integrations/wa-center/voice-events"', 6200);
+assert(waWebhookSql.includes("provider_event_id"), "El webhook de WA-Center debe deduplicar eventos del proveedor");
+assert(waWebhookSql.includes("wa_center_call_id"), "El webhook de WA-Center debe correlacionar llamadas municipales externas");
 
 console.log("Security contract OK");

@@ -2972,6 +2972,9 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
 async function createTicket({
   control_center_id,
   citizen_user_id = null,
+  created_by_user_id = null,
+  created_by_role = null,
+  creation_description = null,
   source_type,
   source_event_id = null,
   alert_type,
@@ -3042,10 +3045,10 @@ async function createTicket({
     `,
     [
       ticket.id,
-      citizen_user_id,
-      citizen_user_id ? "NEIGHBOR" : "SYSTEM",
+      created_by_user_id || citizen_user_id,
+      created_by_role || (citizen_user_id ? "NEIGHBOR" : "SYSTEM"),
       "TICKET_CREATED",
-      "Ticket creado por alerta entrante",
+      creation_description || "Ticket creado por alerta entrante",
       metadata
     ]
   );
@@ -4502,6 +4505,7 @@ async function ensureVoiceSchema() {
       voice_session_id UUID REFERENCES ticket_voice_sessions(id) ON DELETE SET NULL,
       ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL,
       wa_center_session_id TEXT,
+      provider_event_id TEXT,
       external_reference TEXT,
       event TEXT NOT NULL,
       participant_role TEXT,
@@ -4510,6 +4514,13 @@ async function ensureVoiceSchema() {
       payload JSONB DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`ALTER TABLE ticket_voice_events ADD COLUMN IF NOT EXISTS provider_event_id TEXT`);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_voice_events_provider_event
+    ON ticket_voice_events(provider_event_id)
+    WHERE provider_event_id IS NOT NULL
   `);
 
   await pool.query(`
@@ -4584,6 +4595,8 @@ function sanitizeVoiceSessionRow(row, options = {}) {
     status: row.status,
     external_reference: row.external_reference,
     wa_center_session_id: row.wa_center_session_id,
+    wa_center_call_id: row.wa_center_call_id,
+    wa_center_bridge_id: row.wa_center_bridge_id,
     started_at: row.started_at,
     connected_at: row.connected_at,
     ended_at: row.ended_at,
@@ -7419,6 +7432,187 @@ app.get("/tickets", async (req, res) => {
 
 
 
+app.post("/tickets/manual", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional para crear tickets")) return;
+
+  try {
+    const actor = req.panel_session || {};
+    const controlCenterCode = dashboardAuthorizedControlCenterCode(req);
+    const controlCenterResult = await pool.query(
+      `SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1`,
+      [controlCenterCode]
+    );
+    if (!controlCenterResult.rows.length) {
+      return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    }
+
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+      return res.status(400).json({ status: "error", message: "Debes indicar coordenadas GPS válidas para ubicar el evento" });
+    }
+
+    const alertType = String(req.body?.alert_type || "").trim().toUpperCase();
+    const catalog = await loadEmergencyCategoryCatalog({ includeDisabled: false });
+    const category = catalog.find(item => item.type === alertType && item.enabled !== false);
+    if (!category) {
+      return res.status(400).json({ status: "error", message: "La categoría seleccionada no está habilitada" });
+    }
+
+    const callerName = String(req.body?.caller_name || "").trim().slice(0, 160) || null;
+    const callerPhone = String(req.body?.caller_phone || "").trim().slice(0, 40) || null;
+    const reportedAddress = String(req.body?.reported_address || "").trim().slice(0, 300) || null;
+    const description = String(req.body?.description || "").trim().slice(0, 3000);
+    if (!description) {
+      return res.status(400).json({ status: "error", message: "Describe brevemente la emergencia informada por teléfono" });
+    }
+
+    const waCenterSessionId = String(req.body?.wa_center_session_id || "").trim().slice(0, 180) || null;
+    const waCenterCallId = String(req.body?.wa_center_call_id || "").trim().slice(0, 180) || null;
+    const waCenterBridgeId = String(req.body?.wa_center_bridge_id || "").trim().slice(0, 180) || null;
+    const externalReference = String(req.body?.external_reference || "").trim().slice(0, 220) || null;
+    const recordingId = String(req.body?.recording_id || "").trim().slice(0, 220) || null;
+    const durationSeconds = req.body?.duration_seconds == null ? null : Math.max(0, Math.round(Number(req.body.duration_seconds)));
+    let recordingUrl = String(req.body?.recording_url || "").trim().slice(0, 2000) || null;
+    if (recordingUrl) {
+      try {
+        const parsed = new URL(recordingUrl);
+        if (parsed.protocol !== "https:") throw new Error("HTTPS required");
+      } catch {
+        return res.status(400).json({ status: "error", message: "La URL de grabación debe ser HTTPS" });
+      }
+    }
+
+    await ensureVoiceSchema();
+    if (waCenterSessionId || waCenterCallId) {
+      const duplicate = await pool.query(
+        `SELECT id, ticket_id FROM ticket_voice_sessions
+         WHERE ($1::text IS NOT NULL AND wa_center_session_id = $1)
+            OR ($2::text IS NOT NULL AND wa_center_call_id = $2)
+         ORDER BY created_at DESC LIMIT 1`,
+        [waCenterSessionId, waCenterCallId]
+      );
+      if (duplicate.rows[0]?.ticket_id) {
+        return res.status(409).json({ status: "error", message: "Esta llamada de WA-Center ya está asociada a otro ticket", ticket_id: duplicate.rows[0].ticket_id });
+      }
+    }
+
+    const metadata = {
+      intake_channel: "MUNICIPAL_PHONE",
+      caller_name: callerName,
+      caller_phone: callerPhone,
+      reported_address: reportedAddress,
+      operator_user_id: actor.sub || null,
+      operator_name: actor.full_name || actor.name || null,
+      wa_center_session_id: waCenterSessionId,
+      wa_center_call_id: waCenterCallId,
+      external_reference: externalReference,
+      recording_url: recordingUrl,
+      recording_id: recordingId,
+      duration_seconds: Number.isFinite(durationSeconds) ? durationSeconds : null
+    };
+
+    const ticket = await createTicket({
+      control_center_id: controlCenterResult.rows[0].id,
+      created_by_user_id: actor.sub || null,
+      created_by_role: String(actor.role || "OPERATOR").toUpperCase(),
+      creation_description: "Ticket ingresado manualmente por llamada al teléfono municipal",
+      source_type: "PHONE_CALL",
+      source_event_id: waCenterSessionId || waCenterCallId || externalReference,
+      alert_type: category.type,
+      title: String(req.body?.title || category.title || "Emergencia telefónica").trim().slice(0, 180),
+      description,
+      latitude,
+      longitude,
+      accuracy: null,
+      priority: Math.max(1, Math.min(5, Number(req.body?.priority || category.priority || 2))),
+      metadata
+    });
+
+    let voiceSession = null;
+    if (waCenterSessionId || waCenterCallId || recordingUrl || recordingId) {
+      const providerReference = externalReference || `sos-ticket-${ticket.id}`;
+      const voiceResult = await pool.query(
+        `INSERT INTO ticket_voice_sessions (
+           ticket_id, requested_by, target_type, operator_user_id, external_reference,
+           wa_center_session_id, wa_center_call_id, wa_center_bridge_id, status,
+           party_a_role, party_b_role, recording_id, recording_url,
+           duration_seconds, ended_at, raw_response
+         ) VALUES ($1,'EXTERNAL_CALLER','CENTRAL',$2,$3,$4,$5,$6,$7,'caller','central',$8,$9,$10,
+           CASE WHEN $7 = 'ENDED' THEN NOW() ELSE NULL END,$11)
+         RETURNING *`,
+        [
+          ticket.id,
+          actor.sub || null,
+          providerReference,
+          waCenterSessionId,
+          waCenterCallId,
+          waCenterBridgeId,
+          recordingUrl || recordingId ? "ENDED" : "CONNECTED",
+          recordingId,
+          recordingUrl,
+          Number.isFinite(durationSeconds) ? durationSeconds : null,
+          JSON.stringify(req.body?.wa_center_payload || {})
+        ]
+      );
+      voiceSession = voiceResult.rows[0];
+
+      await pool.query(
+        `UPDATE ticket_voice_events
+         SET voice_session_id = $1, ticket_id = $2
+         WHERE voice_session_id IS NULL
+           AND (($3::text IS NOT NULL AND wa_center_session_id = $3)
+             OR ($4::text IS NOT NULL AND external_reference = $4)
+             OR ($5::text IS NOT NULL AND payload->>'call_id' = $5)
+             OR ($5::text IS NOT NULL AND payload->>'wa_center_call_id' = $5))`,
+        [voiceSession.id, ticket.id, waCenterSessionId, providerReference, waCenterCallId]
+      );
+
+      const historicalEvent = await pool.query(
+        `SELECT payload, duration_seconds
+         FROM ticket_voice_events
+         WHERE voice_session_id = $1
+         ORDER BY (event = 'RECORDING_AVAILABLE') DESC, created_at DESC
+         LIMIT 1`,
+        [voiceSession.id]
+      );
+      const historicalPayload = historicalEvent.rows[0]?.payload || {};
+      const historicalRecordingUrl = historicalPayload.recording_url || historicalPayload.recording?.url || null;
+      const historicalRecordingId = historicalPayload.recording_id || historicalPayload.recording?.id || null;
+      if ((!recordingUrl && historicalRecordingUrl) || (!recordingId && historicalRecordingId)) {
+        const mergedVoice = await pool.query(
+          `UPDATE ticket_voice_sessions
+           SET recording_url = COALESCE($2, recording_url),
+               recording_id = COALESCE($3, recording_id),
+               duration_seconds = COALESCE($4, duration_seconds),
+               status = CASE WHEN $2::text IS NOT NULL OR $3::text IS NOT NULL THEN 'ENDED' ELSE status END,
+               ended_at = CASE WHEN $2::text IS NOT NULL OR $3::text IS NOT NULL THEN COALESCE(ended_at, NOW()) ELSE ended_at END,
+               updated_at = NOW()
+           WHERE id = $1 RETURNING *`,
+          [
+            voiceSession.id,
+            recordingUrl || historicalRecordingUrl,
+            recordingId || historicalRecordingId,
+            Number.isFinite(durationSeconds) ? durationSeconds : historicalEvent.rows[0]?.duration_seconds || null
+          ]
+        );
+        voiceSession = mergedVoice.rows[0] || voiceSession;
+      }
+    }
+
+    res.status(201).json({
+      status: "ok",
+      message: "Ticket telefónico creado",
+      ticket,
+      manual_intake: metadata,
+      voice_session: sanitizeVoiceSessionRow(voiceSession, { includeCredentials: false })
+    });
+  } catch (error) {
+    console.error("[MANUAL PHONE TICKET ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message || "No fue posible crear el ticket telefónico" });
+  }
+});
+
 app.post("/tickets/:id/acknowledge", async (req, res) => {
   if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
   if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
@@ -9624,7 +9818,9 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
 
     const payload = req.body || {};
     const sessionId = payload.session_id || payload.wa_center_session_id || null;
+    const callId = payload.call_id || payload.wa_center_call_id || null;
     const externalReference = payload.external_reference || null;
+    const providerEventId = String(payload.event_id || payload.webhook_event_id || "").trim().slice(0, 220) || null;
     const event = String(payload.event || "UPDATED").toUpperCase();
     const normalizedStatus = normalizeVoiceStatus(event);
 
@@ -9634,20 +9830,22 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
       FROM ticket_voice_sessions
       WHERE ($1::text IS NOT NULL AND wa_center_session_id = $1)
          OR ($2::text IS NOT NULL AND external_reference = $2)
+         OR ($3::text IS NOT NULL AND wa_center_call_id = $3)
       ORDER BY created_at DESC
       LIMIT 1
       `,
-      [sessionId, externalReference]
+      [sessionId, externalReference, callId]
     );
 
     const session = sessionResult.rows[0] || null;
 
-    await pool.query(
+    const voiceEventInsert = await pool.query(
       `
       INSERT INTO ticket_voice_events (
         voice_session_id,
         ticket_id,
         wa_center_session_id,
+        provider_event_id,
         external_reference,
         event,
         participant_role,
@@ -9655,12 +9853,15 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
         failure_reason,
         payload
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (provider_event_id) WHERE provider_event_id IS NOT NULL DO NOTHING
+      RETURNING id
       `,
       [
         session?.id || null,
         session?.ticket_id || null,
         sessionId,
+        providerEventId,
         externalReference,
         event,
         payload.participant_role || null,
@@ -9669,6 +9870,10 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
         JSON.stringify(payload)
       ]
     );
+
+    if (providerEventId && voiceEventInsert.rows.length === 0) {
+      return res.json({ status: "ok", matched: Boolean(session), event, duplicate: true });
+    }
 
     if (session) {
       const effectiveStatus = await resolveWebhookVoiceStatus(session, normalizedStatus, payload);
@@ -9719,6 +9924,7 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
           JSON.stringify({
             provider: 'wa_center',
             wa_center_session_id: sessionId,
+            wa_center_call_id: callId,
             external_reference: externalReference,
             event,
             participant_role: payload.participant_role || null,
@@ -12269,6 +12475,8 @@ app.get("/tickets/:id", async (req, res) => {
     );
 
     const voiceSessions = await getVoiceSessionsForTicket(id, { includeCredentials: false, limit: 20 });
+    const creationAction = actionsResult.rows.find(action => action.action_type === "TICKET_CREATED");
+    const manualIntake = ticket.source_type === "PHONE_CALL" ? (creationAction?.metadata || null) : null;
 
     res.json({
       status: "ok",
@@ -12277,7 +12485,8 @@ app.get("/tickets/:id", async (req, res) => {
       actions: actionsResult.rows,
       notes: notesResult.rows,
       reports: reportsResult.rows,
-      voice_sessions: voiceSessions
+      voice_sessions: voiceSessions,
+      manual_intake: manualIntake
     });
 
   } catch (error) {
