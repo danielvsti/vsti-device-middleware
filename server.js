@@ -7785,12 +7785,14 @@ app.post("/public/location-request/:token/position", locationRequestRateLimit, e
     const longitude = Number(req.body?.longitude);
     const accuracy = Number(req.body?.accuracy);
     const maxAccuracy = Math.max(30, Number(process.env.PHONE_LOCATION_MAX_ACCURACY_METERS || 200));
+    const absoluteAccuracyLimit = Math.max(maxAccuracy, Number(process.env.PHONE_LOCATION_ABSOLUTE_MAX_ACCURACY_METERS || 5000));
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
       return sendPublicLocationResponse(req, res, 400, { status: "error", message: "El teléfono entregó coordenadas inválidas" });
     }
-    if (!Number.isFinite(accuracy) || accuracy > maxAccuracy) {
-      return sendPublicLocationResponse(req, res, 422, { status: "error", message: `La ubicación aún es imprecisa (${Math.round(accuracy || 0)} m). Intenta nuevamente al aire libre.` });
+    if (!Number.isFinite(accuracy) || accuracy > absoluteAccuracyLimit) {
+      return sendPublicLocationResponse(req, res, 422, { status: "error", message: `La ubicación es demasiado imprecisa (${Math.round(accuracy || 0)} m). Intenta nuevamente al aire libre.` });
     }
+    const lowPrecision = accuracy > maxAccuracy;
 
     await client.query("BEGIN");
     const requestResult = await client.query(
@@ -7822,16 +7824,27 @@ app.post("/public/location-request/:token/position", locationRequestRateLimit, e
     await client.query(
       `INSERT INTO ticket_actions (ticket_id, actor_role, action_type, description, metadata)
        VALUES ($1,'EXTERNAL_CALLER','LOCATION_SHARED',$2,$3)`,
-      [request.ticket_id, "Llamante compartió su ubicación GPS mediante enlace seguro", JSON.stringify({
+      [request.ticket_id, lowPrecision
+        ? `Llamante compartió ubicación GPS aproximada (${Math.round(accuracy)} m de precisión)`
+        : "Llamante compartió su ubicación GPS mediante enlace seguro", JSON.stringify({
         location_request_id: request.id,
         latitude,
         longitude,
-        accuracy
+        accuracy,
+        low_precision: lowPrecision,
+        preferred_max_accuracy_meters: maxAccuracy
       })]
     );
     await client.query("COMMIT");
     await classifyAndPersistTicketSector(ticketResult.rows[0]).catch(error => console.warn("[PHONE LOCATION SECTOR WARNING]", error.message));
-    sendPublicLocationResponse(req, res, 200, { status: "ok", message: "Ubicación recibida correctamente", accuracy });
+    sendPublicLocationResponse(req, res, 200, {
+      status: "ok",
+      message: lowPrecision
+        ? `Ubicación aproximada recibida (${Math.round(accuracy)} m de precisión)`
+        : "Ubicación recibida correctamente",
+      accuracy,
+      low_precision: lowPrecision
+    });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => null);
     console.error("[PHONE LOCATION SUBMIT ERROR]", error);

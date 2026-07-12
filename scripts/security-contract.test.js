@@ -94,5 +94,6 @@ assert(dashboardMapState.includes('Cache-Control'), "El estado del mapa operacio
 const locationSubmitSql = routeBlock('app.post("/public/location-request/:token/position"', 5200);
 assert(locationSubmitSql.includes("status='COMPLETED'"), "El enlace GPS debe quedar consumido después de utilizarse");
 assert(locationSubmitSql.includes("LOCATION_SHARED"), "La ubicación compartida debe dejar trazabilidad operacional");
+assert(locationSubmitSql.includes("absoluteAccuracyLimit"), "El GPS telefónico debe conservar ubicación aproximada con advertencia antes de descartarla");
 
 console.log("Security contract OK");
