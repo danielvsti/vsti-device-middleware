@@ -59,16 +59,21 @@ function corsOriginAllowed(origin) {
   return CORS_ALLOWED_ORIGINS.includes(normalizedOrigin) || SOS_PUBLIC_ORIGINS.includes(normalizedOrigin);
 }
 
-app.use(cors({
-  origin(origin, callback) {
-    if (corsOriginAllowed(origin)) return callback(null, true);
-    const error = new Error("Origen no autorizado por CORS");
-    error.status = 403;
-    return callback(error);
-  },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "X-Admin-Token", "X-SOS-Token", "X-Request-Id"],
-  maxAge: 86400
+app.use(cors((req, callback) => {
+  const isPublicLocationSubmission = req.method === "POST"
+    && /^\/public\/location-request\/[^/]+\/position$/.test(req.path);
+  callback(null, {
+    origin(origin, originCallback) {
+      if (isPublicLocationSubmission && origin === "null") return originCallback(null, true);
+      if (corsOriginAllowed(origin)) return originCallback(null, true);
+      const error = new Error("Origen no autorizado por CORS");
+      error.status = 403;
+      return originCallback(error);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "X-Admin-Token", "X-SOS-Token", "X-Request-Id"],
+    maxAge: 86400
+  });
 }));
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");

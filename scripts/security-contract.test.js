@@ -21,6 +21,8 @@ assert(server.includes("TWILIO_VERIFY_SERVICE_SID"), "Debe existir integración 
 assert(server.includes('selectedChannel === "demo" && OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE'), "El código demo solo debe exponerse para desafíos demo");
 assert(server.includes("CORS_ALLOWED_ORIGINS"), "Debe existir allowlist CORS");
 assert(server.includes("SOS_PUBLIC_ORIGINS.includes(normalizedOrigin)"), "CORS debe permitir el origen propio del formulario GPS público");
+assert(server.includes('isPublicLocationSubmission && origin === "null"'), "CORS debe aceptar Origin null solamente en el POST GPS firmado de WhatsApp iOS");
+assert(server.includes('/^\\/public\\/location-request\\/[^/]+\\/position$/'), "La excepción Origin null debe quedar limitada a la ruta GPS pública");
 assert(server.includes('"Cache-Control"'), "CORS debe permitir Cache-Control usado por paneles web");
 
 for (const signature of [
