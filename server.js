@@ -45,11 +45,18 @@ const CORS_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
+const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://sos.vsti.cl"]
+  .filter(Boolean)
+  .map((value) => {
+    try { return new URL(value).origin; } catch (_) { return ""; }
+  })
+  .filter(Boolean);
 
 function corsOriginAllowed(origin) {
   if (!origin) return true;
   if (SECURITY_DEMO_MODE && CORS_ALLOWED_ORIGINS.length === 0) return true;
-  return CORS_ALLOWED_ORIGINS.includes(String(origin).replace(/\/+$/, ""));
+  const normalizedOrigin = String(origin).replace(/\/+$/, "");
+  return CORS_ALLOWED_ORIGINS.includes(normalizedOrigin) || SOS_PUBLIC_ORIGINS.includes(normalizedOrigin);
 }
 
 app.use(cors({
@@ -7732,6 +7739,7 @@ app.post("/tickets/:id/location-request", async (req, res) => {
 
 app.get("/public/location-request/:token", locationRequestRateLimit, async (req, res) => {
   try {
+    res.setHeader("Permissions-Policy", "geolocation=(self), camera=(), microphone=()");
     await ensurePhoneLocationRequestSchema();
     const tokenHash = locationRequestTokenHash(req.params.token);
     const result = await pool.query(

@@ -20,6 +20,7 @@ assert(server.includes("OTP_PROVIDER"), "Debe existir configuración de proveedo
 assert(server.includes("TWILIO_VERIFY_SERVICE_SID"), "Debe existir integración Twilio Verify");
 assert(server.includes('selectedChannel === "demo" && OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE'), "El código demo solo debe exponerse para desafíos demo");
 assert(server.includes("CORS_ALLOWED_ORIGINS"), "Debe existir allowlist CORS");
+assert(server.includes("SOS_PUBLIC_ORIGINS.includes(normalizedOrigin)"), "CORS debe permitir el origen propio del formulario GPS público");
 assert(server.includes('"Cache-Control"'), "CORS debe permitir Cache-Control usado por paneles web");
 
 for (const signature of [
@@ -82,6 +83,7 @@ const locationRequestSql = routeBlock('app.post("/tickets/:id/location-request"'
 assert(locationRequestSql.includes("crypto.randomBytes(32)"), "El enlace GPS debe usar un token criptográficamente aleatorio");
 assert(locationRequestSql.includes("token_hash"), "El token GPS debe almacenarse únicamente como hash");
 const publicLocationPage = routeBlock('app.get("/public/location-request/:token"', 7000);
+assert(publicLocationPage.includes('geolocation=(self)'), "La página GPS pública debe habilitar geolocalización del mismo origen");
 assert(publicLocationPage.includes('method="post"'), "La página GPS debe enviar mediante formulario HTML nativo compatible con Safari");
 assert(publicLocationPage.includes("form.submit()"), "La página GPS debe evitar transportes JavaScript incompatibles con WhatsApp iOS");
 assert(!publicLocationPage.includes("fetch("), "La página GPS no debe depender de fetch en el navegador embebido");
