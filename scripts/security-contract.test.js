@@ -88,6 +88,8 @@ assert(publicLocationPage.includes('method="post"'), "La página GPS debe enviar
 assert(publicLocationPage.includes("form.submit()"), "La página GPS debe evitar transportes JavaScript incompatibles con WhatsApp iOS");
 assert(!publicLocationPage.includes("fetch("), "La página GPS no debe depender de fetch en el navegador embebido");
 assert(!publicLocationPage.includes("new XMLHttpRequest()"), "La página GPS no debe depender de XMLHttpRequest en el navegador embebido");
+const dashboardMapState = routeBlock('app.get("/dashboard/map-state"', 1800);
+assert(dashboardMapState.includes('Cache-Control'), "El estado del mapa operacional no debe quedar almacenado en caché");
 const locationSubmitSql = routeBlock('app.post("/public/location-request/:token/position"', 5200);
 assert(locationSubmitSql.includes("status='COMPLETED'"), "El enlace GPS debe quedar consumido después de utilizarse");
 assert(locationSubmitSql.includes("LOCATION_SHARED"), "La ubicación compartida debe dejar trazabilidad operacional");

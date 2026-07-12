@@ -12260,6 +12260,9 @@ app.get("/dashboard/map-state", async (req, res) => {
   if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere usuario OPERATOR o ADMIN para acceder al panel de control")) return;
 
   try {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
     await ensureGeofenceSchema();
     const control_center_code = dashboardAuthorizedControlCenterCode(req);
 
