@@ -12717,12 +12717,32 @@ app.get("/tickets/:id", async (req, res) => {
     );
     const creationAction = actionsResult.rows.find(action => action.action_type === "TICKET_CREATED");
     const manualIntake = ticket.source_type === "PHONE_CALL" ? (creationAction?.metadata || null) : null;
+    const locationAuditActions = locationRequestsResult.rows.map((request) => ({
+      id: `location-request-${request.id}`,
+      action_type: `LOCATION_REQUEST_${String(request.status || "UNKNOWN").toUpperCase()}`,
+      actor_role: "SYSTEM",
+      description: request.completed_at
+        ? `Solicitud GPS completada con precisión ${request.accuracy ?? "no informada"} m`
+        : `Solicitud GPS ${String(request.status || "sin estado").toLowerCase()}; vence ${new Date(request.expires_at).toISOString()}`,
+      metadata: {
+        location_request_id: request.id,
+        channel: request.channel,
+        expires_at: request.expires_at,
+        completed_at: request.completed_at,
+        latitude: request.latitude,
+        longitude: request.longitude,
+        accuracy: request.accuracy
+      },
+      created_at: request.completed_at || request.updated_at || request.created_at,
+      actor_name: null
+    }));
 
     res.json({
       status: "ok",
       ticket,
       emergency_contacts: contactsResult.rows,
-      actions: actionsResult.rows,
+      actions: [...actionsResult.rows, ...locationAuditActions]
+        .sort((a, b) => new Date(a.created_at) - new Date(b.created_at)),
       notes: notesResult.rows,
       reports: reportsResult.rows,
       voice_sessions: voiceSessions,
