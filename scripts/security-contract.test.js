@@ -34,6 +34,7 @@ for (const signature of [
   'app.post("/public/sirens/activate"',
   'app.post("/public/sirens/deactivate"',
   'app.post("/public/mobile/ack"',
+  'app.get("/settings/emergency-categories"',
   'app.post("/tickets/manual"'
 ]) {
   assert(routeBlock(signature).includes("checkRoleAccess"), `${signature} debe exigir rol operacional`);

@@ -7432,6 +7432,16 @@ app.get("/tickets", async (req, res) => {
 
 
 
+app.get("/settings/emergency-categories", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
+  try {
+    const categories = await loadEmergencyCategoryCatalog({ includeDisabled: false });
+    res.json({ status: "ok", categories });
+  } catch (error) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
 app.post("/tickets/manual", async (req, res) => {
   if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional para crear tickets")) return;
 
