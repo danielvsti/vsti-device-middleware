@@ -6151,7 +6151,15 @@ async function getNeighborTicketActivity(ticketId, limit = 30) {
     [ticketId, limit]
   );
 
-  return result.rows.map((row) => {
+  const actionItems = result.rows
+    // Las llamadas gestionadas por WA-Center se resumen desde
+    // ticket_voice_sessions más abajo. Así evitamos mostrar por separado la
+    // solicitud y el rechazo técnico de una misma sesión.
+    .filter((row) => {
+      const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+      return !metadata.voice_session_id;
+    })
+    .map((row) => {
     const metadata = row.metadata && typeof row.metadata === 'object'
       ? row.metadata
       : {};
@@ -6193,7 +6201,73 @@ async function getNeighborTicketActivity(ticketId, limit = 30) {
       file_name,
       created_at: row.created_at
     };
+    });
+
+  await ensureVoiceSchema();
+  const voiceResult = await pool.query(
+    `
+    SELECT
+      id,
+      status,
+      target_type,
+      started_at,
+      connected_at,
+      ended_at,
+      duration_seconds,
+      failure_reason,
+      recording_url,
+      created_at
+    FROM ticket_voice_sessions
+    WHERE ticket_id = $1
+      AND requested_by = 'NEIGHBOR'
+    ORDER BY created_at DESC
+    LIMIT $2
+    `,
+    [ticketId, limit]
+  );
+
+  const voiceItems = voiceResult.rows.map((session) => {
+    const status = String(session.status || 'REQUESTED').toUpperCase();
+    const target = String(session.target_type || '').toUpperCase() === 'RESOLVER'
+      ? 'con el resolutor'
+      : 'con la central';
+    const connected = Boolean(session.connected_at) || status === 'CONNECTED';
+    const terminalFailure = ['FAILED', 'NO_ANSWER', 'EXPIRED', 'REJECTED'].includes(status)
+      || (status === 'ENDED' && !connected);
+    let title = `Llamada solicitada ${target}`;
+    let body = 'Esperando conexión de la llamada segura.';
+
+    if (status === 'ENDED' && connected) {
+      title = 'Llamada segura finalizada';
+      body = session.duration_seconds != null
+        ? `La comunicación ${target} duró ${Math.max(0, Math.round(Number(session.duration_seconds)))} segundos.`
+        : `La comunicación ${target} terminó correctamente.`;
+    } else if (status === 'CONNECTED' || connected) {
+      title = 'Llamada segura conectada';
+      body = `Comunicación establecida ${target}.`;
+    } else if (terminalFailure) {
+      title = 'Intento de llamada no completado';
+      body = status === 'NO_ANSWER'
+        ? `No hubo respuesta ${target}.`
+        : status === 'REJECTED'
+          ? `La llamada ${target} fue rechazada.`
+          : 'La sesión no alcanzó a conectarse. Puedes volver a intentarlo.';
+    }
+
+    return {
+      id: `voice-session-${session.id}`,
+      kind: terminalFailure ? 'call_response' : 'voice_call',
+      title,
+      body,
+      media_url: null,
+      file_name: null,
+      created_at: session.ended_at || session.connected_at || session.started_at || session.created_at
+    };
   });
+
+  return [...actionItems, ...voiceItems]
+    .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime())
+    .slice(0, limit);
 }
 
 function buildNeighborProgress(event) {
