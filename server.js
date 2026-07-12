@@ -10069,6 +10069,17 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
     const providerEventId = String(payload.event_id || payload.webhook_event_id || "").trim().slice(0, 220) || null;
     const event = String(payload.event || "UPDATED").toUpperCase();
     const normalizedStatus = normalizeVoiceStatus(event);
+    const rawRecordingUrl = payload.recording_url || payload.recording?.url || null;
+    let recordingUrl = null;
+    if (rawRecordingUrl) {
+      try {
+        const parsedRecordingUrl = new URL(String(rawRecordingUrl));
+        if (parsedRecordingUrl.protocol !== "https:") throw new Error("HTTPS required");
+        recordingUrl = parsedRecordingUrl.toString();
+      } catch {
+        return res.status(400).json({ status: "error", message: "recording_url must be a valid HTTPS URL" });
+      }
+    }
 
     const sessionResult = await pool.query(
       `
@@ -10123,7 +10134,6 @@ app.post("/integrations/wa-center/voice-events", async (req, res) => {
 
     if (session) {
       const effectiveStatus = await resolveWebhookVoiceStatus(session, normalizedStatus, payload);
-      const recordingUrl = payload.recording_url || payload.recording?.url || null;
       const recordingId = payload.recording_id || payload.recording?.id || null;
 
       await pool.query(

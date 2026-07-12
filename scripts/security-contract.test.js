@@ -82,6 +82,7 @@ assert(manualTicketSql.includes("wa_center_session_id"), "El ticket telefónico 
 const waWebhookSql = routeBlock('app.post("/integrations/wa-center/voice-events"', 6200);
 assert(waWebhookSql.includes("provider_event_id"), "El webhook de WA-Center debe deduplicar eventos del proveedor");
 assert(waWebhookSql.includes("wa_center_call_id"), "El webhook de WA-Center debe correlacionar llamadas municipales externas");
+assert(waWebhookSql.includes('recording_url must be a valid HTTPS URL'), "El webhook de WA-Center debe rechazar grabaciones no HTTPS");
 
 const locationRequestSql = routeBlock('app.post("/tickets/:id/location-request"', 5200);
 assert(locationRequestSql.includes("crypto.randomBytes(32)"), "El enlace GPS debe usar un token criptográficamente aleatorio");

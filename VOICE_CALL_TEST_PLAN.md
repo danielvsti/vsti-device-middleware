@@ -63,6 +63,20 @@ node --check app.js # ejecutar en SOS-PWA y SOS-RESOLVER-PWA
 - No debe quedar ringback, timer de duración, polling de llamada, track local/remoto ni `RTCPeerConnection` activa.
 - Mensaje, Audio, Video y Llamar deben continuar visibles y funcionales en App Vecino.
 
+## Prueba controlada de grabación
+
+Con una sesión de WA-Center ya correlacionada al ticket, ejecutar sin imprimir los secretos:
+
+```bash
+WA_CENTER_WEBHOOK_SECRET='...' PANEL_TOKEN='...' \
+TICKET_ID='<uuid>' WA_CENTER_SESSION_ID='<session-id>' \
+RECORDING_URL='https://media.wa-center.vsti.cl/recordings/<id>.mp3' \
+node scripts/test-wa-center-recording-webhook.js
+```
+
+El script exige que el webhook responda `matched: true` y luego confirma que la
+misma URL quedó almacenada en `ticket_voice_sessions` y disponible en la ficha.
+
 ## Orden de despliegue
 
 1. Middleware.
