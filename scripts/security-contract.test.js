@@ -35,7 +35,8 @@ for (const signature of [
   'app.post("/public/sirens/deactivate"',
   'app.post("/public/mobile/ack"',
   'app.get("/settings/emergency-categories"',
-  'app.post("/tickets/manual"'
+  'app.post("/tickets/manual"',
+  'app.post("/tickets/:id/location-request"'
 ]) {
   assert(routeBlock(signature).includes("checkRoleAccess"), `${signature} debe exigir rol operacional`);
 }
@@ -76,5 +77,12 @@ assert(manualTicketSql.includes("wa_center_session_id"), "El ticket telefónico 
 const waWebhookSql = routeBlock('app.post("/integrations/wa-center/voice-events"', 6200);
 assert(waWebhookSql.includes("provider_event_id"), "El webhook de WA-Center debe deduplicar eventos del proveedor");
 assert(waWebhookSql.includes("wa_center_call_id"), "El webhook de WA-Center debe correlacionar llamadas municipales externas");
+
+const locationRequestSql = routeBlock('app.post("/tickets/:id/location-request"', 5200);
+assert(locationRequestSql.includes("crypto.randomBytes(32)"), "El enlace GPS debe usar un token criptográficamente aleatorio");
+assert(locationRequestSql.includes("token_hash"), "El token GPS debe almacenarse únicamente como hash");
+const locationSubmitSql = routeBlock('app.post("/public/location-request/:token/position"', 5200);
+assert(locationSubmitSql.includes("status='COMPLETED'"), "El enlace GPS debe quedar consumido después de utilizarse");
+assert(locationSubmitSql.includes("LOCATION_SHARED"), "La ubicación compartida debe dejar trazabilidad operacional");
 
 console.log("Security contract OK");

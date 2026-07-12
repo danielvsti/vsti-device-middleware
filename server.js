@@ -106,6 +106,12 @@ const qrVisitRateLimit = rateLimit({
   key: (req) => getRemoteIp(req),
   message: "Demasiados accesos QR desde este dispositivo. Intenta nuevamente en un minuto."
 });
+const locationRequestRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.LOCATION_REQUEST_RATE_LIMIT_MAX || 20),
+  key: (req) => getRemoteIp(req),
+  message: "Demasiados intentos de ubicación. Espera un minuto e intenta nuevamente."
+});
 
 function requireDebugAccess(req, res) {
   if (process.env.SOS_DEBUG_ENDPOINTS_ENABLED !== "true") {
@@ -2968,6 +2974,37 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
   return { assigned: true, ...assignment };
 }
 
+
+let phoneLocationRequestSchemaReady = false;
+async function ensurePhoneLocationRequestSchema() {
+  if (phoneLocationRequestSchemaReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_location_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      destination_phone TEXT,
+      requested_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      expires_at TIMESTAMPTZ NOT NULL,
+      completed_at TIMESTAMPTZ,
+      latitude DOUBLE PRECISION,
+      longitude DOUBLE PRECISION,
+      accuracy DOUBLE PRECISION,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_ticket_location_requests_ticket
+    ON ticket_location_requests(ticket_id, created_at DESC)
+  `);
+  phoneLocationRequestSchemaReady = true;
+}
+
+function locationRequestTokenHash(token) {
+  return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+}
 
 async function createTicket({
   control_center_id,
@@ -7620,6 +7657,170 @@ app.post("/tickets/manual", async (req, res) => {
   } catch (error) {
     console.error("[MANUAL PHONE TICKET ERROR]", error);
     res.status(500).json({ status: "error", message: error.message || "No fue posible crear el ticket telefónico" });
+  }
+});
+
+app.post("/tickets/:id/location-request", async (req, res) => {
+  if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Se requiere sesión operacional")) return;
+  if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
+  try {
+    await ensurePhoneLocationRequestSchema();
+    const ticketResult = await pool.query(
+      `SELECT t.id, t.state, t.source_type, cc.name AS control_center_name
+       FROM tickets t JOIN control_centers cc ON cc.id = t.control_center_id
+       WHERE t.id = $1 LIMIT 1`,
+      [req.params.id]
+    );
+    const ticket = ticketResult.rows[0];
+    if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+    if (["CLOSED", "CANCELLED", "RESOLVED"].includes(String(ticket.state || "").toUpperCase())) {
+      return res.status(409).json({ status: "error", message: "No se puede solicitar ubicación para un ticket cerrado" });
+    }
+
+    const destinationPhone = String(req.body?.phone || "").trim().slice(0, 40) || null;
+    const ttlMinutes = Math.max(5, Math.min(60, Number(process.env.PHONE_LOCATION_REQUEST_TTL_MINUTES || 20)));
+    const rawToken = crypto.randomBytes(32).toString("base64url");
+    const tokenHash = locationRequestTokenHash(rawToken);
+
+    await pool.query(
+      `UPDATE ticket_location_requests
+       SET status = 'REPLACED', updated_at = NOW()
+       WHERE ticket_id = $1 AND status = 'PENDING'`,
+      [ticket.id]
+    );
+    const requestResult = await pool.query(
+      `INSERT INTO ticket_location_requests (
+         ticket_id, token_hash, destination_phone, requested_by, expires_at
+       ) VALUES ($1,$2,$3,$4,NOW() + ($5::int * INTERVAL '1 minute'))
+       RETURNING id, expires_at`,
+      [ticket.id, tokenHash, destinationPhone, req.panel_session?.sub || null, ttlMinutes]
+    );
+
+    await pool.query(
+      `INSERT INTO ticket_actions (
+         ticket_id, actor_user_id, actor_role, action_type, description, metadata
+       ) VALUES ($1,$2,$3,'LOCATION_REQUEST_SENT',$4,$5)`,
+      [
+        ticket.id,
+        req.panel_session?.sub || null,
+        req.panel_session?.role || "OPERATOR",
+        "Operador generó enlace seguro para solicitar ubicación al llamante",
+        JSON.stringify({
+          location_request_id: requestResult.rows[0].id,
+          destination_phone: destinationPhone,
+          expires_at: requestResult.rows[0].expires_at
+        })
+      ]
+    );
+
+    const url = `${sosPublicBaseUrl(req)}/public/location-request/${rawToken}`;
+    res.status(201).json({
+      status: "ok",
+      location_request: {
+        id: requestResult.rows[0].id,
+        url,
+        expires_at: requestResult.rows[0].expires_at,
+        destination_phone: destinationPhone,
+        control_center_name: ticket.control_center_name
+      }
+    });
+  } catch (error) {
+    console.error("[CREATE TICKET LOCATION REQUEST ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message || "No fue posible generar el enlace de ubicación" });
+  }
+});
+
+app.get("/public/location-request/:token", locationRequestRateLimit, async (req, res) => {
+  try {
+    await ensurePhoneLocationRequestSchema();
+    const tokenHash = locationRequestTokenHash(req.params.token);
+    const result = await pool.query(
+      `SELECT lr.status, lr.expires_at, cc.name AS control_center_name
+       FROM ticket_location_requests lr
+       JOIN tickets t ON t.id = lr.ticket_id
+       JOIN control_centers cc ON cc.id = t.control_center_id
+       WHERE lr.token_hash = $1 LIMIT 1`,
+      [tokenHash]
+    );
+    const request = result.rows[0];
+    const available = request && request.status === "PENDING" && new Date(request.expires_at).getTime() > Date.now();
+    res.setHeader("Permissions-Policy", "geolocation=(self)");
+    res.setHeader("Cache-Control", "no-store");
+    res.type("html").send(`<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Compartir ubicación · SOS Municipal</title>
+<style>body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#eef2f7;color:#0f172a;display:grid;min-height:100vh;place-items:center;padding:18px;box-sizing:border-box}.card{width:min(560px,100%);background:#fff;border-radius:26px;padding:28px;box-shadow:0 20px 60px #0f172a22;text-align:center}.icon{font-size:52px}h1{margin:10px 0}p{color:#475569;line-height:1.5}.notice{background:#eff6ff;border:1px solid #bfdbfe;padding:13px;border-radius:14px;text-align:left}button{width:100%;border:0;border-radius:15px;padding:15px;font-size:17px;font-weight:900;background:#dc2626;color:#fff;margin-top:16px}button:disabled{background:#94a3b8}.status{min-height:26px;margin-top:14px;font-weight:800}.ok{color:#15803d}.error{color:#b91c1c}</style></head>
+<body><main class="card"><div class="icon">📍</div><h1>Compartir ubicación</h1>
+<p>${available ? `El <strong>${String(request.control_center_name || "Centro de Control Municipal").replace(/[<>&"]/g, "")}</strong> necesita ubicar correctamente la emergencia que informaste.` : "Este enlace ya fue utilizado, reemplazado o venció."}</p>
+<div class="notice">Tu ubicación se enviará solamente cuando presiones el botón y autorices el GPS del teléfono.</div>
+<button id="send" ${available ? "" : "disabled"}>Compartir mi ubicación actual</button><div id="status" class="status"></div></main>
+<script>const button=document.getElementById('send'),statusEl=document.getElementById('status');button?.addEventListener('click',()=>{if(!navigator.geolocation){statusEl.className='status error';statusEl.textContent='Este teléfono no permite obtener ubicación.';return;}button.disabled=true;statusEl.className='status';statusEl.textContent='Obteniendo GPS de alta precisión…';navigator.geolocation.getCurrentPosition(async p=>{try{const r=await fetch(location.pathname+'/position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy})});const d=await r.json();if(!r.ok)throw new Error(d.message||'No fue posible enviar la ubicación');statusEl.className='status ok';statusEl.textContent='✓ Ubicación enviada correctamente. Ya puedes cerrar esta página.';}catch(e){button.disabled=false;statusEl.className='status error';statusEl.textContent=e.message;}},e=>{button.disabled=false;statusEl.className='status error';statusEl.textContent=e.code===1?'Debes permitir el acceso a ubicación para continuar.':'No pudimos obtener un GPS preciso. Intenta nuevamente al aire libre.';},{enableHighAccuracy:true,timeout:20000,maximumAge:0});});</script></body></html>`);
+  } catch (error) {
+    res.status(500).type("text").send("No fue posible abrir la solicitud de ubicación.");
+  }
+});
+
+app.post("/public/location-request/:token/position", locationRequestRateLimit, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await ensurePhoneLocationRequestSchema();
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    const accuracy = Number(req.body?.accuracy);
+    const maxAccuracy = Math.max(30, Number(process.env.PHONE_LOCATION_MAX_ACCURACY_METERS || 200));
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+      return res.status(400).json({ status: "error", message: "El teléfono entregó coordenadas inválidas" });
+    }
+    if (!Number.isFinite(accuracy) || accuracy > maxAccuracy) {
+      return res.status(422).json({ status: "error", message: `La ubicación aún es imprecisa (${Math.round(accuracy || 0)} m). Intenta nuevamente al aire libre.` });
+    }
+
+    await client.query("BEGIN");
+    const requestResult = await client.query(
+      `SELECT lr.*, t.state
+       FROM ticket_location_requests lr JOIN tickets t ON t.id = lr.ticket_id
+       WHERE lr.token_hash = $1 FOR UPDATE`,
+      [locationRequestTokenHash(req.params.token)]
+    );
+    const request = requestResult.rows[0];
+    if (!request || request.status !== "PENDING" || new Date(request.expires_at).getTime() <= Date.now()) {
+      await client.query("ROLLBACK");
+      return res.status(410).json({ status: "error", message: "El enlace ya fue utilizado o venció" });
+    }
+    if (["CLOSED", "CANCELLED", "RESOLVED"].includes(String(request.state || "").toUpperCase())) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ status: "error", message: "Este caso ya fue cerrado" });
+    }
+
+    const ticketResult = await client.query(
+      `UPDATE tickets SET latitude=$2, longitude=$3, accuracy=$4, updated_at=NOW()
+       WHERE id=$1 RETURNING *`,
+      [request.ticket_id, latitude, longitude, accuracy]
+    );
+    await client.query(
+      `UPDATE ticket_location_requests SET status='COMPLETED', completed_at=NOW(),
+       latitude=$2, longitude=$3, accuracy=$4, updated_at=NOW() WHERE id=$1`,
+      [request.id, latitude, longitude, accuracy]
+    );
+    await client.query(
+      `INSERT INTO ticket_actions (ticket_id, actor_role, action_type, description, metadata)
+       VALUES ($1,'EXTERNAL_CALLER','LOCATION_SHARED',$2,$3)`,
+      [request.ticket_id, "Llamante compartió su ubicación GPS mediante enlace seguro", JSON.stringify({
+        location_request_id: request.id,
+        latitude,
+        longitude,
+        accuracy
+      })]
+    );
+    await client.query("COMMIT");
+    await classifyAndPersistTicketSector(ticketResult.rows[0]).catch(error => console.warn("[PHONE LOCATION SECTOR WARNING]", error.message));
+    res.json({ status: "ok", message: "Ubicación recibida", accuracy });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    console.error("[PHONE LOCATION SUBMIT ERROR]", error);
+    res.status(500).json({ status: "error", message: "No fue posible actualizar la ubicación" });
+  } finally {
+    client.release();
   }
 });
 
