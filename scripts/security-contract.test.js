@@ -64,6 +64,7 @@ assert(!panelLoginSql.includes("source_event."), "El login de panel no debe refe
 const ticketDetailSql = routeBlock('app.get("/tickets/:id"', 4200);
 assert(ticketDetailSql.includes("LEFT JOIN mobile_events source_event"), "El detalle del ticket debe enlazar el evento móvil");
 assert(ticketDetailSql.includes("LEFT JOIN municipal_qr_points qr_point"), "El detalle del ticket debe enlazar la atribución QR");
+assert(routeBlock('app.get("/tickets/:id"', 9000).includes("location_requests"), "El detalle del ticket debe incluir trazabilidad de solicitudes GPS");
 const resolverLocationSql = routeBlock('app.post("/resolver/location"', 6200);
 assert(resolverLocationSql.includes("const rawLonNum = Number(longitude)"), "La ruta GPS del resolutor debe declarar la longitud recibida");
 assert(resolverLocationSql.includes("LONGITUDE_HEMISPHERE_SIGN"), "La ruta GPS del resolutor debe defenderse de hemisferio invertido");

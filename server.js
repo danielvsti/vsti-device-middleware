@@ -12706,6 +12706,15 @@ app.get("/tickets/:id", async (req, res) => {
     );
 
     const voiceSessions = await getVoiceSessionsForTicket(id, { includeCredentials: false, limit: 20 });
+    await ensurePhoneLocationRequestSchema();
+    const locationRequestsResult = await pool.query(
+      `SELECT id, status, channel, recipient, expires_at, completed_at,
+              latitude, longitude, accuracy, created_at, updated_at
+       FROM ticket_location_requests
+       WHERE ticket_id = $1
+       ORDER BY created_at ASC`,
+      [id]
+    );
     const creationAction = actionsResult.rows.find(action => action.action_type === "TICKET_CREATED");
     const manualIntake = ticket.source_type === "PHONE_CALL" ? (creationAction?.metadata || null) : null;
 
@@ -12717,6 +12726,7 @@ app.get("/tickets/:id", async (req, res) => {
       notes: notesResult.rows,
       reports: reportsResult.rows,
       voice_sessions: voiceSessions,
+      location_requests: locationRequestsResult.rows,
       manual_intake: manualIntake
     });
 
