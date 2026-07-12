@@ -7753,14 +7753,23 @@ app.get("/public/location-request/:token", locationRequestRateLimit, async (req,
 <body><main class="card"><div class="icon">📍</div><h1>Compartir ubicación</h1>
 <p>${available ? `El <strong>${String(request.control_center_name || "Centro de Control Municipal").replace(/[<>&"]/g, "")}</strong> necesita ubicar correctamente la emergencia que informaste.` : "Este enlace ya fue utilizado, reemplazado o venció."}</p>
 <div class="notice">Tu ubicación se enviará solamente cuando presiones el botón y autorices el GPS del teléfono.</div>
+<form id="locationForm" method="post" action="${sosPublicBaseUrl(req)}/public/location-request/${encodeURIComponent(req.params.token)}/position"><input type="hidden" name="latitude"><input type="hidden" name="longitude"><input type="hidden" name="accuracy"></form>
 <button id="send" ${available ? "" : "disabled"}>Compartir mi ubicación actual</button><div id="status" class="status"></div></main>
-<script>const submitUrl=${JSON.stringify(`${sosPublicBaseUrl(req)}/public/location-request/${encodeURIComponent(req.params.token)}/position`)};const button=document.getElementById('send'),statusEl=document.getElementById('status');function sendPosition(position){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST',submitUrl,true);xhr.setRequestHeader('Content-Type','application/json');xhr.onload=()=>{let data={};try{data=JSON.parse(xhr.responseText||'{}');}catch(_){return reject(new Error('El servidor entregó una respuesta no válida.'));}if(xhr.status<200||xhr.status>=300)return reject(new Error(data.message||'No fue posible enviar la ubicación'));resolve(data);};xhr.onerror=()=>reject(new Error('No fue posible conectar con el servidor.'));xhr.ontimeout=()=>reject(new Error('La conexión tardó demasiado. Intenta nuevamente.'));xhr.timeout=20000;xhr.send(JSON.stringify({latitude:position.coords.latitude,longitude:position.coords.longitude,accuracy:position.coords.accuracy}));});}button?.addEventListener('click',()=>{if(!navigator.geolocation){statusEl.className='status error';statusEl.textContent='Este teléfono no permite obtener ubicación.';return;}button.disabled=true;statusEl.className='status';statusEl.textContent='Obteniendo GPS de alta precisión…';navigator.geolocation.getCurrentPosition(async p=>{try{await sendPosition(p);statusEl.className='status ok';statusEl.textContent='✓ Ubicación enviada correctamente. Ya puedes cerrar esta página.';}catch(e){button.disabled=false;statusEl.className='status error';statusEl.textContent=e?.message||'No fue posible enviar la ubicación. Intenta nuevamente.';}},e=>{button.disabled=false;statusEl.className='status error';statusEl.textContent=e.code===1?'Debes permitir el acceso a ubicación para continuar.':'No pudimos obtener un GPS preciso. Intenta nuevamente al aire libre.';},{enableHighAccuracy:true,timeout:20000,maximumAge:0});});</script></body></html>`);
+<script>const button=document.getElementById('send'),statusEl=document.getElementById('status'),form=document.getElementById('locationForm');button?.addEventListener('click',()=>{if(!navigator.geolocation){statusEl.className='status error';statusEl.textContent='Este teléfono no permite obtener ubicación.';return;}button.disabled=true;statusEl.className='status';statusEl.textContent='Obteniendo GPS de alta precisión…';navigator.geolocation.getCurrentPosition(p=>{form.elements.latitude.value=String(p.coords.latitude);form.elements.longitude.value=String(p.coords.longitude);form.elements.accuracy.value=String(p.coords.accuracy);statusEl.textContent='Enviando ubicación…';form.submit();},e=>{button.disabled=false;statusEl.className='status error';statusEl.textContent=e.code===1?'Debes permitir el acceso a ubicación para continuar.':'No pudimos obtener un GPS preciso. Intenta nuevamente al aire libre.';},{enableHighAccuracy:true,timeout:20000,maximumAge:0});});</script></body></html>`);
   } catch (error) {
     res.status(500).type("text").send("No fue posible abrir la solicitud de ubicación.");
   }
 });
 
-app.post("/public/location-request/:token/position", locationRequestRateLimit, async (req, res) => {
+function sendPublicLocationResponse(req, res, status, payload) {
+  if (!req.is("application/x-www-form-urlencoded")) return res.status(status).json(payload);
+  const ok = status >= 200 && status < 300;
+  const message = String(payload.message || (ok ? "Ubicación enviada correctamente" : "No fue posible enviar la ubicación"))
+    .replace(/[<>&"]/g, "");
+  return res.status(status).type("html").send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ubicación · SOS Municipal</title><style>body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#eef2f7;color:#0f172a;display:grid;min-height:100vh;place-items:center;padding:18px;box-sizing:border-box}.card{width:min(560px,100%);background:#fff;border-radius:26px;padding:32px;box-shadow:0 20px 60px #0f172a22;text-align:center}.icon{font-size:58px}h1{margin:12px 0}p{color:#475569;line-height:1.5;font-size:18px}</style></head><body><main class="card"><div class="icon">${ok ? "✅" : "⚠️"}</div><h1>${ok ? "Ubicación compartida" : "No fue posible completar el envío"}</h1><p>${message}</p><p>${ok ? "Ya puedes cerrar esta página y volver a WhatsApp." : "Vuelve a WhatsApp y solicita un nuevo enlace si el problema continúa."}</p></main></body></html>`);
+}
+
+app.post("/public/location-request/:token/position", locationRequestRateLimit, express.urlencoded({ extended: false }), async (req, res) => {
   const client = await pool.connect();
   try {
     await ensurePhoneLocationRequestSchema();
@@ -7769,10 +7778,10 @@ app.post("/public/location-request/:token/position", locationRequestRateLimit, a
     const accuracy = Number(req.body?.accuracy);
     const maxAccuracy = Math.max(30, Number(process.env.PHONE_LOCATION_MAX_ACCURACY_METERS || 200));
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
-      return res.status(400).json({ status: "error", message: "El teléfono entregó coordenadas inválidas" });
+      return sendPublicLocationResponse(req, res, 400, { status: "error", message: "El teléfono entregó coordenadas inválidas" });
     }
     if (!Number.isFinite(accuracy) || accuracy > maxAccuracy) {
-      return res.status(422).json({ status: "error", message: `La ubicación aún es imprecisa (${Math.round(accuracy || 0)} m). Intenta nuevamente al aire libre.` });
+      return sendPublicLocationResponse(req, res, 422, { status: "error", message: `La ubicación aún es imprecisa (${Math.round(accuracy || 0)} m). Intenta nuevamente al aire libre.` });
     }
 
     await client.query("BEGIN");
@@ -7785,11 +7794,11 @@ app.post("/public/location-request/:token/position", locationRequestRateLimit, a
     const request = requestResult.rows[0];
     if (!request || request.status !== "PENDING" || new Date(request.expires_at).getTime() <= Date.now()) {
       await client.query("ROLLBACK");
-      return res.status(410).json({ status: "error", message: "El enlace ya fue utilizado o venció" });
+      return sendPublicLocationResponse(req, res, 410, { status: "error", message: "El enlace ya fue utilizado o venció" });
     }
     if (["CLOSED", "CANCELLED", "RESOLVED"].includes(String(request.state || "").toUpperCase())) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ status: "error", message: "Este caso ya fue cerrado" });
+      return sendPublicLocationResponse(req, res, 409, { status: "error", message: "Este caso ya fue cerrado" });
     }
 
     const ticketResult = await client.query(
@@ -7814,11 +7823,11 @@ app.post("/public/location-request/:token/position", locationRequestRateLimit, a
     );
     await client.query("COMMIT");
     await classifyAndPersistTicketSector(ticketResult.rows[0]).catch(error => console.warn("[PHONE LOCATION SECTOR WARNING]", error.message));
-    res.json({ status: "ok", message: "Ubicación recibida", accuracy });
+    sendPublicLocationResponse(req, res, 200, { status: "ok", message: "Ubicación recibida correctamente", accuracy });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => null);
     console.error("[PHONE LOCATION SUBMIT ERROR]", error);
-    res.status(500).json({ status: "error", message: "No fue posible actualizar la ubicación" });
+    sendPublicLocationResponse(req, res, 500, { status: "error", message: "No fue posible actualizar la ubicación" });
   } finally {
     client.release();
   }

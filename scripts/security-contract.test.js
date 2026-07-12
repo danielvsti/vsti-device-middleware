@@ -82,9 +82,10 @@ const locationRequestSql = routeBlock('app.post("/tickets/:id/location-request"'
 assert(locationRequestSql.includes("crypto.randomBytes(32)"), "El enlace GPS debe usar un token criptográficamente aleatorio");
 assert(locationRequestSql.includes("token_hash"), "El token GPS debe almacenarse únicamente como hash");
 const publicLocationPage = routeBlock('app.get("/public/location-request/:token"', 7000);
-assert(publicLocationPage.includes("const submitUrl="), "La página GPS debe entregar una URL de envío explícita compatible con Safari");
-assert(!publicLocationPage.includes("fetch(location.pathname"), "La página GPS no debe construir la ruta POST desde location.pathname");
-assert(publicLocationPage.includes("new XMLHttpRequest()"), "La página GPS debe usar un envío compatible con el navegador embebido de WhatsApp en iOS");
+assert(publicLocationPage.includes('method="post"'), "La página GPS debe enviar mediante formulario HTML nativo compatible con Safari");
+assert(publicLocationPage.includes("form.submit()"), "La página GPS debe evitar transportes JavaScript incompatibles con WhatsApp iOS");
+assert(!publicLocationPage.includes("fetch("), "La página GPS no debe depender de fetch en el navegador embebido");
+assert(!publicLocationPage.includes("new XMLHttpRequest()"), "La página GPS no debe depender de XMLHttpRequest en el navegador embebido");
 const locationSubmitSql = routeBlock('app.post("/public/location-request/:token/position"', 5200);
 assert(locationSubmitSql.includes("status='COMPLETED'"), "El enlace GPS debe quedar consumido después de utilizarse");
 assert(locationSubmitSql.includes("LOCATION_SHARED"), "La ubicación compartida debe dejar trazabilidad operacional");
