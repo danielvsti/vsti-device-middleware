@@ -81,6 +81,9 @@ assert(waWebhookSql.includes("wa_center_call_id"), "El webhook de WA-Center debe
 const locationRequestSql = routeBlock('app.post("/tickets/:id/location-request"', 5200);
 assert(locationRequestSql.includes("crypto.randomBytes(32)"), "El enlace GPS debe usar un token criptográficamente aleatorio");
 assert(locationRequestSql.includes("token_hash"), "El token GPS debe almacenarse únicamente como hash");
+const publicLocationPage = routeBlock('app.get("/public/location-request/:token"', 7000);
+assert(publicLocationPage.includes("const submitUrl="), "La página GPS debe entregar una URL de envío explícita compatible con Safari");
+assert(!publicLocationPage.includes("fetch(location.pathname"), "La página GPS no debe construir la ruta POST desde location.pathname");
 const locationSubmitSql = routeBlock('app.post("/public/location-request/:token/position"', 5200);
 assert(locationSubmitSql.includes("status='COMPLETED'"), "El enlace GPS debe quedar consumido después de utilizarse");
 assert(locationSubmitSql.includes("LOCATION_SHARED"), "La ubicación compartida debe dejar trazabilidad operacional");
