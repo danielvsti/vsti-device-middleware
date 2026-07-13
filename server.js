@@ -264,6 +264,7 @@ function getRemoteIp(req) {
 let controlCenterSettingsSchemaReady = false;
 let emergencyCategoryCatalogSchemaReady = false;
 let municipalQrSchemaReady = false;
+let communicationsSchemaReady = false;
 
 const DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES = Object.freeze([
   { type: 'SOS_MANUAL', title: 'SOS General', icon: '🚨', color: '#dc2626', priority: 1, enabled: true, order: 10, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
@@ -310,6 +311,16 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     categories: ['FIRE', 'TRAFFIC_ACCIDENT', 'URBAN_RISK'],
     channels: ['PUSH'],
     privacy_mode: 'SAFE_AREA_ONLY'
+  },
+  communications_module: {
+    enabled: false,
+    municipal_broadcasts: true,
+    personal_notifications: false,
+    surveys: false,
+    video: true,
+    push_delivery: false,
+    max_active_announcements: 20,
+    storage_limit_mb: 2048
   },
   incident_policy: {
     dedup_enabled: true,
@@ -607,6 +618,16 @@ function normalizeControlCenterSettings(input = {}) {
   if (!Array.isArray(merged.notification_policy.categories)) merged.notification_policy.categories = [];
   if (!Array.isArray(merged.notification_policy.channels)) merged.notification_policy.channels = ['PUSH'];
 
+  merged.communications_module = merged.communications_module || {};
+  merged.communications_module.enabled = normalizePolicyBoolean(merged.communications_module.enabled, false);
+  merged.communications_module.municipal_broadcasts = normalizePolicyBoolean(merged.communications_module.municipal_broadcasts, true);
+  merged.communications_module.personal_notifications = normalizePolicyBoolean(merged.communications_module.personal_notifications, false);
+  merged.communications_module.surveys = normalizePolicyBoolean(merged.communications_module.surveys, false);
+  merged.communications_module.video = normalizePolicyBoolean(merged.communications_module.video, true);
+  merged.communications_module.push_delivery = normalizePolicyBoolean(merged.communications_module.push_delivery, false);
+  merged.communications_module.max_active_announcements = clampPolicyNumber(merged.communications_module.max_active_announcements, 20, 1, 500);
+  merged.communications_module.storage_limit_mb = clampPolicyNumber(merged.communications_module.storage_limit_mb, 2048, 0, 102400);
+
   merged.incident_policy = merged.incident_policy || {};
   merged.incident_policy.dedup_enabled = normalizePolicyBoolean(merged.incident_policy.dedup_enabled, true);
   merged.incident_policy.dedup_radius_meters = clampPolicyNumber(
@@ -770,6 +791,7 @@ function publicSettingsPayload(settings) {
       expires_minutes: normalized.voice_policy.expires_minutes
     },
     notification_policy: normalized.notification_policy,
+    communications_module: normalized.communications_module,
     incident_policy: normalized.incident_policy,
     resolver_policy: normalized.resolver_policy,
     operator_tools: normalized.operator_tools,
@@ -14065,6 +14087,9 @@ app.put("/admin/control-centers/:code/settings", async (req, res) => {
     const current = await getControlCenterSettingsById(cc.id);
     const currentSettings = current?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
     const nextSettings = normalizeControlCenterSettings(deepMergeSettings(currentSettings, req.body?.settings || req.body || {}));
+    // La licencia comercial es propiedad de VS&TI/SuperAdmin. Un ADMIN
+    // municipal puede administrar contenido, pero no auto-habilitar el módulo.
+    nextSettings.communications_module = normalizeControlCenterSettings(currentSettings).communications_module;
     const actorId = req.panel_session?.sub || null;
 
     await pool.query(
@@ -14092,6 +14117,230 @@ app.put("/admin/control-centers/:code/settings", async (req, res) => {
   } catch (error) {
     console.error("[ADMIN PUT CONTROL CENTER SETTINGS ERROR]", error);
     res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+async function ensureCommunicationsSchema() {
+  if (communicationsSchemaReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS municipal_announcements (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+      audience_type TEXT NOT NULL DEFAULT 'BROADCAST',
+      target_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      media_type TEXT NOT NULL DEFAULT 'NONE',
+      media_url TEXT,
+      status TEXT NOT NULL DEFAULT 'DRAFT',
+      starts_at TIMESTAMPTZ,
+      ends_at TIMESTAMPTZ,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT municipal_announcements_audience_check CHECK (audience_type IN ('BROADCAST','PERSONAL')),
+      CONSTRAINT municipal_announcements_media_check CHECK (media_type IN ('NONE','IMAGE','VIDEO')),
+      CONSTRAINT municipal_announcements_status_check CHECK (status IN ('DRAFT','PUBLISHED','ARCHIVED'))
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_municipal_announcements_cc_status_dates
+    ON municipal_announcements(control_center_id, status, starts_at, ends_at)
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS municipal_announcement_reads (
+      announcement_id UUID NOT NULL REFERENCES municipal_announcements(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (announcement_id, user_id)
+    )
+  `);
+  communicationsSchemaReady = true;
+}
+
+function normalizeCommunicationsLicense(raw = {}) {
+  return normalizeControlCenterSettings({ communications_module: raw }).communications_module;
+}
+
+function normalizeAnnouncementInput(body = {}) {
+  const audienceType = String(body.audience_type || 'BROADCAST').trim().toUpperCase();
+  const mediaType = String(body.media_type || 'NONE').trim().toUpperCase();
+  const status = String(body.status || 'DRAFT').trim().toUpperCase();
+  if (!['BROADCAST', 'PERSONAL'].includes(audienceType)) throw new Error('Audiencia inválida');
+  if (!['NONE', 'IMAGE', 'VIDEO'].includes(mediaType)) throw new Error('Tipo de contenido inválido');
+  if (!['DRAFT', 'PUBLISHED', 'ARCHIVED'].includes(status)) throw new Error('Estado inválido');
+  const title = String(body.title || '').trim().slice(0, 180);
+  const text = String(body.body || '').trim().slice(0, 5000);
+  if (!title) throw new Error('El título es obligatorio');
+  let mediaUrl = String(body.media_url || '').trim().slice(0, 2000) || null;
+  if (mediaUrl) {
+    const parsed = new URL(mediaUrl);
+    if (parsed.protocol !== 'https:') throw new Error('La URL multimedia debe usar HTTPS');
+  }
+  if (mediaType === 'NONE') mediaUrl = null;
+  if (mediaType !== 'NONE' && !mediaUrl) throw new Error('Debes indicar una URL multimedia HTTPS');
+  const startsAt = body.starts_at ? new Date(body.starts_at) : null;
+  const endsAt = body.ends_at ? new Date(body.ends_at) : null;
+  if (startsAt && Number.isNaN(startsAt.getTime())) throw new Error('Fecha de inicio inválida');
+  if (endsAt && Number.isNaN(endsAt.getTime())) throw new Error('Fecha de término inválida');
+  if (startsAt && endsAt && endsAt <= startsAt) throw new Error('La fecha de término debe ser posterior al inicio');
+  return {
+    audienceType,
+    targetUserId: audienceType === 'PERSONAL' ? String(body.target_user_id || '').trim() || null : null,
+    title,
+    body: text,
+    mediaType,
+    mediaUrl,
+    status,
+    startsAt: startsAt?.toISOString() || null,
+    endsAt: endsAt?.toISOString() || null
+  };
+}
+
+app.get('/superadmin/control-centers/:code/communications-license', async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const row = await getControlCenterSettingsByCode(String(req.params.code || '').toUpperCase());
+    if (!row) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+    res.json({ status: 'ok', control_center: { code: row.control_center_code, name: row.control_center_name }, license: row.settings.communications_module });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.put('/superadmin/control-centers/:code/communications-license', async (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    await ensureControlCenterSettingsSchema();
+    const row = await getControlCenterSettingsByCode(String(req.params.code || '').toUpperCase());
+    if (!row) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+    const currentSettings = row.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+    const nextSettings = normalizeControlCenterSettings({
+      ...currentSettings,
+      communications_module: normalizeCommunicationsLicense(req.body?.license || req.body || {})
+    });
+    await pool.query(`
+      INSERT INTO control_center_settings (control_center_id, settings, updated_by, updated_at)
+      VALUES ($1,$2::jsonb,$3,NOW())
+      ON CONFLICT (control_center_id) DO UPDATE SET settings=EXCLUDED.settings, updated_by=EXCLUDED.updated_by, updated_at=NOW()
+    `, [row.control_center_id, JSON.stringify(nextSettings), req.panel_session?.sub || null]);
+    await pool.query(`
+      INSERT INTO control_center_settings_audit (control_center_id, actor_user_id, old_settings, new_settings)
+      VALUES ($1,$2,$3::jsonb,$4::jsonb)
+    `, [row.control_center_id, req.panel_session?.sub || null, JSON.stringify(currentSettings), JSON.stringify(nextSettings)]);
+    res.json({ status: 'ok', license: nextSettings.communications_module });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/admin/control-centers/:code/announcements', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    await ensureCommunicationsSchema();
+    const cc = await adminResolveControlCenter(req, req.params.code);
+    if (!cc) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+    const settings = await getControlCenterSettingsById(cc.id);
+    const license = settings?.settings?.communications_module || DEFAULT_CONTROL_CENTER_SETTINGS.communications_module;
+    const rows = await pool.query(`
+      SELECT a.*, u.full_name AS target_user_name, u.phone AS target_user_phone,
+             (SELECT COUNT(*)::int FROM municipal_announcement_reads r WHERE r.announcement_id=a.id) AS opened_count
+      FROM municipal_announcements a
+      LEFT JOIN users u ON u.id=a.target_user_id
+      WHERE a.control_center_id=$1
+      ORDER BY a.created_at DESC
+      LIMIT 200
+    `, [cc.id]);
+    res.json({ status: 'ok', license, announcements: rows.rows });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/admin/control-centers/:code/announcements', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    await ensureCommunicationsSchema();
+    const cc = await adminResolveControlCenter(req, req.params.code);
+    if (!cc) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+    const settings = await getControlCenterSettingsById(cc.id);
+    const license = settings?.settings?.communications_module || DEFAULT_CONTROL_CENTER_SETTINGS.communications_module;
+    if (!license.enabled) return res.status(403).json({ status: 'error', code: 'COMMUNICATIONS_MODULE_NOT_LICENSED', message: 'El módulo de Comunicaciones no está contratado para este Centro de Control' });
+    const input = normalizeAnnouncementInput(req.body || {});
+    if (input.audienceType === 'BROADCAST' && !license.municipal_broadcasts) return res.status(403).json({ status: 'error', message: 'Los anuncios municipales no están incluidos en la licencia' });
+    if (input.audienceType === 'PERSONAL' && !license.personal_notifications) return res.status(403).json({ status: 'error', message: 'Los avisos individuales no están incluidos en la licencia' });
+    if (input.mediaType === 'VIDEO' && !license.video) return res.status(403).json({ status: 'error', message: 'Los videos no están incluidos en la licencia' });
+    if (input.audienceType === 'PERSONAL' && !input.targetUserId) throw new Error('Debes seleccionar un vecino destinatario');
+    if (input.targetUserId) {
+      const target = await pool.query(`SELECT id FROM users WHERE id=$1 AND control_center_id=$2 AND role='NEIGHBOR' AND is_active=true LIMIT 1`, [input.targetUserId, cc.id]);
+      if (!target.rows.length) throw new Error('El destinatario no es un vecino activo de este Centro de Control');
+    }
+    const activeCount = await pool.query(`SELECT COUNT(*)::int AS total FROM municipal_announcements WHERE control_center_id=$1 AND status='PUBLISHED' AND (ends_at IS NULL OR ends_at>NOW())`, [cc.id]);
+    if (input.status === 'PUBLISHED' && Number(activeCount.rows[0]?.total || 0) >= Number(license.max_active_announcements || 20)) return res.status(409).json({ status: 'error', message: 'Se alcanzó el máximo de anuncios activos de la licencia' });
+    const created = await pool.query(`
+      INSERT INTO municipal_announcements (control_center_id,audience_type,target_user_id,title,body,media_type,media_url,status,starts_at,ends_at,created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *
+    `, [cc.id,input.audienceType,input.targetUserId,input.title,input.body,input.mediaType,input.mediaUrl,input.status,input.startsAt,input.endsAt,req.panel_session?.sub || null]);
+    res.status(201).json({ status: 'ok', announcement: created.rows[0] });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.patch('/admin/control-centers/:code/announcements/:id', async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  try {
+    await ensureCommunicationsSchema();
+    const cc = await adminResolveControlCenter(req, req.params.code);
+    if (!cc) return res.status(404).json({ status: 'error', message: 'Centro de control no encontrado' });
+    const settings = await getControlCenterSettingsById(cc.id);
+    if (!settings?.settings?.communications_module?.enabled) return res.status(403).json({ status: 'error', message: 'Módulo de Comunicaciones no contratado' });
+    const current = await pool.query('SELECT * FROM municipal_announcements WHERE id=$1 AND control_center_id=$2', [req.params.id, cc.id]);
+    if (!current.rows.length) return res.status(404).json({ status: 'error', message: 'Anuncio no encontrado' });
+    const input = normalizeAnnouncementInput({ ...current.rows[0], ...(req.body || {}) });
+    const updated = await pool.query(`
+      UPDATE municipal_announcements SET audience_type=$3,target_user_id=$4,title=$5,body=$6,media_type=$7,media_url=$8,status=$9,starts_at=$10,ends_at=$11,updated_at=NOW()
+      WHERE id=$1 AND control_center_id=$2 RETURNING *
+    `, [req.params.id,cc.id,input.audienceType,input.targetUserId,input.title,input.body,input.mediaType,input.mediaUrl,input.status,input.startsAt,input.endsAt]);
+    res.json({ status: 'ok', announcement: updated.rows[0] });
+  } catch (error) {
+    res.status(400).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/neighbor/announcements', async (req, res) => {
+  if (!checkAuthenticatedAccess(req, res, ['NEIGHBOR'], 'Sesión de vecino requerida')) return;
+  try {
+    await ensureCommunicationsSchema();
+    const settings = await getControlCenterSettingsById(req.panel_session.control_center_id);
+    const license = settings?.settings?.communications_module || DEFAULT_CONTROL_CENTER_SETTINGS.communications_module;
+    if (!license.enabled) return res.json({ status: 'ok', enabled: false, announcements: [] });
+    const rows = await pool.query(`
+      SELECT a.id,a.audience_type,a.title,a.body,a.media_type,a.media_url,a.starts_at,a.ends_at,a.created_at,
+             (r.user_id IS NOT NULL) AS opened
+      FROM municipal_announcements a
+      LEFT JOIN municipal_announcement_reads r ON r.announcement_id=a.id AND r.user_id=$2
+      WHERE a.control_center_id=$1 AND a.status='PUBLISHED'
+        AND (a.starts_at IS NULL OR a.starts_at<=NOW()) AND (a.ends_at IS NULL OR a.ends_at>NOW())
+        AND (a.audience_type='BROADCAST' OR a.target_user_id=$2)
+      ORDER BY (a.audience_type='PERSONAL') DESC, a.created_at DESC LIMIT 50
+    `, [req.panel_session.control_center_id, req.panel_session.sub]);
+    res.json({ status: 'ok', enabled: true, license, announcements: rows.rows });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/neighbor/announcements/:id/read', async (req, res) => {
+  if (!checkAuthenticatedAccess(req, res, ['NEIGHBOR'], 'Sesión de vecino requerida')) return;
+  try {
+    await ensureCommunicationsSchema();
+    const allowed = await pool.query(`SELECT id FROM municipal_announcements WHERE id=$1 AND control_center_id=$2 AND (audience_type='BROADCAST' OR target_user_id=$3)`, [req.params.id,req.panel_session.control_center_id,req.panel_session.sub]);
+    if (!allowed.rows.length) return res.status(404).json({ status: 'error', message: 'Anuncio no encontrado' });
+    await pool.query(`INSERT INTO municipal_announcement_reads (announcement_id,user_id,opened_at) VALUES ($1,$2,NOW()) ON CONFLICT (announcement_id,user_id) DO UPDATE SET opened_at=EXCLUDED.opened_at`, [req.params.id,req.panel_session.sub]);
+    res.json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
   }
 });
 

@@ -100,4 +100,13 @@ assert(locationSubmitSql.includes("status='COMPLETED'"), "El enlace GPS debe que
 assert(locationSubmitSql.includes("LOCATION_SHARED"), "La ubicación compartida debe dejar trazabilidad operacional");
 assert(locationSubmitSql.includes("absoluteAccuracyLimit"), "El GPS telefónico debe conservar ubicación aproximada con advertencia antes de descartarla");
 
+const adminSettingsSql = routeBlock('app.put("/admin/control-centers/:code/settings"', 2600);
+assert(adminSettingsSql.includes("nextSettings.communications_module"), "El ADMIN municipal no debe poder auto-habilitar la licencia de Comunicaciones");
+assert(adminSettingsSql.includes("currentSettings"), "La licencia comercial debe conservar el valor administrado por SuperAdmin");
+const communicationsLicenseSql = routeBlock("app.put('/superadmin/control-centers/:code/communications-license'", 3200);
+assert(communicationsLicenseSql.includes("requireSuperAdmin"), "Sólo SuperAdmin debe modificar la licencia de Comunicaciones");
+const neighborAnnouncementsSql = routeBlock("app.get('/neighbor/announcements'", 3600);
+assert(neighborAnnouncementsSql.includes("checkAuthenticatedAccess"), "Los anuncios personales deben exigir sesión autenticada de vecino");
+assert(neighborAnnouncementsSql.includes("a.target_user_id=$2"), "Los avisos individuales sólo deben llegar a su destinatario");
+
 console.log("Security contract OK");
