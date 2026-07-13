@@ -45,7 +45,7 @@ const CORS_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
-const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://sos.vsti.cl"]
+const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://sos.vsti.cl", "https://app.sos.vsti.cl"]
   .filter(Boolean)
   .map((value) => {
     try { return new URL(value).origin; } catch (_) { return ""; }
