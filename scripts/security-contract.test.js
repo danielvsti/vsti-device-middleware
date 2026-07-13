@@ -123,6 +123,15 @@ assert(physicalSosRegistry.includes("applyPhysicalSosDemoOverride"), "La asignac
 const physicalSosTicket = routeBlock("async function createTicketFromPhysicalSos", 4200);
 assert(physicalSosTicket.includes("cachedPosition"), "La alarma física debe poder usar el último GPS conocido");
 assert(physicalSosTicket.includes("profile.demo_override"), "El modo demo debe quedar limitado al perfil sobrescrito");
+const physicalDeviceMapState = routeBlock('app.get("/public/map-state"', 7600);
+assert(physicalDeviceMapState.includes("registeredKeys"), "El mapa debe limitar botones físicos al inventario del Centro de Control");
+assert(physicalDeviceMapState.includes("devicesForMap = []"), "El mapa debe ocultar botones si la función está deshabilitada o el inventario falla");
+const adminDeviceUpsert = routeBlock('app.post("/admin/control-centers/:code/devices"', 5200);
+assert(adminDeviceUpsert.includes("payload.last_latitude"), "El alta de botones debe aceptar coordenadas del contrato histórico");
+assert(adminDeviceUpsert.includes("Latitud y longitud deben informarse juntas"), "El alta de botones debe validar el par GPS");
+const adminDeviceDelete = routeBlock('app.delete("/admin/control-centers/:code/devices/:id"', 2600);
+assert(adminDeviceDelete.includes("checkAdminToken"), "Eliminar un botón físico debe exigir sesión ADMIN");
+assert(adminDeviceDelete.includes("control_center_id = $2"), "Eliminar un botón físico debe quedar aislado por Centro de Control");
 const flespiMqtt = routeBlock("function startFlespiMqtt", 4200);
 assert(flespiMqtt.includes("flespi/message/gw/devices/"), "El middleware debe escuchar mensajes completos del botón físico");
 assert(flespiMqtt.includes("processIncomingMessage"), "Los mensajes MQTT del botón deben entrar al flujo de tickets");

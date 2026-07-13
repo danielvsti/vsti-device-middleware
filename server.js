@@ -1545,6 +1545,11 @@ const PHYSICAL_SOS_DEMO_CONTROL_CENTER_CODE = String(
   process.env.PHYSICAL_SOS_DEMO_CONTROL_CENTER_CODE || "CC-CONCHALI"
 ).trim().toUpperCase();
 
+function isPhysicalSosDemoDevice(...values) {
+  const keys = values.filter(Boolean).map(String);
+  return keys.includes(PHYSICAL_SOS_DEMO_BUTTON_ID) || keys.includes(PHYSICAL_SOS_DEMO_IDENT);
+}
+
 function applyPhysicalSosDemoOverride(profile, normalized) {
   const keys = [
     profile?.id,
@@ -1554,7 +1559,7 @@ function applyPhysicalSosDemoOverride(profile, normalized) {
     normalized?.device?.id
   ].filter(Boolean).map(String);
 
-  if (!keys.includes(PHYSICAL_SOS_DEMO_BUTTON_ID) && !keys.includes(PHYSICAL_SOS_DEMO_IDENT)) {
+  if (!isPhysicalSosDemoDevice(...keys)) {
     return profile;
   }
 
@@ -4318,8 +4323,24 @@ last_event_type: d.last_event_type || null
           [settingsRow.control_center_id]
         );
 
+        const registeredRowsForCenter = registeredDevicesResult.rows.filter((device) => {
+          if (!isPhysicalSosDemoDevice(device.id, device.platform_id, device.metadata?.ident)) return true;
+          return String(controlCenterCode).trim().toUpperCase() === PHYSICAL_SOS_DEMO_CONTROL_CENTER_CODE;
+        });
+        const registeredKeys = new Set(
+          registeredRowsForCenter.flatMap((device) => [device.id, device.platform_id, device.metadata?.ident])
+            .filter(Boolean)
+            .map(String)
+        );
+        const isDemoControlCenter = String(controlCenterCode).trim().toUpperCase() === PHYSICAL_SOS_DEMO_CONTROL_CENTER_CODE;
+
+        devicesForMap = devicesForMap.filter((device) =>
+          registeredKeys.has(String(device.id)) ||
+          (isDemoControlCenter && isPhysicalSosDemoDevice(device.id, device.platform_id))
+        );
+
         const liveKeys = new Set(devicesForMap.map((device) => String(device.id)));
-        const registeredDevices = registeredDevicesResult.rows
+        const registeredDevices = registeredRowsForCenter
           .filter((device) => !liveKeys.has(String(device.platform_id || device.id)))
           .map((device) => {
             const metadata = device.metadata && typeof device.metadata === 'object' ? device.metadata : {};
@@ -4347,7 +4368,10 @@ last_event_type: d.last_event_type || null
         devicesForMap = [...devicesForMap, ...registeredDevices];
       } catch (error) {
         console.warn('[MAP STATE REGISTERED PHYSICAL DEVICES WARNING]', error.message);
+        devicesForMap = [];
       }
+    } else {
+      devicesForMap = [];
     }
 
     const configuredSirens = settingsRow
@@ -14591,20 +14615,39 @@ function normalizeAdminDeviceType(value) {
 }
 
 function sanitizeDeviceMetadata(payload = {}, existingMetadata = {}) {
+  const nestedMetadata = payload.metadata && typeof payload.metadata === 'object'
+    ? payload.metadata
+    : {};
+  const source = { ...payload, ...nestedMetadata };
+  const heartbeatTimeoutSeconds = clampPolicyNumber(
+    source.heartbeat_timeout_seconds ?? source.heartbeat_max_seconds,
+    600,
+    30,
+    86400
+  );
+
   return {
     ...(existingMetadata && typeof existingMetadata === 'object' ? existingMetadata : {}),
-    enabled: payload.enabled !== false,
-    sim_phone: String(payload.sim_phone || payload.phone || '').trim() || null,
-    registered_address: String(payload.registered_address || payload.address || payload.location || '').trim() || null,
-    owner_name: String(payload.owner_name || '').trim() || null,
-    ident: String(payload.ident || payload.device_ident || '').trim() || null,
-    device_model: String(payload.device_model || payload.model || '').trim() || null,
-    heartbeat_max_seconds: clampPolicyNumber(payload.heartbeat_max_seconds, 900, 60, 86400),
-    notes: String(payload.notes || '').trim() || null,
-    sector_code: String(payload.sector_code || '').trim() || null,
-    sector_name: String(payload.sector_name || '').trim() || null,
-    siren_id: String(payload.siren_id || '').trim() || null
+    enabled: source.enabled !== false,
+    sim_phone: String(source.sim_phone || source.phone || '').trim() || null,
+    registered_address: String(source.registered_address || source.address || source.location || '').trim() || null,
+    owner_name: String(source.owner_name || '').trim() || null,
+    ident: String(source.ident || source.device_ident || '').trim() || null,
+    device_model: String(source.device_model || source.model || '').trim() || null,
+    heartbeat_timeout_seconds: heartbeatTimeoutSeconds,
+    heartbeat_max_seconds: heartbeatTimeoutSeconds,
+    notes: String(source.notes || '').trim() || null,
+    sector_code: String(source.sector_code || '').trim() || null,
+    sector_name: String(source.sector_name || '').trim() || null,
+    siren_id: String(source.siren_id || '').trim() || null
   };
+}
+
+function parseOptionalDeviceCoordinate(value, minimum, maximum) {
+  if (value === '' || value == null) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) return NaN;
+  return parsed;
 }
 
 app.get("/admin/control-centers/:code/devices", async (req, res) => {
@@ -14666,11 +14709,31 @@ app.post("/admin/control-centers/:code/devices", async (req, res) => {
       return res.status(400).json({ status: "error", message: "id/device_id y name son obligatorios" });
     }
 
-    const existing = await pool.query(`SELECT metadata FROM devices WHERE id = $1 LIMIT 1`, [id]);
+    const existing = await pool.query(
+      `SELECT control_center_id, metadata FROM devices WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    if (existing.rows[0] && String(existing.rows[0].control_center_id) !== String(cc.id)) {
+      return res.status(409).json({
+        status: "error",
+        message: "Este código de dispositivo ya pertenece a otro Centro de Control. Elimínalo allí antes de reasignarlo."
+      });
+    }
     const existingMetadata = existing.rows[0]?.metadata || {};
     const metadata = sanitizeDeviceMetadata(payload, existingMetadata);
     const type = normalizeAdminDeviceType(payload.type || 'PHYSICAL_SOS');
     const platformId = String(payload.platform_id || id).trim();
+    const latitudeInput = payload.latitude ?? payload.last_latitude;
+    const longitudeInput = payload.longitude ?? payload.last_longitude;
+    const latitude = parseOptionalDeviceCoordinate(latitudeInput, -90, 90);
+    const longitude = parseOptionalDeviceCoordinate(longitudeInput, -180, 180);
+
+    if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
+      return res.status(400).json({ status: "error", message: "Latitud o longitud inválida" });
+    }
+    if ((latitude == null) !== (longitude == null)) {
+      return res.status(400).json({ status: "error", message: "Latitud y longitud deben informarse juntas" });
+    }
 
     const result = await pool.query(
       `
@@ -14705,8 +14768,8 @@ app.post("/admin/control-centers/:code/devices", async (req, res) => {
         name,
         type,
         platformId || null,
-        payload.latitude === '' || payload.latitude == null ? null : Number(payload.latitude),
-        payload.longitude === '' || payload.longitude == null ? null : Number(payload.longitude),
+        latitude,
+        longitude,
         String(payload.status || 'OFFLINE').toUpperCase(),
         JSON.stringify(metadata)
       ]
@@ -14743,6 +14806,42 @@ app.post("/admin/control-centers/:code/devices/:id/active", async (req, res) => 
     res.json({ status: "ok", device: result.rows[0] });
   } catch (error) {
     console.error("[ADMIN DEVICE ACTIVE ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+app.delete("/admin/control-centers/:code/devices/:id", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  try {
+    const cc = await adminResolveControlCenter(req, req.params.code || 'CC-VINA');
+    if (!cc) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+
+    const result = await pool.query(
+      `
+      DELETE FROM devices
+      WHERE id = $1
+        AND control_center_id = $2
+      RETURNING id, name, type, platform_id
+      `,
+      [req.params.id, cc.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ status: "error", message: "Dispositivo no encontrado en este Centro de Control" });
+    }
+
+    const deletedDevice = result.rows[0];
+    [deletedDevice.platform_id, deletedDevice.id]
+      .filter(Boolean)
+      .map(String)
+      .forEach((liveDeviceKey) => {
+        if (gpsDevices[liveDeviceKey]) delete gpsDevices[liveDeviceKey];
+      });
+
+    res.json({ status: "ok", deleted: true, device: deletedDevice });
+  } catch (error) {
+    console.error("[ADMIN DELETE DEVICE ERROR]", error);
     res.status(500).json({ status: "error", message: error.message });
   }
 });
