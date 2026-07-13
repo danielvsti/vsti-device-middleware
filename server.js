@@ -14362,6 +14362,25 @@ app.post('/neighbor/announcements/:id/read', async (req, res) => {
   }
 });
 
+app.get('/public/announcement-video/:provider/:videoId', (req, res) => {
+  const provider = String(req.params.provider || '').toLowerCase();
+  const videoId = String(req.params.videoId || '').trim();
+  let embedUrl = null;
+  if (provider === 'youtube' && /^[A-Za-z0-9_-]{6,20}$/.test(videoId)) {
+    const origin = encodeURIComponent(sosPublicBaseUrl(req));
+    embedUrl = `https://www.youtube.com/embed/${videoId}?playsinline=1&rel=0&origin=${origin}`;
+  } else if (provider === 'vimeo' && /^\d{5,14}$/.test(videoId)) {
+    embedUrl = `https://player.vimeo.com/video/${videoId}?playsinline=1`;
+  }
+  if (!embedUrl) return res.status(404).send('Video no válido');
+  res.set({
+    'Cache-Control': 'public, max-age=3600',
+    'Content-Security-Policy': "default-src 'none'; frame-src https://www.youtube.com https://www.youtube-nocookie.com https://player.vimeo.com; style-src 'unsafe-inline'; img-src data:;",
+    'Referrer-Policy': 'strict-origin-when-cross-origin'
+  });
+  res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;background:#111}body{overflow:hidden}</style></head><body><iframe src="${embedUrl}" title="Video municipal" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe></body></html>`);
+});
+
 app.get("/admin/control-centers/:code/sirens", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
 

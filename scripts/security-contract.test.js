@@ -112,5 +112,8 @@ const announcementInputSql = routeBlock("function normalizeAnnouncementInput", 3
 assert(announcementInputSql.includes("youtube.com"), "Los videos municipales deben validar explícitamente YouTube");
 assert(announcementInputSql.includes("vimeo.com"), "Los videos municipales deben validar explícitamente Vimeo");
 assert(announcementInputSql.includes("directVideo"), "Los videos directos deben limitarse a formatos permitidos");
+const announcementVideoProxySql = routeBlock("app.get('/public/announcement-video/:provider/:videoId'", 2600);
+assert(announcementVideoProxySql.includes("youtube") && announcementVideoProxySql.includes("vimeo"), "El reproductor HTTPS debe limitarse a YouTube y Vimeo");
+assert(announcementVideoProxySql.includes("Content-Security-Policy"), "El reproductor embebido debe aplicar CSP restrictiva");
 
 console.log("Security contract OK");
