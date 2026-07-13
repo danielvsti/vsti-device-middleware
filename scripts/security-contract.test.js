@@ -108,5 +108,9 @@ assert(communicationsLicenseSql.includes("requireSuperAdmin"), "Sólo SuperAdmin
 const neighborAnnouncementsSql = routeBlock("app.get('/neighbor/announcements'", 3600);
 assert(neighborAnnouncementsSql.includes("checkAuthenticatedAccess"), "Los anuncios personales deben exigir sesión autenticada de vecino");
 assert(neighborAnnouncementsSql.includes("a.target_user_id=$2"), "Los avisos individuales sólo deben llegar a su destinatario");
+const announcementInputSql = routeBlock("function normalizeAnnouncementInput", 3600);
+assert(announcementInputSql.includes("youtube.com"), "Los videos municipales deben validar explícitamente YouTube");
+assert(announcementInputSql.includes("vimeo.com"), "Los videos municipales deben validar explícitamente Vimeo");
+assert(announcementInputSql.includes("directVideo"), "Los videos directos deben limitarse a formatos permitidos");
 
 console.log("Security contract OK");

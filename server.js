@@ -14176,6 +14176,18 @@ function normalizeAnnouncementInput(body = {}) {
   if (mediaUrl) {
     const parsed = new URL(mediaUrl);
     if (parsed.protocol !== 'https:') throw new Error('La URL multimedia debe usar HTTPS');
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    const path = parsed.pathname.toLowerCase();
+    if (mediaType === 'VIDEO') {
+      const supportedVideoHost = ['youtube.com', 'm.youtube.com', 'youtu.be', 'youtube-nocookie.com', 'vimeo.com', 'player.vimeo.com'].includes(host);
+      const directVideo = /\.(mp4|webm|m4v|mov|m3u8)$/.test(path);
+      if (!supportedVideoHost && !directVideo) {
+        throw new Error('Video no permitido. Usa YouTube, Vimeo o un archivo directo MP4/WebM/M4V/MOV/M3U8');
+      }
+    }
+    if (mediaType === 'IMAGE' && !/\.(png|jpe?g|webp|gif|avif)$/.test(path)) {
+      throw new Error('Imagen no permitida. Usa una URL directa PNG, JPG, WebP, GIF o AVIF');
+    }
   }
   if (mediaType === 'NONE') mediaUrl = null;
   if (mediaType !== 'NONE' && !mediaUrl) throw new Error('Debes indicar una URL multimedia HTTPS');
