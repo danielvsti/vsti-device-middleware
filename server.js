@@ -45,7 +45,7 @@ const CORS_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
-const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://sos.vsti.cl", "https://app.sos.vsti.cl"]
+const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://sos.vsti.cl"]
   .filter(Boolean)
   .map((value) => {
     try { return new URL(value).origin; } catch (_) { return ""; }
@@ -14375,12 +14375,14 @@ app.get('/public/announcement-video/:provider/:videoId', (req, res) => {
     embedUrl = `https://player.vimeo.com/video/${videoId}?playsinline=1`;
   }
   if (!embedUrl) return res.status(404).send('Video no válido');
+  res.removeHeader('X-Frame-Options');
   res.set({
     'Cache-Control': 'public, max-age=3600',
-    'Content-Security-Policy': "default-src 'none'; frame-src https://www.youtube.com https://www.youtube-nocookie.com https://player.vimeo.com; style-src 'unsafe-inline'; img-src data:;",
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self' capacitor://localhost ionic://localhost http://localhost https://localhost;",
     'Referrer-Policy': 'strict-origin-when-cross-origin'
   });
-  res.type('html').send(`<!doctype html><html><head><meta name="referrer" content="strict-origin-when-cross-origin"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;background:#0f172a}body{overflow:hidden}</style></head><body><iframe src="${embedUrl}" title="Video municipal" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe></body></html>`);
+  const escapedEmbedUrl = embedUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  res.type('html').send(`<!doctype html><html><head><meta name="referrer" content="strict-origin-when-cross-origin"><meta http-equiv="refresh" content="0;url=${escapedEmbedUrl}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;width:100%;height:100%;background:#0f172a;color:#fff;font:16px system-ui;display:grid;place-items:center}a{color:#fff}</style></head><body><a href="${escapedEmbedUrl}">Cargar video</a></body></html>`);
 });
 
 app.get("/admin/control-centers/:code/sirens", async (req, res) => {
