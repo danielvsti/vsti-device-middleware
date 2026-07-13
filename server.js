@@ -14164,7 +14164,7 @@ function normalizeCommunicationsLicense(raw = {}) {
 
 function normalizeAnnouncementInput(body = {}) {
   const audienceType = String(body.audience_type || 'BROADCAST').trim().toUpperCase();
-  const mediaType = String(body.media_type || 'NONE').trim().toUpperCase();
+  let mediaType = String(body.media_type || 'NONE').trim().toUpperCase();
   const status = String(body.status || 'DRAFT').trim().toUpperCase();
   if (!['BROADCAST', 'PERSONAL'].includes(audienceType)) throw new Error('Audiencia inválida');
   if (!['NONE', 'IMAGE', 'VIDEO'].includes(mediaType)) throw new Error('Tipo de contenido inválido');
@@ -14178,6 +14178,12 @@ function normalizeAnnouncementInput(body = {}) {
     if (parsed.protocol !== 'https:') throw new Error('La URL multimedia debe usar HTTPS');
     const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
     const path = parsed.pathname.toLowerCase();
+    if (mediaType === 'NONE') {
+      const videoHost = ['youtube.com', 'm.youtube.com', 'youtu.be', 'youtube-nocookie.com', 'vimeo.com', 'player.vimeo.com'].includes(host);
+      if (videoHost || /\.(mp4|webm|m4v|mov|m3u8)$/.test(path)) mediaType = 'VIDEO';
+      else if (/\.(png|jpe?g|webp|gif|avif)$/.test(path)) mediaType = 'IMAGE';
+      else throw new Error('No fue posible detectar el tipo multimedia. Selecciona Imagen o Video');
+    }
     if (mediaType === 'VIDEO') {
       const supportedVideoHost = ['youtube.com', 'm.youtube.com', 'youtu.be', 'youtube-nocookie.com', 'vimeo.com', 'player.vimeo.com'].includes(host);
       const directVideo = /\.(mp4|webm|m4v|mov|m3u8)$/.test(path);
