@@ -116,4 +116,15 @@ const announcementVideoProxySql = routeBlock("app.get('/public/announcement-vide
 assert(announcementVideoProxySql.includes("youtube") && announcementVideoProxySql.includes("vimeo"), "El reproductor HTTPS debe limitarse a YouTube y Vimeo");
 assert(announcementVideoProxySql.includes("Content-Security-Policy"), "El reproductor embebido debe aplicar CSP restrictiva");
 
+const physicalSosRegistry = routeBlock("PHYSICAL SOS BUTTON REGISTRY", 5200);
+assert(physicalSosRegistry.includes('PHYSICAL_SOS_DEMO_BUTTON_ID = "8322560"'), "El botón piloto debe quedar identificado explícitamente");
+assert(physicalSosRegistry.includes('"CC-CONCHALI"'), "El botón piloto de demo debe dirigirse a Conchalí");
+assert(physicalSosRegistry.includes("applyPhysicalSosDemoOverride"), "La asignación demo debe prevalecer sobre el inventario anterior");
+const physicalSosTicket = routeBlock("async function createTicketFromPhysicalSos", 4200);
+assert(physicalSosTicket.includes("cachedPosition"), "La alarma física debe poder usar el último GPS conocido");
+assert(physicalSosTicket.includes("profile.demo_override"), "El modo demo debe quedar limitado al perfil sobrescrito");
+const flespiMqtt = routeBlock("function startFlespiMqtt", 4200);
+assert(flespiMqtt.includes("flespi/message/gw/devices/"), "El middleware debe escuchar mensajes completos del botón físico");
+assert(flespiMqtt.includes("processIncomingMessage"), "Los mensajes MQTT del botón deben entrar al flujo de tickets");
+
 console.log("Security contract OK");

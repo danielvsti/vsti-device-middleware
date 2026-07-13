@@ -1531,11 +1531,67 @@ const DEFAULT_PHYSICAL_SOS_BUTTONS = [
     ident: "9705249564",
     name: "BotonSOS_1_Pudahuel",
     phone: process.env.PHYSICAL_BUTTON_8322560_PHONE || "",
-    control_center_code: "CC-VINA",
+    control_center_code: "CC-CONCHALI",
     address: "Botón físico SOS piloto",
     notes: "Botón físico RF-V51 piloto"
   }
 ];
+
+// Modo demo acotado al unico boton fisico disponible. Puede cambiarse o
+// desactivarse desde Render sin volver a desplegar codigo.
+const PHYSICAL_SOS_DEMO_BUTTON_ID = "8322560";
+const PHYSICAL_SOS_DEMO_IDENT = "9705249564";
+const PHYSICAL_SOS_DEMO_CONTROL_CENTER_CODE = String(
+  process.env.PHYSICAL_SOS_DEMO_CONTROL_CENTER_CODE || "CC-CONCHALI"
+).trim().toUpperCase();
+
+function applyPhysicalSosDemoOverride(profile, normalized) {
+  const keys = [
+    profile?.id,
+    profile?.platform_id,
+    profile?.ident,
+    normalized?.device?.platform_id,
+    normalized?.device?.id
+  ].filter(Boolean).map(String);
+
+  if (!keys.includes(PHYSICAL_SOS_DEMO_BUTTON_ID) && !keys.includes(PHYSICAL_SOS_DEMO_IDENT)) {
+    return profile;
+  }
+
+  return {
+    ...profile,
+    enabled: true,
+    control_center_code: PHYSICAL_SOS_DEMO_CONTROL_CENTER_CODE,
+    demo_override: true
+  };
+}
+
+function alarmValueIsActive(value) {
+  if (value === true || value === 1) return true;
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return ["1", "TRUE", "ON", "ACTIVE", "PRESSED", "SOS", "PANIC", "ALARM"].includes(normalized);
+}
+
+function isPhysicalSosSignal(msg = {}) {
+  const messageType = String(msg["message.type"] || msg.type || "").trim().toUpperCase();
+  if (["AL_LTE", "SOS", "ALARM", "PANIC"].includes(messageType)) return true;
+
+  const explicitKeys = [
+    "sos.alarm",
+    "sos.status",
+    "panic.alarm",
+    "panic.button",
+    "alarm.button"
+  ];
+
+  if (explicitKeys.some((key) => alarmValueIsActive(msg[key]))) return true;
+
+  // Respaldo para el boton piloto: distintos firmwares publican nombres
+  // levemente diferentes para la misma pulsacion.
+  return Object.entries(msg).some(([key, value]) =>
+    /(sos|panic)/i.test(key) && alarmValueIsActive(value)
+  );
+}
 
 function loadPhysicalSosButtons() {
   const raw = process.env.PHYSICAL_SOS_BUTTONS_JSON;
@@ -1770,8 +1826,10 @@ async function findOpenPhysicalDeviceTicket(normalized, profile) {
 async function createTicketFromPhysicalSos(normalized) {
   if (normalized.event_type !== "SOS") return null;
 
-  const latitude = normalized.position?.latitude;
-  const longitude = normalized.position?.longitude;
+  const platformId = normalized?.device?.platform_id ? String(normalized.device.platform_id) : null;
+  const cachedPosition = platformId ? gpsDevices[platformId] : null;
+  const latitude = normalized.position?.latitude ?? cachedPosition?.latitude ?? null;
+  const longitude = normalized.position?.longitude ?? cachedPosition?.longitude ?? null;
 
   if (latitude == null || longitude == null) {
     console.warn("[PHYSICAL SOS] SOS received without position. Ticket not created.", normalized.event_id);
@@ -1782,7 +1840,10 @@ async function createTicketFromPhysicalSos(normalized) {
     console.warn("[PHYSICAL SOS DB PROFILE WARNING]", error.message);
     return null;
   });
-  const profile = dbProfile || getPhysicalSosButtonProfile(normalized);
+  const profile = applyPhysicalSosDemoOverride(
+    dbProfile || getPhysicalSosButtonProfile(normalized),
+    normalized
+  );
 
   if (profile.enabled === false) {
     console.log("[PHYSICAL SOS] Device disabled by admin inventory", { device_id: profile.id, platform_id: profile.platform_id });
@@ -1799,9 +1860,16 @@ async function createTicketFromPhysicalSos(normalized) {
   const settingsRow = await getControlCenterSettingsById(controlCenterId).catch(() => null);
   const platformSettings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
 
-  if (platformSettings.features?.physical_sos_buttons_enabled === false) {
+  if (platformSettings.features?.physical_sos_buttons_enabled === false && profile.demo_override !== true) {
     console.log("[PHYSICAL SOS] Physical SOS buttons disabled by control center policy", { control_center_code: profile.control_center_code });
     return null;
+  }
+
+  if (profile.demo_override === true) {
+    console.log("[PHYSICAL SOS DEMO OVERRIDE]", {
+      device_id: profile.id,
+      control_center_code: profile.control_center_code
+    });
   }
 
   const existingTicket = await findOpenPhysicalDeviceTicket(normalized, profile);
@@ -1866,11 +1934,7 @@ function normalizeMessage(msg, receivedAt) {
 	const battery = msg["battery.level"] ?? msg["battery"] ?? null;
 	const type = msg["message.type"] || "UNKNOWN";
 
-	const isSos =
-		msg["sos.alarm"] === true ||
-		type === "AL_LTE" ||
-		type === "SOS" ||
-		type === "ALARM";
+	const isSos = isPhysicalSosSignal(msg);
 
 	const hasPosition = lat !== null && lon !== null;
 
@@ -2111,24 +2175,50 @@ connectTimeout: 10000
 client.on("connect", () => {
 		console.log("Connected to Flespi MQTT");
 
+		const physicalButtonMessageTopics = [...new Set(
+			loadPhysicalSosButtons()
+				.flatMap((button) => [button.platform_id, button.id])
+				.filter(Boolean)
+				.map((id) => `flespi/message/gw/devices/${String(id)}`)
+		)];
+		const topics = [
+			"flespi/state/gw/devices/+/telemetry/position",
+			...physicalButtonMessageTopics
+		];
+
 		client.subscribe(
-				"flespi/state/gw/devices/+/telemetry/position",
+				topics,
 				{ qos: 0 },
 				(err) => {
 				if (err) {
 				console.error("Flespi subscribe error:", err.message);
 				} else {
-				console.log("Subscribed to Flespi position telemetry");
+					console.log("Subscribed to Flespi position telemetry and physical button messages", physicalButtonMessageTopics);
 				}
 				}
 				);
 		});
 
-client.on("message", (topic, message) => {
+client.on("message", async (topic, message) => {
 		try {
 		const payload = JSON.parse(message.toString());
 		const parts = topic.split("/");
 		const deviceId = parts[4];
+
+		if (topic.startsWith("flespi/message/gw/devices/")) {
+			const incomingMessages = Array.isArray(payload) ? payload : [payload];
+			for (const incoming of incomingMessages) {
+				const msg = { ...incoming };
+				if (msg["device.id"] == null) msg["device.id"] = deviceId;
+				console.log("[FLESPI PHYSICAL BUTTON MESSAGE]", {
+					device_id: deviceId,
+					message_type: msg["message.type"] || msg.type || null,
+					sos: isPhysicalSosSignal(msg)
+				});
+				await processIncomingMessage(msg, nowChile());
+			}
+			return;
+		}
 
 		if (!payload.latitude || !payload.longitude) return;
 
