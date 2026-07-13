@@ -4633,6 +4633,13 @@ function sanitizeVoiceSessionRow(row, options = {}) {
     return copy;
   };
 
+  const rawRequest = row.raw_request && typeof row.raw_request === 'object'
+    ? row.raw_request
+    : {};
+  const recordingRequested = typeof rawRequest.record === 'boolean'
+    ? rawRequest.record
+    : (typeof rawRequest.recording === 'boolean' ? rawRequest.recording : null);
+
   return {
     id: row.id,
     ticket_id: row.ticket_id,
@@ -4654,6 +4661,10 @@ function sanitizeVoiceSessionRow(row, options = {}) {
     failure_reason: row.failure_reason,
     recording_url: row.recording_url,
     recording_id: row.recording_id,
+    // Snapshot de la política aplicada al crear esta sesión. No se deriva de
+    // la configuración actual del CC porque el administrador puede cambiarla
+    // después de finalizada la llamada.
+    recording_requested: recordingRequested,
     created_at: row.created_at,
     updated_at: row.updated_at,
     party_a_webrtc: sanitizeParticipant(row.party_a_webrtc),
