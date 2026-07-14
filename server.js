@@ -28,6 +28,7 @@ const pool = require("./db");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const http2 = require("http2");
 
 console.log(
   "DATABASE_URL configurada:",
@@ -944,6 +945,96 @@ if (!process.env.SOS_SESSION_SECRET && !process.env.ADMIN_TOKEN && !SECURITY_DEM
   console.warn("[SECURITY] SOS_SESSION_SECRET no configurado: se usará una clave efímera y las sesiones expirarán al reiniciar.");
 }
 const PANEL_SESSION_TTL_HOURS = Number(process.env.PANEL_SESSION_TTL_HOURS || 12);
+const MOBILE_REFRESH_TTL_DAYS = Number(process.env.MOBILE_REFRESH_TTL_DAYS || 30);
+let mobileAppSchemaReady = false;
+let fcmAccessTokenCache = null;
+let apnsProviderTokenCache = null;
+
+function normalizeMobileAppType(value) {
+  const type = String(value || "").trim().toUpperCase();
+  return ["NEIGHBOR", "RESOLVER"].includes(type) ? type : null;
+}
+
+function hashOpaqueToken(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+async function ensureMobileAppSchema() {
+  if (mobileAppSchemaReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mobile_refresh_sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      app_type TEXT NOT NULL CHECK (app_type IN ('NEIGHBOR','RESOLVER')),
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ,
+      replaced_by_hash TEXT,
+      user_agent TEXT,
+      remote_ip TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_used_at TIMESTAMPTZ
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mobile_refresh_user ON mobile_refresh_sessions(user_id, app_type, expires_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mobile_push_devices (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+      app_type TEXT NOT NULL CHECK (app_type IN ('NEIGHBOR','RESOLVER')),
+      platform TEXT NOT NULL CHECK (platform IN ('ios','android')),
+      push_token TEXT NOT NULL,
+      device_id TEXT,
+      app_version TEXT,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (app_type, push_token)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mobile_push_user ON mobile_push_devices(user_id, app_type, enabled)`);
+  mobileAppSchemaReady = true;
+}
+
+async function issueMobileRefreshToken(user, appType, req = null) {
+  const normalizedAppType = normalizeMobileAppType(appType);
+  if (!normalizedAppType || String(user?.role || "").toUpperCase() !== normalizedAppType) {
+    throw new Error("Invalid mobile refresh session");
+  }
+  await ensureMobileAppSchema();
+  const refreshToken = `sosr_${crypto.randomBytes(48).toString("base64url")}`;
+  const tokenHash = hashOpaqueToken(refreshToken);
+  const ttlDays = Number.isFinite(MOBILE_REFRESH_TTL_DAYS) && MOBILE_REFRESH_TTL_DAYS > 0
+    ? MOBILE_REFRESH_TTL_DAYS
+    : 30;
+  await pool.query(
+    `
+    INSERT INTO mobile_refresh_sessions (
+      token_hash, user_id, app_type, expires_at, user_agent, remote_ip
+    )
+    VALUES ($1,$2,$3,NOW() + ($4 * INTERVAL '1 day'),$5,$6)
+    `,
+    [
+      tokenHash,
+      user.id,
+      normalizedAppType,
+      ttlDays,
+      String(req?.headers?.["user-agent"] || "").slice(0, 500) || null,
+      String(req?.ip || "").slice(0, 128) || null
+    ]
+  );
+  return { refresh_token: refreshToken, refresh_expires_days: ttlDays };
+}
+
+function mobileAuthPayload(user, appType, refreshSession) {
+  return {
+    token: createPanelSessionToken(user, appType),
+    expires_hours: PANEL_SESSION_TTL_HOURS,
+    ...refreshSession
+  };
+}
 
 function base64UrlEncode(value) {
   return Buffer.from(typeof value === "string" ? value : JSON.stringify(value))
@@ -1026,6 +1117,189 @@ function verifyPanelSessionToken(token) {
 
 function panelSessionFromRequest(req) {
   return verifyPanelSessionToken(getBearerOrPanelToken(req));
+}
+
+function parseServiceAccountConfig() {
+  const raw = String(process.env.FCM_SERVICE_ACCOUNT_JSON || "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed.client_email || !parsed.private_key || !parsed.project_id) return null;
+    return parsed;
+  } catch (error) {
+    console.warn("[PUSH] FCM_SERVICE_ACCOUNT_JSON inválido:", error.message);
+    return null;
+  }
+}
+
+async function getFcmAccessToken() {
+  if (fcmAccessTokenCache?.token && fcmAccessTokenCache.expires_at > Date.now() + 60_000) {
+    return fcmAccessTokenCache.token;
+  }
+  const serviceAccount = parseServiceAccountConfig();
+  if (!serviceAccount) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const encodedHeader = base64UrlEncode({ alg: "RS256", typ: "JWT" });
+  const encodedPayload = base64UrlEncode({
+    iss: serviceAccount.client_email,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600
+  });
+  const unsigned = `${encodedHeader}.${encodedPayload}`;
+  const signature = crypto.sign("RSA-SHA256", Buffer.from(unsigned), serviceAccount.private_key).toString("base64url");
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: `${unsigned}.${signature}`
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) {
+    throw new Error(data.error_description || data.error || `FCM OAuth HTTP ${response.status}`);
+  }
+  fcmAccessTokenCache = {
+    token: data.access_token,
+    expires_at: Date.now() + Number(data.expires_in || 3600) * 1000
+  };
+  return data.access_token;
+}
+
+async function sendFcmPush(device, notification) {
+  const serviceAccount = parseServiceAccountConfig();
+  const accessToken = await getFcmAccessToken();
+  if (!serviceAccount || !accessToken) return { skipped: true, reason: "FCM_NOT_CONFIGURED" };
+  const data = Object.fromEntries(Object.entries(notification.data || {}).map(([key, value]) => [key, String(value)]));
+  const response = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(serviceAccount.project_id)}/messages:send`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      message: {
+        token: device.push_token,
+        notification: { title: notification.title, body: notification.body },
+        data,
+        android: {
+          priority: "HIGH",
+          notification: {
+            channel_id: notification.channel_id || "sos_alerts",
+            sound: "default",
+            visibility: "PUBLIC"
+          }
+        }
+      }
+    })
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body?.error?.message || `FCM HTTP ${response.status}`);
+    error.statusCode = response.status;
+    throw error;
+  }
+  return { ok: true, provider: "FCM", id: body.name || null };
+}
+
+function getApnsProviderToken() {
+  if (apnsProviderTokenCache?.token && apnsProviderTokenCache.expires_at > Date.now() + 60_000) {
+    return apnsProviderTokenCache.token;
+  }
+  const teamId = String(process.env.APNS_TEAM_ID || "").trim();
+  const keyId = String(process.env.APNS_KEY_ID || "").trim();
+  const privateKey = String(process.env.APNS_PRIVATE_KEY || "").replace(/\\n/g, "\n").trim();
+  if (!teamId || !keyId || !privateKey) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64UrlEncode({ alg: "ES256", kid: keyId });
+  const payload = base64UrlEncode({ iss: teamId, iat: now });
+  const unsigned = `${header}.${payload}`;
+  const signature = crypto.sign("sha256", Buffer.from(unsigned), {
+    key: privateKey,
+    dsaEncoding: "ieee-p1363"
+  }).toString("base64url");
+  apnsProviderTokenCache = {
+    token: `${unsigned}.${signature}`,
+    expires_at: Date.now() + 50 * 60 * 1000
+  };
+  return apnsProviderTokenCache.token;
+}
+
+function apnsTopicForApp(appType) {
+  if (appType === "RESOLVER") return process.env.APNS_TOPIC_RESOLVER || "cl.vsti.sosresolutor";
+  return process.env.APNS_TOPIC_NEIGHBOR || "cl.vsti.sosvecino";
+}
+
+async function sendApnsPush(device, notification) {
+  const providerToken = getApnsProviderToken();
+  if (!providerToken) return { skipped: true, reason: "APNS_NOT_CONFIGURED" };
+  const authority = String(process.env.APNS_ENVIRONMENT || "production").toLowerCase() === "sandbox"
+    ? "https://api.sandbox.push.apple.com"
+    : "https://api.push.apple.com";
+  const client = http2.connect(authority);
+  return new Promise((resolve, reject) => {
+    let statusCode = 0;
+    let responseBody = "";
+    const request = client.request({
+      ":method": "POST",
+      ":path": `/3/device/${encodeURIComponent(device.push_token)}`,
+      authorization: `bearer ${providerToken}`,
+      "apns-topic": apnsTopicForApp(device.app_type),
+      "apns-push-type": "alert",
+      "apns-priority": "10",
+      "apns-expiration": "0"
+    });
+    request.setEncoding("utf8");
+    request.on("response", (headers) => { statusCode = Number(headers[":status"] || 0); });
+    request.on("data", (chunk) => { responseBody += chunk; });
+    request.on("end", () => {
+      client.close();
+      if (statusCode >= 200 && statusCode < 300) return resolve({ ok: true, provider: "APNS" });
+      const error = new Error(`APNS HTTP ${statusCode}${responseBody ? `: ${responseBody}` : ""}`);
+      error.statusCode = statusCode;
+      reject(error);
+    });
+    request.on("error", (error) => { client.close(); reject(error); });
+    client.on("error", reject);
+    request.end(JSON.stringify({
+      aps: {
+        alert: { title: notification.title, body: notification.body },
+        sound: "default",
+        badge: 1,
+        "content-available": 1
+      },
+      ...notification.data
+    }));
+  });
+}
+
+async function notifyMobileUser(userId, appType, notification) {
+  if (!userId) return { sent: 0, skipped: 0, failed: 0 };
+  await ensureMobileAppSchema();
+  const normalizedAppType = normalizeMobileAppType(appType);
+  const devices = await pool.query(
+    `SELECT * FROM mobile_push_devices WHERE user_id = $1 AND app_type = $2 AND enabled = true`,
+    [userId, normalizedAppType]
+  );
+  const summary = { sent: 0, skipped: 0, failed: 0 };
+  await Promise.all(devices.rows.map(async (device) => {
+    try {
+      const result = device.platform === "ios"
+        ? await sendApnsPush(device, notification)
+        : await sendFcmPush(device, notification);
+      if (result?.skipped) summary.skipped += 1;
+      else summary.sent += 1;
+    } catch (error) {
+      summary.failed += 1;
+      console.warn(`[PUSH ${device.platform}]`, error.message);
+      if ([404, 410].includes(Number(error.statusCode))) {
+        await pool.query(`UPDATE mobile_push_devices SET enabled = false, updated_at = NOW() WHERE id = $1`, [device.id]).catch(() => null);
+      }
+    }
+  }));
+  return summary;
 }
 
 function isSuperAdminSession(session) {
@@ -2782,6 +3056,16 @@ async function autoAssignResolver(ticket, options = {}) {
     ]
   );
 
+  void notifyMobileUser(selected.id, "RESOLVER", {
+    title: "Nueva emergencia asignada",
+    body: "Tienes un nuevo caso municipal pendiente de atención.",
+    channel_id: "sos_assignments",
+    data: {
+      type: "TICKET_ASSIGNED",
+      ticket_id: ticket.id
+    }
+  }).catch((error) => console.warn("[PUSH AUTO ASSIGN]", error.message));
+
   return {
     ticket: update.rows[0],
     resolver: selected
@@ -2983,6 +3267,16 @@ async function assignTicketToResolverManually(ticketId, resolverUserId, options 
       })
     ]
   );
+
+  void notifyMobileUser(resolver.id, "RESOLVER", {
+    title: ticket.assigned_resolver_id ? "Emergencia reasignada" : "Nueva emergencia asignada",
+    body: "Revisa el caso asignado por la central municipal.",
+    channel_id: "sos_assignments",
+    data: {
+      type: "TICKET_ASSIGNED",
+      ticket_id: ticket.id
+    }
+  }).catch((error) => console.warn("[PUSH MANUAL ASSIGN]", error.message));
 
   return {
     ticket: update.rows[0],
@@ -7346,7 +7640,8 @@ app.post("/auth/verify-code", authRateLimit, async (req, res) => {
     const {
       phone,
       code,
-      purpose = null
+      purpose = null,
+      client_type = null
     } = req.body;
 
     const cleanPhone = normalizePhoneForAuth(phone);
@@ -7411,11 +7706,14 @@ app.post("/auth/verify-code", authRateLimit, async (req, res) => {
       });
     }
 
+    const nativeSession = String(client_type || "").toUpperCase() === "NATIVE_APP"
+      ? await issueMobileRefreshToken(user, "NEIGHBOR", req)
+      : {};
+
     res.json({
       status: "ok",
       message: "Código verificado",
-      token: createPanelSessionToken(user, "NEIGHBOR"),
-      expires_hours: PANEL_SESSION_TTL_HOURS,
+      ...mobileAuthPayload(user, "NEIGHBOR", nativeSession),
       user: publicUserPayload(user)
     });
 
@@ -7430,16 +7728,170 @@ app.post("/auth/verify-code", authRateLimit, async (req, res) => {
 });
 
 app.post("/auth/logout", async (req, res) => {
+  const refreshToken = String(req.body?.refresh_token || "").trim();
+  if (refreshToken) {
+    await ensureMobileAppSchema();
+    await pool.query(
+      `UPDATE mobile_refresh_sessions SET revoked_at = COALESCE(revoked_at, NOW()) WHERE token_hash = $1`,
+      [hashOpaqueToken(refreshToken)]
+    ).catch(() => null);
+  }
   res.json({
     status: "ok",
     message: "Logged out"
   });
 });
 
+app.post("/auth/mobile/refresh", authRateLimit, async (req, res) => {
+  const refreshToken = String(req.body?.refresh_token || "").trim();
+  const requestedAppType = normalizeMobileAppType(req.body?.app_type);
+  if (!refreshToken || !requestedAppType) {
+    return res.status(400).json({ status: "error", message: "refresh_token and app_type are required" });
+  }
+
+  const oldHash = hashOpaqueToken(refreshToken);
+  await ensureMobileAppSchema();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const sessionResult = await client.query(
+      `
+      SELECT user_id, app_type
+      FROM mobile_refresh_sessions
+      WHERE token_hash = $1
+        AND revoked_at IS NULL
+        AND expires_at > NOW()
+      FOR UPDATE
+      `,
+      [oldHash]
+    );
+    if (!sessionResult.rows.length || sessionResult.rows[0].app_type !== requestedAppType) {
+      await client.query("ROLLBACK");
+      return res.status(401).json({ status: "error", message: "Sesión móvil inválida o expirada" });
+    }
+
+    const userResult = await client.query(
+      `
+      SELECT u.*, cc.code AS control_center_code, cc.name AS control_center_name
+      FROM users u
+      JOIN control_centers cc ON cc.id = u.control_center_id
+      WHERE u.id = $1
+        AND u.is_active = true
+      LIMIT 1
+      `,
+      [sessionResult.rows[0].user_id]
+    );
+    const user = userResult.rows[0];
+    if (!user || String(user.role || "").toUpperCase() !== requestedAppType) {
+      await client.query(`UPDATE mobile_refresh_sessions SET revoked_at = NOW() WHERE token_hash = $1`, [oldHash]);
+      await client.query("COMMIT");
+      return res.status(401).json({ status: "error", message: "La cuenta móvil ya no está habilitada" });
+    }
+
+    const nextToken = `sosr_${crypto.randomBytes(48).toString("base64url")}`;
+    const nextHash = hashOpaqueToken(nextToken);
+    const ttlDays = Number.isFinite(MOBILE_REFRESH_TTL_DAYS) && MOBILE_REFRESH_TTL_DAYS > 0 ? MOBILE_REFRESH_TTL_DAYS : 30;
+    await client.query(
+      `UPDATE mobile_refresh_sessions SET revoked_at = NOW(), replaced_by_hash = $2, last_used_at = NOW() WHERE token_hash = $1`,
+      [oldHash, nextHash]
+    );
+    await client.query(
+      `
+      INSERT INTO mobile_refresh_sessions (token_hash, user_id, app_type, expires_at, user_agent, remote_ip)
+      VALUES ($1,$2,$3,NOW() + ($4 * INTERVAL '1 day'),$5,$6)
+      `,
+      [
+        nextHash,
+        user.id,
+        requestedAppType,
+        ttlDays,
+        String(req.headers["user-agent"] || "").slice(0, 500) || null,
+        String(req.ip || "").slice(0, 128) || null
+      ]
+    );
+    await client.query("COMMIT");
+    return res.json({
+      status: "ok",
+      ...mobileAuthPayload(user, requestedAppType, {
+        refresh_token: nextToken,
+        refresh_expires_days: ttlDays
+      }),
+      user: requestedAppType === "NEIGHBOR" ? publicUserPayload(user) : user
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    console.error("[MOBILE REFRESH ERROR]", error);
+    return res.status(500).json({ status: "error", message: "No fue posible renovar la sesión móvil" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/mobile/push/register", async (req, res) => {
+  const session = panelSessionFromRequest(req);
+  const appType = normalizeMobileAppType(req.body?.app_type);
+  const platform = String(req.body?.platform || "").trim().toLowerCase();
+  const pushToken = String(req.body?.push_token || "").trim();
+  if (!session || !appType || String(session.role || "").toUpperCase() !== appType) {
+    return res.status(401).json({ status: "error", message: "Sesión móvil requerida" });
+  }
+  if (!pushToken || !["ios", "android"].includes(platform)) {
+    return res.status(400).json({ status: "error", message: "push_token and platform are required" });
+  }
+  try {
+    await ensureMobileAppSchema();
+    await pool.query(
+      `
+      INSERT INTO mobile_push_devices (
+        user_id, control_center_id, app_type, platform, push_token, device_id, app_version
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (app_type, push_token) DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        control_center_id = EXCLUDED.control_center_id,
+        platform = EXCLUDED.platform,
+        device_id = EXCLUDED.device_id,
+        app_version = EXCLUDED.app_version,
+        enabled = true,
+        last_seen_at = NOW(),
+        updated_at = NOW()
+      `,
+      [
+        session.sub,
+        session.control_center_id,
+        appType,
+        platform,
+        pushToken,
+        String(req.body?.device_id || "").slice(0, 180) || null,
+        String(req.body?.app_version || "").slice(0, 80) || null
+      ]
+    );
+    return res.json({ status: "ok", message: "Dispositivo registrado para notificaciones" });
+  } catch (error) {
+    console.error("[PUSH REGISTER ERROR]", error);
+    return res.status(500).json({ status: "error", message: "No fue posible registrar notificaciones" });
+  }
+});
+
+app.post("/mobile/push/unregister", async (req, res) => {
+  const session = panelSessionFromRequest(req);
+  const appType = normalizeMobileAppType(req.body?.app_type);
+  const pushToken = String(req.body?.push_token || "").trim();
+  if (!session || !appType || String(session.role || "").toUpperCase() !== appType) {
+    return res.status(401).json({ status: "error", message: "Sesión móvil requerida" });
+  }
+  await ensureMobileAppSchema();
+  await pool.query(
+    `UPDATE mobile_push_devices SET enabled = false, updated_at = NOW() WHERE user_id = $1 AND app_type = $2 AND ($3 = '' OR push_token = $3)`,
+    [session.sub, appType, pushToken]
+  );
+  return res.json({ status: "ok", message: "Notificaciones desregistradas" });
+});
+
 
 app.post("/resolver/auth/login", authRateLimit, async (req, res) => {
   try {
-    const { phone, code = null, channel = null } = req.body || {};
+    const { phone, code = null, channel = null, client_type = null } = req.body || {};
 
     if (!phone) {
       return res.status(400).json({
@@ -7519,13 +7971,14 @@ app.post("/resolver/auth/login", authRateLimit, async (req, res) => {
       });
     }
 
-    const token = createPanelSessionToken(user, "RESOLVER");
+    const nativeSession = String(client_type || "").toUpperCase() === "NATIVE_APP"
+      ? await issueMobileRefreshToken(user, "RESOLVER", req)
+      : {};
 
     res.json({
       status: "ok",
       message: "Resolver login OK",
-      token,
-      expires_hours: PANEL_SESSION_TTL_HOURS,
+      ...mobileAuthPayload(user, "RESOLVER", nativeSession),
       user
     });
 
@@ -9601,6 +10054,20 @@ app.post("/public/mobile/events/:eventId/voice/request", async (req, res) => {
       resolverUserId: ticket?.assigned_resolver_id || null
     });
 
+    if (ticket?.assigned_resolver_id) {
+      void notifyMobileUser(ticket.assigned_resolver_id, "RESOLVER", {
+        title: "Llamada segura entrante",
+        body: "El vecino solicita comunicarse por el caso activo.",
+        channel_id: "sos_calls",
+        data: {
+          type: "VOICE_INCOMING",
+          ticket_id: ticket.id,
+          event_id: eventId,
+          voice_session_id: voiceSession.id
+        }
+      }).catch((error) => console.warn("[PUSH RESOLVER VOICE]", error.message));
+    }
+
     res.json({
       status: "ok",
       message: "Llamada segura solicitada",
@@ -9790,6 +10257,19 @@ app.post("/resolver/tickets/:ticketId/voice/request", async (req, res) => {
       resolverUserId: resolver_user_id
     });
 
+    if (ticket.citizen_user_id) {
+      void notifyMobileUser(ticket.citizen_user_id, "NEIGHBOR", {
+        title: "Llamada segura entrante",
+        body: "El resolutor municipal está intentando comunicarse contigo.",
+        channel_id: "sos_calls",
+        data: {
+          type: "VOICE_INCOMING",
+          ticket_id: ticket.id,
+          voice_session_id: voiceSession.id
+        }
+      }).catch((error) => console.warn("[PUSH NEIGHBOR VOICE]", error.message));
+    }
+
     res.json({
       status: "ok",
       message: "Llamada segura solicitada",
@@ -9825,6 +10305,19 @@ app.post("/tickets/:id/voice/request", async (req, res) => {
       actorUserId: req.panel_session?.sub || null,
       resolverUserId: ticket.assigned_resolver_id || null
     });
+
+    if (String(target_type || "NEIGHBOR").toUpperCase() === "NEIGHBOR" && ticket.citizen_user_id) {
+      void notifyMobileUser(ticket.citizen_user_id, "NEIGHBOR", {
+        title: "Llamada de la central municipal",
+        body: "La central necesita comunicarse contigo por tu caso activo.",
+        channel_id: "sos_calls",
+        data: {
+          type: "VOICE_INCOMING",
+          ticket_id: ticket.id,
+          voice_session_id: voiceSession.id
+        }
+      }).catch((error) => console.warn("[PUSH OPERATOR VOICE]", error.message));
+    }
 
     res.json({
       status: "ok",
