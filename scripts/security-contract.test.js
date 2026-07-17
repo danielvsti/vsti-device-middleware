@@ -20,6 +20,9 @@ assert(server.includes("OTP_PROVIDER"), "Debe existir configuración de proveedo
 assert(server.includes("TWILIO_VERIFY_SERVICE_SID"), "Debe existir integración Twilio Verify");
 assert(server.includes('selectedChannel === "demo" && OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE'), "El código demo solo debe exponerse para desafíos demo");
 assert(server.includes("CORS_ALLOWED_ORIGINS"), "Debe existir allowlist CORS");
+assert(server.includes("SOS_PUBLIC_ORIGINS.includes(normalizedOrigin)"), "CORS debe permitir el origen propio del formulario GPS público");
+assert(server.includes('isPublicLocationSubmission && origin === "null"'), "CORS debe aceptar Origin null solamente en el POST GPS firmado de WhatsApp iOS");
+assert(server.includes('/^\\/public\\/location-request\\/[^/]+\\/position$/'), "La excepción Origin null debe quedar limitada a la ruta GPS pública");
 assert(server.includes('"Cache-Control"'), "CORS debe permitir Cache-Control usado por paneles web");
 
 for (const signature of [
@@ -33,7 +36,10 @@ for (const signature of [
 for (const signature of [
   'app.post("/public/sirens/activate"',
   'app.post("/public/sirens/deactivate"',
-  'app.post("/public/mobile/ack"'
+  'app.post("/public/mobile/ack"',
+  'app.get("/settings/emergency-categories"',
+  'app.post("/tickets/manual"',
+  'app.post("/tickets/:id/location-request"'
 ]) {
   assert(routeBlock(signature).includes("checkRoleAccess"), `${signature} debe exigir rol operacional`);
 }
@@ -53,5 +59,81 @@ for (const signature of [
 ]) {
   assert(routeBlock(signature).includes("checkTicketParticipantAccess"), `${signature} debe validar pertenencia al ticket`);
 }
+
+const panelLoginSql = routeBlock('app.post("/auth/panel-login"', 2200);
+assert(!panelLoginSql.includes("source_event."), "El login de panel no debe referenciar tablas de eventos sin JOIN");
+
+const ticketDetailSql = routeBlock('app.get("/tickets/:id"', 4200);
+assert(ticketDetailSql.includes("LEFT JOIN mobile_events source_event"), "El detalle del ticket debe enlazar el evento móvil");
+assert(ticketDetailSql.includes("LEFT JOIN municipal_qr_points qr_point"), "El detalle del ticket debe enlazar la atribución QR");
+assert(routeBlock('app.get("/tickets/:id"', 9000).includes("location_requests"), "El detalle del ticket debe incluir trazabilidad de solicitudes GPS");
+assert(routeBlock('app.get("/tickets/:id"', 9000).includes("destination_phone AS recipient"), "La auditoría GPS debe usar las columnas reales del esquema");
+const resolverLocationSql = routeBlock('app.post("/resolver/location"', 6200);
+assert(resolverLocationSql.includes("const rawLonNum = Number(longitude)"), "La ruta GPS del resolutor debe declarar la longitud recibida");
+assert(resolverLocationSql.includes("LONGITUDE_HEMISPHERE_SIGN"), "La ruta GPS del resolutor debe defenderse de hemisferio invertido");
+
+const mobileSosSql = routeBlock('app.post("/public/mobile/sos"', 2600);
+assert(!mobileSosSql.includes("rawLonNum"), "La corrección del simulador no debe contaminar la creación de SOS vecino");
+
+const manualTicketSql = routeBlock('app.post("/tickets/manual"', 9000);
+assert(manualTicketSql.includes('source_type: "PHONE_CALL"'), "El ingreso telefónico debe usar una fuente de ticket diferenciada");
+assert(manualTicketSql.includes("wa_center_session_id"), "El ticket telefónico debe permitir asociar la sesión de WA-Center");
+
+const waWebhookSql = routeBlock('app.post("/integrations/wa-center/voice-events"', 6200);
+assert(waWebhookSql.includes("provider_event_id"), "El webhook de WA-Center debe deduplicar eventos del proveedor");
+assert(waWebhookSql.includes("wa_center_call_id"), "El webhook de WA-Center debe correlacionar llamadas municipales externas");
+assert(waWebhookSql.includes('recording_url must be a valid HTTPS URL'), "El webhook de WA-Center debe rechazar grabaciones no HTTPS");
+
+const locationRequestSql = routeBlock('app.post("/tickets/:id/location-request"', 5200);
+assert(locationRequestSql.includes("crypto.randomBytes(32)"), "El enlace GPS debe usar un token criptográficamente aleatorio");
+assert(locationRequestSql.includes("token_hash"), "El token GPS debe almacenarse únicamente como hash");
+const publicLocationPage = routeBlock('app.get("/public/location-request/:token"', 7000);
+assert(publicLocationPage.includes('geolocation=(self)'), "La página GPS pública debe habilitar geolocalización del mismo origen");
+assert(publicLocationPage.includes('method="post"'), "La página GPS debe enviar mediante formulario HTML nativo compatible con Safari");
+assert(publicLocationPage.includes("form.submit()"), "La página GPS debe evitar transportes JavaScript incompatibles con WhatsApp iOS");
+assert(!publicLocationPage.includes("fetch("), "La página GPS no debe depender de fetch en el navegador embebido");
+assert(!publicLocationPage.includes("new XMLHttpRequest()"), "La página GPS no debe depender de XMLHttpRequest en el navegador embebido");
+const dashboardMapState = routeBlock('app.get("/dashboard/map-state"', 1800);
+assert(dashboardMapState.includes('Cache-Control'), "El estado del mapa operacional no debe quedar almacenado en caché");
+const locationSubmitSql = routeBlock('app.post("/public/location-request/:token/position"', 5200);
+assert(locationSubmitSql.includes("status='COMPLETED'"), "El enlace GPS debe quedar consumido después de utilizarse");
+assert(locationSubmitSql.includes("LOCATION_SHARED"), "La ubicación compartida debe dejar trazabilidad operacional");
+assert(locationSubmitSql.includes("absoluteAccuracyLimit"), "El GPS telefónico debe conservar ubicación aproximada con advertencia antes de descartarla");
+
+const adminSettingsSql = routeBlock('app.put("/admin/control-centers/:code/settings"', 2600);
+assert(adminSettingsSql.includes("nextSettings.communications_module"), "El ADMIN municipal no debe poder auto-habilitar la licencia de Comunicaciones");
+assert(adminSettingsSql.includes("currentSettings"), "La licencia comercial debe conservar el valor administrado por SuperAdmin");
+const communicationsLicenseSql = routeBlock("app.put('/superadmin/control-centers/:code/communications-license'", 3200);
+assert(communicationsLicenseSql.includes("requireSuperAdmin"), "Sólo SuperAdmin debe modificar la licencia de Comunicaciones");
+const neighborAnnouncementsSql = routeBlock("app.get('/neighbor/announcements'", 3600);
+assert(neighborAnnouncementsSql.includes("checkAuthenticatedAccess"), "Los anuncios personales deben exigir sesión autenticada de vecino");
+assert(neighborAnnouncementsSql.includes("a.target_user_id=$2"), "Los avisos individuales sólo deben llegar a su destinatario");
+const announcementInputSql = routeBlock("function normalizeAnnouncementInput", 3600);
+assert(announcementInputSql.includes("youtube.com"), "Los videos municipales deben validar explícitamente YouTube");
+assert(announcementInputSql.includes("vimeo.com"), "Los videos municipales deben validar explícitamente Vimeo");
+assert(announcementInputSql.includes("directVideo"), "Los videos directos deben limitarse a formatos permitidos");
+const announcementVideoProxySql = routeBlock("app.get('/public/announcement-video/:provider/:videoId'", 2600);
+assert(announcementVideoProxySql.includes("youtube") && announcementVideoProxySql.includes("vimeo"), "El reproductor HTTPS debe limitarse a YouTube y Vimeo");
+assert(announcementVideoProxySql.includes("Content-Security-Policy"), "El reproductor embebido debe aplicar CSP restrictiva");
+
+const physicalSosRegistry = routeBlock("PHYSICAL SOS BUTTON REGISTRY", 5200);
+assert(physicalSosRegistry.includes('PHYSICAL_SOS_DEMO_BUTTON_ID = "8322560"'), "El botón piloto debe quedar identificado explícitamente");
+assert(physicalSosRegistry.includes('"CC-CONCHALI"'), "El botón piloto de demo debe dirigirse a Conchalí");
+assert(physicalSosRegistry.includes("applyPhysicalSosDemoOverride"), "La asignación demo debe prevalecer sobre el inventario anterior");
+const physicalSosTicket = routeBlock("async function createTicketFromPhysicalSos", 4200);
+assert(physicalSosTicket.includes("cachedPosition"), "La alarma física debe poder usar el último GPS conocido");
+assert(physicalSosTicket.includes("profile.demo_override"), "El modo demo debe quedar limitado al perfil sobrescrito");
+const physicalDeviceMapState = routeBlock('app.get("/public/map-state"', 7600);
+assert(physicalDeviceMapState.includes("registeredKeys"), "El mapa debe limitar botones físicos al inventario del Centro de Control");
+assert(physicalDeviceMapState.includes("devicesForMap = []"), "El mapa debe ocultar botones si la función está deshabilitada o el inventario falla");
+const adminDeviceUpsert = routeBlock('app.post("/admin/control-centers/:code/devices"', 5200);
+assert(adminDeviceUpsert.includes("payload.last_latitude"), "El alta de botones debe aceptar coordenadas del contrato histórico");
+assert(adminDeviceUpsert.includes("Latitud y longitud deben informarse juntas"), "El alta de botones debe validar el par GPS");
+const adminDeviceDelete = routeBlock('app.delete("/admin/control-centers/:code/devices/:id"', 2600);
+assert(adminDeviceDelete.includes("checkAdminToken"), "Eliminar un botón físico debe exigir sesión ADMIN");
+assert(adminDeviceDelete.includes("control_center_id = $2"), "Eliminar un botón físico debe quedar aislado por Centro de Control");
+const flespiMqtt = routeBlock("function startFlespiMqtt", 4200);
+assert(flespiMqtt.includes("flespi/message/gw/devices/"), "El middleware debe escuchar mensajes completos del botón físico");
+assert(flespiMqtt.includes("processIncomingMessage"), "Los mensajes MQTT del botón deben entrar al flujo de tickets");
 
 console.log("Security contract OK");

@@ -40,10 +40,10 @@ Nunca habilitar estas variables en producción municipal.
 ### Allowlist CORS del despliegue actual
 
 ```env
-CORS_ALLOWED_ORIGINS=https://sos-admin-ipp7.onrender.com,https://sos-dashboard-3695.onrender.com,https://mapa.sos.vsti.cl,https://sos-pwa.onrender.com,https://sos-resolver-pwa.onrender.com,https://sos-superadmin.onrender.com,capacitor://localhost,http://localhost
+CORS_ALLOWED_ORIGINS=https://app.queltu.com,https://response.queltu.com,https://control.queltu.com,https://dashboard.queltu.com,https://admin.queltu.com,https://superadmin.queltu.com,https://sos-admin-ipp7.onrender.com,https://sos-dashboard-3695.onrender.com,https://mapa.sos.vsti.cl,https://sos-map.onrender.com,https://sos-pwa.onrender.com,https://sos-resolver-pwa.onrender.com,https://sos-superadmin.onrender.com,capacitor://localhost,ionic://localhost,https://localhost,http://localhost
 ```
 
-`mapa.sos.vsti.cl` debe servir el panel exclusivamente mediante HTTPS. No agregar `http://mapa.sos.vsti.cl` a producción: una página operacional cargada sin TLS podría exponer la sesión OTP.
+`api.queltu.com` es el host canónico de la API. `sos.vsti.cl` permanece como alias heredado temporal y no debe retirarse hasta verificar logs, integraciones Flespi y dispositivos físicos. `mapa.sos.vsti.cl` debe seguir sirviendo exclusivamente mediante HTTPS. No agregar `http://mapa.sos.vsti.cl` a producción.
 
 Usar secretos diferentes por ambiente. Después del despliegue, rotar cualquier token histórico que haya estado incluido en código o logs.
 

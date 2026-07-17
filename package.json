@@ -4,8 +4,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/security-contract.test.js",
-    "test:security": "node scripts/security-contract.test.js"
+    "test": "node scripts/security-contract.test.js && node scripts/platform-contract.test.js",
+    "test:security": "node scripts/security-contract.test.js",
+    "test:platform": "node scripts/platform-contract.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
