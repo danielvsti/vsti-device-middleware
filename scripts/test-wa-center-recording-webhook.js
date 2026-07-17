@@ -15,7 +15,7 @@ for (const name of required) {
   }
 }
 
-const baseUrl = String(process.env.SOS_BASE_URL || "https://sos.vsti.cl").replace(/\/+$/, "");
+const baseUrl = String(process.env.SOS_BASE_URL || "https://api.queltu.com").replace(/\/+$/, "");
 const ticketId = process.env.TICKET_ID;
 const recordingUrl = process.env.RECORDING_URL;
 

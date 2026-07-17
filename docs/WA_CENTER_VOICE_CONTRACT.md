@@ -16,7 +16,7 @@ SOS invoca `POST {WA_CENTER_BASE_URL}/voice/sessions` con autenticación
     { "role": "party_a", "type": "webrtc", "label": "vecino" },
     { "role": "party_b", "type": "webrtc", "label": "central" }
   ],
-  "callback_url": "https://sos.vsti.cl/integrations/wa-center/voice-events"
+  "callback_url": "https://api.queltu.com/integrations/wa-center/voice-events"
 }
 ```
 

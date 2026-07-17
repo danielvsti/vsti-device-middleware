@@ -46,7 +46,13 @@ const CORS_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
-const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://sos.vsti.cl"]
+const NATIVE_APP_ORIGINS = new Set([
+  "capacitor://localhost",
+  "ionic://localhost",
+  "http://localhost",
+  "https://localhost"
+]);
+const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://api.queltu.com", "https://sos.vsti.cl"]
   .filter(Boolean)
   .map((value) => {
     try { return new URL(value).origin; } catch (_) { return ""; }
@@ -57,7 +63,9 @@ function corsOriginAllowed(origin) {
   if (!origin) return true;
   if (SECURITY_DEMO_MODE && CORS_ALLOWED_ORIGINS.length === 0) return true;
   const normalizedOrigin = String(origin).replace(/\/+$/, "");
-  return CORS_ALLOWED_ORIGINS.includes(normalizedOrigin) || SOS_PUBLIC_ORIGINS.includes(normalizedOrigin);
+  return NATIVE_APP_ORIGINS.has(normalizedOrigin)
+    || CORS_ALLOWED_ORIGINS.includes(normalizedOrigin)
+    || SOS_PUBLIC_ORIGINS.includes(normalizedOrigin);
 }
 
 app.use(cors((req, callback) => {
@@ -220,7 +228,7 @@ const WA_CENTER_VOICE_RECORDING = envFlag("WA_CENTER_VOICE_RECORDING", true);
 const WA_CENTER_VOICE_SUPERVISION = envFlag("WA_CENTER_VOICE_SUPERVISION", true);
 const WA_CENTER_WEBHOOK_SECRET = process.env.WA_CENTER_WEBHOOK_SECRET || "";
 const WA_CENTER_CALLBACK_URL_OVERRIDE = envFlag("WA_CENTER_CALLBACK_URL_OVERRIDE", false);
-const SOS_PUBLIC_BASE_URL = String(process.env.SOS_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+const SOS_PUBLIC_BASE_URL = String(process.env.SOS_PUBLIC_BASE_URL || "https://api.queltu.com").replace(/\/+$/, "");
 
 const gpsDevices = {};
 const mobileEvents = {};
@@ -868,7 +876,7 @@ function municipalQrPublicPayload(row) {
     enabled: row.enabled !== false,
     control_center_code: row.control_center_code || null,
     control_center_name: row.control_center_name || null,
-    pwa_url: `${process.env.SOS_PWA_BASE_URL || 'https://sos-pwa.onrender.com'}/?qr=${encodeURIComponent(row.code)}&lat=${encodeURIComponent(Number(row.latitude).toFixed(6))}&lng=${encodeURIComponent(Number(row.longitude).toFixed(6))}&cc=${encodeURIComponent(row.control_center_code || '')}`,
+    pwa_url: `${process.env.SOS_PWA_BASE_URL || 'https://app.queltu.com'}/?qr=${encodeURIComponent(row.code)}&lat=${encodeURIComponent(Number(row.latitude).toFixed(6))}&lng=${encodeURIComponent(Number(row.longitude).toFixed(6))}&cc=${encodeURIComponent(row.control_center_code || '')}`,
     visit_count: Number(row.visit_count || 0),
     unique_visitors: Number(row.unique_visitors || 0),
     last_visit_at: row.last_visit_at || null,
@@ -4917,7 +4925,7 @@ function parseDataUrl(dataUrl) {
 }
 
 function publicBaseUrl(req) {
-  return process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
+  return process.env.PUBLIC_BASE_URL || SOS_PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
 }
 
 function meetingRoomForTicket(ticketId) {
