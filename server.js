@@ -52,6 +52,10 @@ const NATIVE_APP_ORIGINS = new Set([
   "http://localhost",
   "https://localhost"
 ]);
+const DASHBOARD_WEB_ORIGINS = new Set([
+  "https://dashboard.queltu.com",
+  "https://sos-dashboard-3695.onrender.com"
+]);
 const SOS_PUBLIC_ORIGINS = [process.env.SOS_PUBLIC_BASE_URL, "https://api.queltu.com", "https://sos.vsti.cl"]
   .filter(Boolean)
   .map((value) => {
@@ -64,6 +68,7 @@ function corsOriginAllowed(origin) {
   if (SECURITY_DEMO_MODE && CORS_ALLOWED_ORIGINS.length === 0) return true;
   const normalizedOrigin = String(origin).replace(/\/+$/, "");
   return NATIVE_APP_ORIGINS.has(normalizedOrigin)
+    || DASHBOARD_WEB_ORIGINS.has(normalizedOrigin)
     || CORS_ALLOWED_ORIGINS.includes(normalizedOrigin)
     || SOS_PUBLIC_ORIGINS.includes(normalizedOrigin);
 }

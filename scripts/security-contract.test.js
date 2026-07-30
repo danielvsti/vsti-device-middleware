@@ -20,6 +20,9 @@ assert(server.includes("OTP_PROVIDER"), "Debe existir configuración de proveedo
 assert(server.includes("TWILIO_VERIFY_SERVICE_SID"), "Debe existir integración Twilio Verify");
 assert(server.includes('selectedChannel === "demo" && OTP_DEMO_MODE && OTP_EXPOSE_DEMO_CODE'), "El código demo solo debe exponerse para desafíos demo");
 assert(server.includes("CORS_ALLOWED_ORIGINS"), "Debe existir allowlist CORS");
+assert(server.includes('"https://dashboard.queltu.com"'), "CORS debe permitir el Dashboard canónico");
+assert(server.includes('"https://sos-dashboard-3695.onrender.com"'), "CORS debe mantener temporalmente el Dashboard heredado");
+assert(server.includes("DASHBOARD_WEB_ORIGINS.has(normalizedOrigin)"), "CORS debe validar los orígenes exactos del Dashboard");
 assert(server.includes("SOS_PUBLIC_ORIGINS.includes(normalizedOrigin)"), "CORS debe permitir el origen propio del formulario GPS público");
 assert(server.includes('isPublicLocationSubmission && origin === "null"'), "CORS debe aceptar Origin null solamente en el POST GPS firmado de WhatsApp iOS");
 assert(server.includes('/^\\/public\\/location-request\\/[^/]+\\/position$/'), "La excepción Origin null debe quedar limitada a la ruta GPS pública");
