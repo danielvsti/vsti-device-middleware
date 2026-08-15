@@ -73,8 +73,16 @@ assert(
   "La API pública canónica debe ser api.queltu.com"
 );
 assert(
-  server.includes("process.env.SOS_PWA_BASE_URL || 'https://app.queltu.com'"),
+  server.includes("const CANONICAL_PWA_BASE_URL = 'https://app.queltu.com'"),
   "Los QR deben usar app.queltu.com por defecto"
+);
+assert(
+  server.includes("hostname.endsWith('.onrender.com')"),
+  "Los QR no deben heredar dominios públicos temporales de Render"
+);
+assert(
+  server.includes("pwa_url: `${publicPwaBaseUrl()}/?qr="),
+  "Todos los QR deben usar la base pública normalizada"
 );
 assert(
   server.includes("WA_CENTER_CALLBACK_URL_OVERRIDE"),
@@ -83,6 +91,18 @@ assert(
 assert(
   server.includes("record: platformSettings.voice_policy?.recording_enabled !== false"),
   "La solicitud de voz debe enviar la política de grabación por sesión"
+);
+assert(
+  server.includes('const isIncomingVoiceCall = data.type === "VOICE_INCOMING"'),
+  "Las llamadas Android deben distinguirse de las notificaciones estándar"
+);
+assert(
+  server.includes("if (!isIncomingVoiceCall) {"),
+  "VOICE_INCOMING debe conservarse como push data-only para recepción en segundo plano"
+);
+assert(
+  server.includes('message.data.channel_id = String(notification.channel_id || "sos_calls")'),
+  "La llamada data-only debe identificar el canal nativo sos_calls"
 );
 
 for (const migration of [

@@ -29,6 +29,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const http2 = require("http2");
+const { registerSafetyModule } = require("./safety-module");
 
 console.log(
   "DATABASE_URL configurada:",
@@ -295,6 +296,22 @@ let emergencyCategoryCatalogCache = DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES.map(ca
 const AUTOMATIC_MOBILE_ALERT_TYPES = new Set(['VIF_SILENT_SHAKE', 'FALL_DETECTED']);
 
 const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
+  vertical: 'CITY',
+  branding: {
+    organizationName: '',
+    logoUrl: '',
+    primaryColor: '#151A1D',
+    secondaryColor: '#E4473F'
+  },
+  terminology: {
+    endUser: 'Vecino',
+    responder: 'Resolutor',
+    operator: 'Operador',
+    incident: 'Emergencia',
+    organization: 'Municipalidad',
+    zone: 'Comuna',
+    controlCenter: 'Centro de Control'
+  },
   features: {
     mobile_app_enabled: true,
     resolver_app_enabled: true,
@@ -336,6 +353,14 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     max_active_announcements: 20,
     storage_limit_mb: 2048
   },
+  safety_modules: {
+    enabled: false,
+    incidents: true,
+    inspections: true,
+    critical_controls: true,
+    behavior_observations: true,
+    camera_ai: false
+  },
   incident_policy: {
     dedup_enabled: true,
     dedup_radius_meters: 120,
@@ -357,6 +382,24 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
   },
   neighbor_app: {
     emergency_categories: DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES
+  }
+});
+
+const VERTICAL_CONTROL_CENTER_DEFAULTS = Object.freeze({
+  CITY: {},
+  MINING: {
+    terminology: {
+      endUser: 'Trabajador', responder: 'Brigadista', operator: 'Operador', incident: 'Incidente',
+      organization: 'Compañía Minera', zone: 'Área o Faena', controlCenter: 'Centro de Control'
+    },
+    safety_modules: { enabled: true, incidents: true, inspections: true, critical_controls: true, behavior_observations: true, camera_ai: false }
+  },
+  INDUSTRY: {
+    terminology: {
+      endUser: 'Colaborador', responder: 'Equipo de Emergencia', operator: 'Operador', incident: 'Incidente',
+      organization: 'Planta', zone: 'Área', controlCenter: 'Centro de Control'
+    },
+    safety_modules: { enabled: true, incidents: true, inspections: true, critical_controls: true, behavior_observations: true, camera_ai: false }
   }
 });
 
@@ -598,7 +641,23 @@ async function loadEmergencyCategoryCatalog({ includeDisabled = true } = {}) {
 }
 
 function normalizeControlCenterSettings(input = {}) {
-  const merged = deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS, input || {});
+  const requestedVertical = String(input?.vertical || DEFAULT_CONTROL_CENTER_SETTINGS.vertical).trim().toUpperCase();
+  const vertical = Object.prototype.hasOwnProperty.call(VERTICAL_CONTROL_CENTER_DEFAULTS, requestedVertical) ? requestedVertical : 'CITY';
+  const verticalDefaults = VERTICAL_CONTROL_CENTER_DEFAULTS[vertical] || {};
+  const merged = deepMergeSettings(deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS, verticalDefaults), input || {});
+  merged.vertical = vertical;
+
+  merged.branding = merged.branding || {};
+  merged.branding.organizationName = String(merged.branding.organizationName || '').trim().slice(0, 180);
+  merged.branding.logoUrl = String(merged.branding.logoUrl || '').trim().slice(0, 2000);
+  merged.branding.primaryColor = /^#[0-9a-f]{6}$/i.test(String(merged.branding.primaryColor || '')) ? merged.branding.primaryColor : '#151A1D';
+  merged.branding.secondaryColor = /^#[0-9a-f]{6}$/i.test(String(merged.branding.secondaryColor || '')) ? merged.branding.secondaryColor : '#E4473F';
+
+  merged.terminology = merged.terminology || {};
+  const terminologyDefaults = deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS.terminology, verticalDefaults.terminology || {});
+  for (const key of Object.keys(DEFAULT_CONTROL_CENTER_SETTINGS.terminology)) {
+    merged.terminology[key] = String(merged.terminology[key] || terminologyDefaults[key]).trim().slice(0, 100);
+  }
 
   merged.features = merged.features || {};
   for (const key of Object.keys(DEFAULT_CONTROL_CENTER_SETTINGS.features)) {
@@ -641,6 +700,12 @@ function normalizeControlCenterSettings(input = {}) {
   merged.communications_module.push_delivery = normalizePolicyBoolean(merged.communications_module.push_delivery, false);
   merged.communications_module.max_active_announcements = clampPolicyNumber(merged.communications_module.max_active_announcements, 20, 1, 500);
   merged.communications_module.storage_limit_mb = clampPolicyNumber(merged.communications_module.storage_limit_mb, 2048, 0, 102400);
+
+  merged.safety_modules = merged.safety_modules || {};
+  const defaultSafety = deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS.safety_modules, verticalDefaults.safety_modules || {});
+  for (const key of Object.keys(DEFAULT_CONTROL_CENTER_SETTINGS.safety_modules)) {
+    merged.safety_modules[key] = normalizePolicyBoolean(merged.safety_modules[key], defaultSafety[key]);
+  }
 
   merged.incident_policy = merged.incident_policy || {};
   merged.incident_policy.dedup_enabled = normalizePolicyBoolean(merged.incident_policy.dedup_enabled, true);
@@ -789,6 +854,9 @@ async function getControlCenterSettingsByCode(controlCenterCode = 'CC-VINA') {
 function publicSettingsPayload(settings) {
   const normalized = normalizeControlCenterSettings(settings || {});
   return {
+    vertical: normalized.vertical,
+    branding: normalized.branding,
+    terminology: normalized.terminology,
     features: {
       mobile_app_enabled: normalized.features.mobile_app_enabled,
       resolver_app_enabled: normalized.features.resolver_app_enabled,
@@ -806,6 +874,7 @@ function publicSettingsPayload(settings) {
     },
     notification_policy: normalized.notification_policy,
     communications_module: normalized.communications_module,
+    safety_modules: normalized.safety_modules,
     incident_policy: normalized.incident_policy,
     resolver_policy: normalized.resolver_policy,
     operator_tools: normalized.operator_tools,
@@ -869,6 +938,32 @@ async function ensureMunicipalQrSchema() {
   municipalQrSchemaReady = true;
 }
 
+const CANONICAL_PWA_BASE_URL = 'https://app.queltu.com';
+
+function publicPwaBaseUrl() {
+  const configured = String(process.env.SOS_PWA_BASE_URL || '').trim();
+  if (!configured) return CANONICAL_PWA_BASE_URL;
+
+  try {
+    const parsed = new URL(configured);
+    const hostname = parsed.hostname.toLowerCase();
+    const isLegacyPublicHost =
+      hostname.endsWith('.onrender.com') ||
+      hostname === 'sos.vsti.cl' ||
+      hostname === 'mapa.sos.vsti.cl';
+
+    if (isLegacyPublicHost) {
+      console.warn(`[QR CONFIG] SOS_PWA_BASE_URL heredada (${parsed.origin}); usando ${CANONICAL_PWA_BASE_URL}`);
+      return CANONICAL_PWA_BASE_URL;
+    }
+
+    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    console.warn(`[QR CONFIG] SOS_PWA_BASE_URL inválida; usando ${CANONICAL_PWA_BASE_URL}`);
+    return CANONICAL_PWA_BASE_URL;
+  }
+}
+
 function municipalQrPublicPayload(row) {
   if (!row) return null;
   return {
@@ -881,7 +976,7 @@ function municipalQrPublicPayload(row) {
     enabled: row.enabled !== false,
     control_center_code: row.control_center_code || null,
     control_center_name: row.control_center_name || null,
-    pwa_url: `${process.env.SOS_PWA_BASE_URL || 'https://app.queltu.com'}/?qr=${encodeURIComponent(row.code)}&lat=${encodeURIComponent(Number(row.latitude).toFixed(6))}&lng=${encodeURIComponent(Number(row.longitude).toFixed(6))}&cc=${encodeURIComponent(row.control_center_code || '')}`,
+    pwa_url: `${publicPwaBaseUrl()}/?qr=${encodeURIComponent(row.code)}&lat=${encodeURIComponent(Number(row.latitude).toFixed(6))}&lng=${encodeURIComponent(Number(row.longitude).toFixed(6))}&cc=${encodeURIComponent(row.control_center_code || '')}`,
     visit_count: Number(row.visit_count || 0),
     unique_visitors: Number(row.unique_visitors || 0),
     last_visit_at: row.last_visit_at || null,
@@ -1186,6 +1281,35 @@ async function sendFcmPush(device, notification) {
   const accessToken = await getFcmAccessToken();
   if (!serviceAccount || !accessToken) return { skipped: true, reason: "FCM_NOT_CONFIGURED" };
   const data = Object.fromEntries(Object.entries(notification.data || {}).map(([key, value]) => [key, String(value)]));
+  const isIncomingVoiceCall = data.type === "VOICE_INCOMING";
+  const message = {
+    token: device.push_token,
+    data,
+    android: {
+      priority: "HIGH"
+    }
+  };
+
+  // Las llamadas se envían como data-only para que Firebase invoque el
+  // servicio nativo incluso con la app en segundo plano o la pantalla apagada.
+  // El servicio Android construye la notificación CATEGORY_CALL y su
+  // full-screen intent. Las demás notificaciones conservan el flujo estándar.
+  if (!isIncomingVoiceCall) {
+    message.notification = {
+      title: notification.title,
+      body: notification.body
+    };
+    message.android.notification = {
+      channel_id: notification.channel_id || "sos_alerts",
+      sound: "default",
+      visibility: "PUBLIC"
+    };
+  } else {
+    message.data.title = String(notification.title || "Llamada segura de QUELTU");
+    message.data.body = String(notification.body || "Tienes una llamada segura entrante.");
+    message.data.channel_id = String(notification.channel_id || "sos_calls");
+  }
+
   const response = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(serviceAccount.project_id)}/messages:send`, {
     method: "POST",
     headers: {
@@ -1193,19 +1317,7 @@ async function sendFcmPush(device, notification) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      message: {
-        token: device.push_token,
-        notification: { title: notification.title, body: notification.body },
-        data,
-        android: {
-          priority: "HIGH",
-          notification: {
-            channel_id: notification.channel_id || "sos_alerts",
-            sound: "default",
-            visibility: "PUBLIC"
-          }
-        }
-      }
+      message
     })
   });
   const body = await response.json().catch(() => ({}));
@@ -10215,7 +10327,9 @@ app.post("/public/mobile/events/:eventId/voice/sessions/:sessionId/end", async (
     }
 
     const normalizedReason = String(reason || "HANGUP").toUpperCase();
-    const outcome = normalizedReason === "NO_ANSWER"
+    const outcome = normalizedReason === "REJECTED_BY_NEIGHBOR"
+      ? "REJECTED"
+      : normalizedReason === "NO_ANSWER"
       ? "NO_ANSWER"
       : normalizedReason === "ERROR"
         ? "FAILED"
@@ -11381,6 +11495,7 @@ app.get("/dashboard/analytics", async (req, res) => {
 
     const controlCenter = ccResult.rows[0];
     const ccId = controlCenter.id;
+    const dashboardSettingsRow = await getControlCenterSettingsById(ccId);
 
     // Before calculating dashboard KPIs, reconcile impossible resolver states:
     // BUSY / EN_ROUTE / ON_SITE without an active assigned ticket.
@@ -11893,6 +12008,7 @@ app.get("/dashboard/analytics", async (req, res) => {
       updated_at: nowChile(),
       period_days: days,
       control_center: controlCenter,
+      platform_settings: publicSettingsPayload(dashboardSettingsRow?.settings || {}),
       generated_by: req.panel_session ? {
         id: req.panel_session.sub,
         name: req.panel_session.name,
@@ -14313,12 +14429,15 @@ app.get("/superadmin/control-centers", async (req, res) => {
   if (!requireSuperAdmin(req, res)) return;
   try {
     await ensureSuperAdminSchema();
+    await ensureControlCenterSettingsSchema();
     const result = await pool.query(`
       SELECT
         cc.id, cc.code, cc.name, cc.municipality, cc.region, cc.country,
         cc.municipality_logo_url, cc.product_logo_url, cc.brand_primary_color, cc.brand_secondary_color,
         cc.latitude, cc.longitude, cc.map_center_lat, cc.map_center_lon, cc.map_zoom,
         cc.geofence_buffer_meters, cc.boundary_geojson->>'type' AS boundary_type,
+        COALESCE(s.settings->>'vertical', 'CITY') AS vertical,
+        COALESCE((s.settings->'safety_modules'->>'enabled')::boolean, false) AS safety_enabled,
         COUNT(u.id)::int AS users_count,
         COUNT(u.id) FILTER (WHERE u.role = 'ADMIN')::int AS admins_count,
         COUNT(u.id) FILTER (WHERE u.role = 'OPERATOR')::int AS operators_count,
@@ -14342,8 +14461,9 @@ app.get("/superadmin/control-centers", async (req, res) => {
           '[]'::jsonb
         ) AS admins
       FROM control_centers cc
+      LEFT JOIN control_center_settings s ON s.control_center_id = cc.id
       LEFT JOIN users u ON u.control_center_id = cc.id
-      GROUP BY cc.id
+      GROUP BY cc.id, s.settings
       ORDER BY cc.region NULLS LAST, cc.municipality NULLS LAST, cc.code
     `);
     res.json({ status: "ok", total: result.rows.length, control_centers: result.rows });
@@ -14450,6 +14570,9 @@ app.post("/superadmin/control-centers", async (req, res) => {
     const productLogoUrl = String(req.body?.product_logo_url || "").trim() || null;
     const brandPrimaryColor = String(req.body?.brand_primary_color || "").trim() || null;
     const brandSecondaryColor = String(req.body?.brand_secondary_color || "").trim() || null;
+    const vertical = ['CITY', 'MINING', 'INDUSTRY'].includes(String(req.body?.vertical || '').trim().toUpperCase())
+      ? String(req.body.vertical).trim().toUpperCase()
+      : 'CITY';
 
     if (!code || !/^CC-[A-Z0-9-]{2,40}$/.test(code)) {
       return res.status(400).json({ status: "error", message: "code debe tener formato CC-COMUNA" });
@@ -14485,7 +14608,26 @@ app.post("/superadmin/control-centers", async (req, res) => {
       municipalityLogoUrl, productLogoUrl, brandPrimaryColor, brandSecondaryColor
     ]);
 
-    res.json({ status: "ok", control_center: result.rows[0] });
+    await ensureControlCenterSettingsSchema();
+    const currentSettingsRow = await getControlCenterSettingsById(result.rows[0].id);
+    const nextSettings = normalizeControlCenterSettings(deepMergeSettings(currentSettingsRow?.settings || {}, {
+      vertical,
+      branding: {
+        organizationName: municipality || name,
+        primaryColor: brandPrimaryColor || currentSettingsRow?.settings?.branding?.primaryColor,
+        secondaryColor: brandSecondaryColor || currentSettingsRow?.settings?.branding?.secondaryColor
+      },
+      safety_modules: {
+        enabled: req.body?.safety_enabled == null ? ['MINING', 'INDUSTRY'].includes(vertical) : req.body.safety_enabled === true
+      }
+    }));
+    await pool.query(`
+      INSERT INTO control_center_settings(control_center_id, settings, updated_by, updated_at)
+      VALUES($1,$2::jsonb,$3,NOW())
+      ON CONFLICT(control_center_id) DO UPDATE SET settings=EXCLUDED.settings, updated_by=EXCLUDED.updated_by, updated_at=NOW()
+    `, [result.rows[0].id, JSON.stringify(nextSettings), req.panel_session?.sub || null]);
+
+    res.json({ status: "ok", control_center: { ...result.rows[0], vertical, safety_enabled: nextSettings.safety_modules.enabled }, settings: nextSettings });
   } catch (error) {
     console.error("[SUPERADMIN CONTROL CENTER UPSERT ERROR]", error);
     res.status(500).json({ status: "error", message: error.message });
@@ -14710,6 +14852,14 @@ app.put("/admin/control-centers/:code/settings", async (req, res) => {
     // La licencia comercial es propiedad de VS&TI/SuperAdmin. Un ADMIN
     // municipal puede administrar contenido, pero no auto-habilitar el módulo.
     nextSettings.communications_module = normalizeControlCenterSettings(currentSettings).communications_module;
+    // La vertical y la licencia Safety son atributos comerciales administrados
+    // por SuperAdmin. El token legado se conserva como mecanismo controlado de
+    // migración/seed, pero un ADMIN autenticado no puede elevar su plan.
+    if (!req.admin_legacy_token && !isSuperAdminSession(req.panel_session)) {
+      const normalizedCurrent = normalizeControlCenterSettings(currentSettings);
+      nextSettings.vertical = normalizedCurrent.vertical;
+      nextSettings.safety_modules = normalizedCurrent.safety_modules;
+    }
     const actorId = req.panel_session?.sub || null;
 
     await pool.query(
@@ -16510,6 +16660,16 @@ app.post('/debug/sector/lookup', async (req, res) => {
 // Preparar esquema de sectores al iniciar para que /tickets, mapa y Luc-IA puedan leer columnas event_sector_*.
 ensureSectorSchema().catch((error) => {
   console.warn('[SECTOR SCHEMA STARTUP WARNING]', error.message);
+});
+
+registerSafetyModule({
+  app,
+  pool,
+  checkAdminToken,
+  checkRoleAccess,
+  requestedControlCenterForSession,
+  adminResolveControlCenter,
+  getControlCenterSettingsById
 });
 
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
