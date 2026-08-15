@@ -14579,6 +14579,15 @@ app.post("/superadmin/control-centers", async (req, res) => {
     }
     if (!name) return res.status(400).json({ status: "error", message: "name is required" });
 
+    // Consult before the upsert so a newly-created center does not inherit the
+    // CITY seed row inserted by ensureControlCenterSettingsSchema(). Vertical
+    // defaults must be applied before any center-specific overrides.
+    const existingCenterResult = await pool.query(
+      `SELECT id FROM control_centers WHERE code = $1 LIMIT 1`,
+      [code]
+    );
+    const isNewControlCenter = !existingCenterResult.rows[0];
+
     const result = await pool.query(`
       INSERT INTO control_centers (
         code, name, municipality, region, country, latitude, longitude,
@@ -14609,8 +14618,22 @@ app.post("/superadmin/control-centers", async (req, res) => {
     ]);
 
     await ensureControlCenterSettingsSchema();
-    const currentSettingsRow = await getControlCenterSettingsById(result.rows[0].id);
-    const nextSettings = normalizeControlCenterSettings(deepMergeSettings(currentSettingsRow?.settings || {}, {
+    const currentSettingsRow = isNewControlCenter ? null : await getControlCenterSettingsById(result.rows[0].id);
+    const currentSettings = deepMergeSettings({}, currentSettingsRow?.settings || {});
+    const currentTerminology = currentSettings.terminology || {};
+    const carriesCitySeedTerminology = vertical !== 'CITY'
+      && Object.keys(DEFAULT_CONTROL_CENTER_SETTINGS.terminology).every(
+        key => currentTerminology[key] === DEFAULT_CONTROL_CENTER_SETTINGS.terminology[key]
+      );
+
+    // Repair early MINING/INDUSTRY records that were created with the complete
+    // CITY seed object. This only removes the known seed terminology; genuine
+    // center-specific terminology remains untouched.
+    if (isNewControlCenter || carriesCitySeedTerminology) {
+      delete currentSettings.terminology;
+    }
+
+    const nextSettings = normalizeControlCenterSettings(deepMergeSettings(currentSettings, {
       vertical,
       branding: {
         organizationName: municipality || name,

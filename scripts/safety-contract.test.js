@@ -15,6 +15,8 @@ assert.match(server, /MINING[\s\S]*Trabajador[\s\S]*Brigadista/, "MINING debe pa
 assert.match(server, /INDUSTRY[\s\S]*Colaborador[\s\S]*Equipo de Emergencia/, "INDUSTRY debe parametrizar terminología visible");
 assert.match(server, /DEFAULT_CONTROL_CENTER_SETTINGS[\s\S]*vertical: 'CITY'/, "CITY debe seguir siendo la vertical predeterminada para compatibilidad");
 assert.match(server, /CITY: \{\}/, "CITY no debe alterar los valores operacionales existentes");
+assert.match(server, /isNewControlCenter[\s\S]*delete currentSettings\.terminology/, "un Centro nuevo debe aplicar la terminología predeterminada de su vertical");
+assert.match(server, /carriesCitySeedTerminology[\s\S]*delete currentSettings\.terminology/, "MINING e INDUSTRY deben reparar la terminología CITY sembrada por compatibilidad");
 
 for (const table of [
   "safety_incidents", "safety_actions", "safety_inspections", "safety_critical_controls",
