@@ -271,9 +271,9 @@ function getRemoteIp(req) {
    CONTROL CENTER PLATFORM SETTINGS
    =========================================================
 
-   Configuración multi-municipal por centro de control. Evita dejar
+   Configuración multi-vertical por centro de control. Evita dejar
    políticas de operación hardcodeadas por ambiente y permite que cada
-   municipalidad habilite/deshabilite funcionalidades propias.
+   organización habilite/deshabilite funcionalidades propias.
 */
 
 let controlCenterSettingsSchemaReady = false;
@@ -281,15 +281,28 @@ let emergencyCategoryCatalogSchemaReady = false;
 let municipalQrSchemaReady = false;
 let communicationsSchemaReady = false;
 
+const VALID_CONTROL_CENTER_VERTICALS = Object.freeze(['CITY', 'MINING', 'INDUSTRY']);
+const ALL_CONTROL_CENTER_VERTICALS = Object.freeze([...VALID_CONTROL_CENTER_VERTICALS]);
+
+// Catálogo técnico único. `verticals` determina en qué perfiles puede ser
+// configurada cada categoría; el Centro de Control sigue decidiendo cuáles
+// habilita, cómo las ordena y qué nombre visible utiliza.
 const DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES = Object.freeze([
-  { type: 'SOS_MANUAL', title: 'SOS General', icon: '🚨', color: '#dc2626', priority: 1, enabled: true, order: 10, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
-  { type: 'MEDICAL', title: 'Médica', icon: '🚑', color: '#16a34a', priority: 1, enabled: true, order: 20, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
-  { type: 'FIRE', title: 'Incendio', icon: '🔥', color: '#f97316', priority: 1, enabled: true, order: 30, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
-  { type: 'SECURITY', title: 'Seguridad', icon: '👮', color: '#7c3aed', priority: 2, enabled: true, order: 40, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: true },
-  { type: 'VIF', title: 'VIF', icon: '🏠', color: '#8b5cf6', priority: 1, enabled: true, order: 50, sensitive: true, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
-  { type: 'TRAFFIC_ACCIDENT', title: 'Accidente', icon: '🚗', color: '#2563eb', priority: 2, enabled: true, order: 60, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
-  { type: 'URBAN_RISK', title: 'Riesgo', icon: '⚠️', color: '#eab308', priority: 3, enabled: true, order: 70, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
-  { type: 'OTHER', title: 'Otro', icon: '📝', color: '#64748b', priority: 3, enabled: true, order: 80, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false }
+  { type: 'SOS_MANUAL', title: 'SOS General', icon: '🚨', color: '#dc2626', priority: 1, enabled: true, order: 10, verticals: ALL_CONTROL_CENTER_VERTICALS, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'MEDICAL', title: 'Emergencia médica', icon: '🚑', color: '#16a34a', priority: 1, enabled: true, order: 20, verticals: ALL_CONTROL_CENTER_VERTICALS, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'FIRE', title: 'Incendio', icon: '🔥', color: '#f97316', priority: 1, enabled: true, order: 30, verticals: ALL_CONTROL_CENTER_VERTICALS, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
+  { type: 'SECURITY', title: 'Seguridad', icon: '🛡️', color: '#7c3aed', priority: 2, enabled: true, order: 40, verticals: ALL_CONTROL_CENTER_VERTICALS, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: true },
+  { type: 'VIF', title: 'VIF', icon: '🏠', color: '#8b5cf6', priority: 1, enabled: true, order: 50, verticals: ['CITY'], sensitive: true, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false },
+  { type: 'TRAFFIC_ACCIDENT', title: 'Accidente de tránsito', icon: '🚗', color: '#2563eb', priority: 2, enabled: true, order: 60, verticals: ['CITY'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'URBAN_RISK', title: 'Riesgo urbano', icon: '⚠️', color: '#eab308', priority: 3, enabled: true, order: 70, verticals: ['CITY'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'NEAR_MISS', title: 'Cuasi accidente', icon: '⚠️', color: '#f59e0b', priority: 2, enabled: true, order: 110, verticals: ['MINING', 'INDUSTRY'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'EQUIPMENT_INCIDENT', title: 'Incidente con equipo', icon: '🚜', color: '#ea580c', priority: 2, enabled: true, order: 120, verticals: ['MINING', 'INDUSTRY'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'HAZARDOUS_MATERIAL', title: 'Sustancia peligrosa', icon: '☣️', color: '#9333ea', priority: 1, enabled: true, order: 130, verticals: ['MINING', 'INDUSTRY'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
+  { type: 'ENVIRONMENTAL_INCIDENT', title: 'Incidente ambiental', icon: '🌱', color: '#15803d', priority: 2, enabled: true, order: 140, verticals: ['MINING', 'INDUSTRY'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: false },
+  { type: 'GEOTECHNICAL_RISK', title: 'Riesgo geotécnico', icon: '⛰️', color: '#92400e', priority: 1, enabled: true, order: 150, verticals: ['MINING'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
+  { type: 'MINE_RESCUE', title: 'Rescate minero', icon: '⛑️', color: '#b91c1c', priority: 1, enabled: true, order: 160, verticals: ['MINING'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
+  { type: 'PROCESS_SAFETY', title: 'Seguridad de procesos', icon: '🏭', color: '#0369a1', priority: 1, enabled: true, order: 170, verticals: ['INDUSTRY'], sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: true, allow_sirens: true },
+  { type: 'OTHER', title: 'Otro', icon: '📝', color: '#64748b', priority: 3, enabled: true, order: 900, verticals: ALL_CONTROL_CENTER_VERTICALS, sensitive: false, allow_voice: true, allow_evidence: true, allow_nearby_notifications: false, allow_sirens: false }
 ]);
 
 let emergencyCategoryCatalogCache = DEFAULT_NEIGHBOR_EMERGENCY_CATEGORIES.map(category => ({ ...category }));
@@ -454,6 +467,13 @@ function normalizeEmergencyCategoryCatalogItem(raw = {}, fallback = {}) {
   const icon = String(raw.icon || fallback.icon || '🆘').trim().slice(0, 12);
   const color = String(raw.color || fallback.color || '#2563eb').trim().slice(0, 24);
 
+  const requestedVerticals = Array.isArray(raw.verticals)
+    ? raw.verticals
+    : (Array.isArray(raw.metadata?.verticals) ? raw.metadata.verticals : fallback.verticals);
+  const verticals = [...new Set((Array.isArray(requestedVerticals) ? requestedVerticals : ALL_CONTROL_CENTER_VERTICALS)
+    .map(value => String(value || '').trim().toUpperCase())
+    .filter(value => VALID_CONTROL_CENTER_VERTICALS.includes(value)))];
+
   return {
     type,
     title: title || type,
@@ -466,7 +486,8 @@ function normalizeEmergencyCategoryCatalogItem(raw = {}, fallback = {}) {
     allow_voice: normalizePolicyBoolean(raw.allow_voice, fallback.allow_voice !== false),
     allow_evidence: normalizePolicyBoolean(raw.allow_evidence, fallback.allow_evidence !== false),
     allow_nearby_notifications: normalizePolicyBoolean(raw.allow_nearby_notifications, fallback.allow_nearby_notifications === true),
-    allow_sirens: normalizePolicyBoolean(raw.allow_sirens, fallback.allow_sirens === true)
+    allow_sirens: normalizePolicyBoolean(raw.allow_sirens, fallback.allow_sirens === true),
+    verticals: verticals.length ? verticals : [...ALL_CONTROL_CENTER_VERTICALS]
   };
 }
 
@@ -489,8 +510,13 @@ function normalizeEmergencyCategoryCatalog(input = []) {
   });
 }
 
-function normalizeNeighborEmergencyCategories(input = [], catalog = currentEmergencyCategoryCatalog()) {
-  const availableCatalog = normalizeEmergencyCategoryCatalog(catalog).filter(category => category.enabled !== false);
+function normalizeNeighborEmergencyCategories(input = [], catalog = currentEmergencyCategoryCatalog(), vertical = 'CITY') {
+  const effectiveVertical = VALID_CONTROL_CENTER_VERTICALS.includes(String(vertical || '').toUpperCase())
+    ? String(vertical).toUpperCase()
+    : 'CITY';
+  const availableCatalog = normalizeEmergencyCategoryCatalog(catalog).filter(category => (
+    category.enabled !== false && category.verticals.includes(effectiveVertical)
+  ));
   const byType = new Map(availableCatalog.map(category => [category.type, {
     type: category.type,
     title: category.title,
@@ -499,7 +525,13 @@ function normalizeNeighborEmergencyCategories(input = [], catalog = currentEmerg
     priority: category.priority,
     enabled: category.enabled !== false,
     order: category.order,
-    title_override: null
+    title_override: null,
+    sensitive: category.sensitive === true,
+    allow_voice: category.allow_voice !== false,
+    allow_evidence: category.allow_evidence !== false,
+    allow_nearby_notifications: category.allow_nearby_notifications === true,
+    allow_sirens: category.allow_sirens === true,
+    verticals: [...category.verticals]
   }]));
   const source = Array.isArray(input) ? input : [];
 
@@ -521,7 +553,13 @@ function normalizeNeighborEmergencyCategories(input = [], catalog = currentEmerg
       color: String(raw.color || fallback.color || '#2563eb').trim().slice(0, 24),
       priority: clampPolicyNumber(raw.priority, fallback.priority, 1, 5),
       enabled: normalizePolicyBoolean(raw.enabled, fallback.enabled !== false),
-      order: clampPolicyNumber(raw.order, fallback.order || ((index + 1) * 10), 1, 999)
+      order: clampPolicyNumber(raw.order, fallback.order || ((index + 1) * 10), 1, 999),
+      sensitive: fallback.sensitive,
+      allow_voice: fallback.allow_voice,
+      allow_evidence: fallback.allow_evidence,
+      allow_nearby_notifications: fallback.allow_nearby_notifications,
+      allow_sirens: fallback.allow_sirens,
+      verticals: [...fallback.verticals]
     });
   }
 
@@ -584,9 +622,10 @@ async function ensureEmergencyCategoryCatalogSchema() {
         allow_voice,
         allow_evidence,
         allow_nearby_notifications,
-        allow_sirens
+        allow_sirens,
+        metadata
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
       ON CONFLICT (category_type) DO NOTHING
       `,
       [
@@ -601,7 +640,8 @@ async function ensureEmergencyCategoryCatalogSchema() {
         category.allow_voice !== false,
         category.allow_evidence !== false,
         category.allow_nearby_notifications === true,
-        category.allow_sirens === true
+        category.allow_sirens === true,
+        JSON.stringify({ verticals: category.verticals || ALL_CONTROL_CENTER_VERTICALS })
       ]
     );
   }
@@ -644,7 +684,18 @@ function normalizeControlCenterSettings(input = {}) {
   const requestedVertical = String(input?.vertical || DEFAULT_CONTROL_CENTER_SETTINGS.vertical).trim().toUpperCase();
   const vertical = Object.prototype.hasOwnProperty.call(VERTICAL_CONTROL_CENTER_DEFAULTS, requestedVertical) ? requestedVertical : 'CITY';
   const verticalDefaults = VERTICAL_CONTROL_CENTER_DEFAULTS[vertical] || {};
-  const merged = deepMergeSettings(deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS, verticalDefaults), input || {});
+  const effectiveInput = deepMergeSettings({}, input || {});
+  const storedTerminology = effectiveInput.terminology || {};
+  const carriesLegacyCitySeedTerminology = vertical !== 'CITY'
+    && Object.keys(DEFAULT_CONTROL_CENTER_SETTINGS.terminology).every(
+      key => storedTerminology[key] === DEFAULT_CONTROL_CENTER_SETTINGS.terminology[key]
+    );
+  // Los primeros centros no-CITY heredaron el objeto CITY completo cuando aún
+  // no existían verticales. Se ignora únicamente esa copia exacta del seed;
+  // cualquier terminología personalizada del Centro de Control se conserva.
+  if (carriesLegacyCitySeedTerminology) delete effectiveInput.terminology;
+
+  const merged = deepMergeSettings(deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS, verticalDefaults), effectiveInput);
   merged.vertical = vertical;
 
   merged.branding = merged.branding || {};
@@ -745,7 +796,11 @@ function normalizeControlCenterSettings(input = {}) {
   })).sort((a, b) => a.order - b.order);
 
   merged.neighbor_app = merged.neighbor_app || {};
-  merged.neighbor_app.emergency_categories = normalizeNeighborEmergencyCategories(merged.neighbor_app.emergency_categories);
+  merged.neighbor_app.emergency_categories = normalizeNeighborEmergencyCategories(
+    merged.neighbor_app.emergency_categories,
+    currentEmergencyCategoryCatalog(),
+    vertical
+  );
 
   return merged;
 }
@@ -14489,10 +14544,37 @@ app.put("/superadmin/emergency-categories", async (req, res) => {
   if (!requireSuperAdmin(req, res)) return;
   try {
     await ensureEmergencyCategoryCatalogSchema();
-    const categories = normalizeEmergencyCategoryCatalog(req.body?.categories || req.body || []);
+    const rawCategories = req.body?.categories || req.body || [];
+    if (!Array.isArray(rawCategories)) {
+      return res.status(400).json({ status: "error", message: "categories debe ser un arreglo" });
+    }
+    for (const raw of rawCategories) {
+      const requested = Array.isArray(raw?.verticals) ? raw.verticals : raw?.metadata?.verticals;
+      if (Array.isArray(requested)) {
+        const valid = requested
+          .map(value => String(value || '').trim().toUpperCase())
+          .filter(value => VALID_CONTROL_CENTER_VERTICALS.includes(value));
+        if (!valid.length) {
+          return res.status(400).json({
+            status: "error",
+            message: `La categoría ${String(raw?.type || raw?.category_type || '').trim().toUpperCase() || 'sin código'} debe aplicar al menos a una vertical`
+          });
+        }
+      }
+    }
+    const categories = normalizeEmergencyCategoryCatalog(rawCategories);
 
     if (!categories.length) {
       return res.status(400).json({ status: "error", message: "Debe enviar al menos una categoría" });
+    }
+
+    for (const vertical of VALID_CONTROL_CENTER_VERTICALS) {
+      if (!categories.some(category => category.enabled !== false && category.verticals.includes(vertical))) {
+        return res.status(400).json({
+          status: "error",
+          message: `Debe quedar al menos una categoría activa para ${vertical}`
+        });
+      }
     }
 
     for (const category of categories) {
@@ -14511,9 +14593,10 @@ app.put("/superadmin/emergency-categories", async (req, res) => {
           allow_evidence,
           allow_nearby_notifications,
           allow_sirens,
+          metadata,
           updated_at
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,NOW())
         ON CONFLICT (category_type) DO UPDATE SET
           title = EXCLUDED.title,
           icon = EXCLUDED.icon,
@@ -14526,6 +14609,7 @@ app.put("/superadmin/emergency-categories", async (req, res) => {
           allow_evidence = EXCLUDED.allow_evidence,
           allow_nearby_notifications = EXCLUDED.allow_nearby_notifications,
           allow_sirens = EXCLUDED.allow_sirens,
+          metadata = EXCLUDED.metadata,
           updated_at = NOW()
         `,
         [
@@ -14540,7 +14624,8 @@ app.put("/superadmin/emergency-categories", async (req, res) => {
           category.allow_voice !== false,
           category.allow_evidence !== false,
           category.allow_nearby_notifications === true,
-          category.allow_sirens === true
+          category.allow_sirens === true,
+          JSON.stringify({ verticals: category.verticals || ALL_CONTROL_CENTER_VERTICALS })
         ]
       );
     }
@@ -14701,7 +14786,7 @@ app.post("/superadmin/control-centers/:code/admin", async (req, res) => {
       validation_status: req.body?.validation_status || "VALIDATED",
       is_active: req.body?.is_active ?? true
     }, req.panel_session);
-    res.json({ status: "ok", message: "Administrador municipal creado/actualizado", operation: result.operation, user: result.user });
+    res.json({ status: "ok", message: "Administrador del Centro de Control creado/actualizado", operation: result.operation, user: result.user });
   } catch (error) {
     console.error("[SUPERADMIN CREATE MUNICIPAL ADMIN ERROR]", error);
     res.status(400).json({ status: "error", message: error.message });

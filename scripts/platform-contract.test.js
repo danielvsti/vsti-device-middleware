@@ -105,6 +105,39 @@ assert(
   "La llamada data-only debe identificar el canal nativo sos_calls"
 );
 
+for (const vertical of ["CITY", "MINING", "INDUSTRY"]) {
+  assert(
+    server.includes(`'${vertical}'`),
+    `La configuración debe reconocer la vertical ${vertical}`
+  );
+}
+for (const miningCategory of [
+  "NEAR_MISS",
+  "EQUIPMENT_INCIDENT",
+  "HAZARDOUS_MATERIAL",
+  "ENVIRONMENTAL_INCIDENT",
+  "GEOTECHNICAL_RISK",
+  "MINE_RESCUE"
+]) {
+  assert(server.includes(`type: '${miningCategory}'`), `Falta la categoría operacional ${miningCategory}`);
+}
+assert(
+  server.includes("category.verticals.includes(effectiveVertical)"),
+  "Las categorías efectivas deben filtrarse por la vertical del Centro de Control"
+);
+assert(
+  server.includes("carriesLegacyCitySeedTerminology"),
+  "Los centros MINING/INDUSTRY deben reparar la terminología CITY heredada del seed"
+);
+assert(
+  server.includes("Array.isArray(raw.metadata?.verticals)"),
+  "El catálogo debe leer la aplicabilidad por vertical desde metadata"
+);
+assert(
+  server.includes("JSON.stringify({ verticals: category.verticals || ALL_CONTROL_CENTER_VERTICALS })"),
+  "SuperAdmin debe persistir la aplicabilidad por vertical en metadata"
+);
+
 for (const migration of [
   "db/migrations/20260709_emergency_category_catalog.sql",
   "db/migrations/20260712_municipal_communications.sql"
