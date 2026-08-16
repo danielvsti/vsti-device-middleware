@@ -191,3 +191,34 @@ CREATE TABLE IF NOT EXISTS safety_ticket_risk_assessments (
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_safety_ticket_risk_ticket ON safety_ticket_risk_assessments(ticket_id, assessed_at DESC);
+
+ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS investigation_notes TEXT;
+ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS recommendations TEXT;
+ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS updated_by UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+ALTER TABLE safety_control_verifications ADD COLUMN IF NOT EXISTS ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_safety_inspections_ticket ON safety_inspections(linked_ticket_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_safety_control_verifications_ticket ON safety_control_verifications(ticket_id, verified_at DESC);
+
+CREATE TABLE IF NOT EXISTS safety_ticket_closure_requests (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+  ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  incident_id UUID REFERENCES safety_incidents(id) ON DELETE SET NULL,
+  status VARCHAR(24) NOT NULL DEFAULT 'REQUESTED',
+  request_summary TEXT NOT NULL,
+  requested_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  requested_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  decided_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  decided_at TIMESTAMP,
+  decision_notes TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_safety_closure_requests_cc_status
+  ON safety_ticket_closure_requests(control_center_id, status, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_safety_closure_requests_ticket
+  ON safety_ticket_closure_requests(ticket_id, requested_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_safety_closure_request_pending_ticket
+  ON safety_ticket_closure_requests(ticket_id) WHERE status='REQUESTED';

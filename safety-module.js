@@ -13,6 +13,7 @@ const SAFETY_STATUSES = Object.freeze({
 const RISK_PHASES = new Set(["INITIAL", "RESIDUAL"]);
 const FREQUENCY_SOURCES = new Set(["PROFESSIONAL_ESTIMATE", "SYSTEM_SUGGESTION"]);
 const PNR_STATUSES = new Set(["DRAFT", "PUBLISHED", "ARCHIVED"]);
+const CLOSURE_DECISIONS = new Set(["APPROVED", "REJECTED"]);
 const MAX_PNR_BYTES = 12 * 1024 * 1024;
 
 function text(value, max = 500) {
@@ -89,7 +90,9 @@ function registerSafetyModule({
   checkTicketParticipantAccess,
   requestedControlCenterForSession,
   adminResolveControlCenter,
-  getControlCenterSettingsById
+  getControlCenterSettingsById,
+  syncMobileEventStateFromTicket,
+  releaseResolverFromTicket
 }) {
   let schemaPromise = null;
 
@@ -282,6 +285,33 @@ function registerSafetyModule({
           created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_safety_ticket_risk_ticket ON safety_ticket_risk_assessments(ticket_id, assessed_at DESC);
+
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS investigation_notes TEXT;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS recommendations TEXT;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS updated_by UUID REFERENCES users(id) ON DELETE SET NULL;
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+        ALTER TABLE safety_control_verifications ADD COLUMN IF NOT EXISTS ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+        CREATE INDEX IF NOT EXISTS idx_safety_inspections_ticket ON safety_inspections(linked_ticket_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_safety_control_verifications_ticket ON safety_control_verifications(ticket_id, verified_at DESC);
+
+        CREATE TABLE IF NOT EXISTS safety_ticket_closure_requests (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+          ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+          incident_id UUID REFERENCES safety_incidents(id) ON DELETE SET NULL,
+          status VARCHAR(24) NOT NULL DEFAULT 'REQUESTED',
+          request_summary TEXT NOT NULL,
+          requested_by UUID REFERENCES users(id) ON DELETE SET NULL,
+          requested_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          decided_by UUID REFERENCES users(id) ON DELETE SET NULL,
+          decided_at TIMESTAMP,
+          decision_notes TEXT,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_safety_closure_requests_cc_status ON safety_ticket_closure_requests(control_center_id, status, requested_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_safety_closure_requests_ticket ON safety_ticket_closure_requests(ticket_id, requested_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_safety_closure_request_pending_ticket ON safety_ticket_closure_requests(ticket_id) WHERE status='REQUESTED';
       `);
     })().catch((error) => {
       schemaPromise = null;
@@ -363,16 +393,45 @@ function registerSafetyModule({
 
   async function ticketSafetyContext(ticketId) {
     const result = await pool.query(
-      `SELECT t.id,t.control_center_id,t.alert_type,t.event_sector_name,t.citizen_user_id,t.assigned_resolver_id,
+      `SELECT t.id,t.control_center_id,t.title,t.description,t.state,t.created_at,t.alert_type,t.event_sector_name,t.citizen_user_id,t.assigned_resolver_id,
               cc.code AS control_center_code,cc.name AS control_center_name,
-              COALESCE(u.work_area, '') AS citizen_work_area
+              COALESCE(u.work_area, '') AS citizen_work_area,
+              u.full_name AS citizen_name,
+              resolver.full_name AS resolver_name
        FROM tickets t
        JOIN control_centers cc ON cc.id=t.control_center_id
        LEFT JOIN users u ON u.id=t.citizen_user_id
+       LEFT JOIN users resolver ON resolver.id=t.assigned_resolver_id
        WHERE t.id=$1`,
       [ticketId]
     );
     return result.rows[0] || null;
+  }
+
+  async function ensureTicketIncident(ticket, createdBy = null) {
+    const existing = await pool.query(
+      `SELECT * FROM safety_incidents WHERE linked_ticket_id=$1 ORDER BY created_at ASC LIMIT 1`,
+      [ticket.id]
+    );
+    if (existing.rows.length) return existing.rows[0];
+    const created = await pool.query(
+      `INSERT INTO safety_incidents(
+         control_center_id,linked_ticket_id,title,event_type,severity,occurred_at,area,description,
+         investigation_status,created_by,updated_by
+       ) VALUES($1,$2,$3,$4,'MEDIUM',$5,$6,$7,'OPEN',$8,$8)
+       RETURNING *`,
+      [
+        ticket.control_center_id,
+        ticket.id,
+        text(ticket.title, 180) || `Caso ${String(ticket.id).slice(0, 8)}`,
+        text(ticket.alert_type || "INCIDENT", 80).toUpperCase(),
+        ticket.created_at || new Date().toISOString(),
+        text(ticket.citizen_work_area || ticket.event_sector_name, 180) || null,
+        text(ticket.description, 8000) || null,
+        createdBy
+      ]
+    );
+    return created.rows[0];
   }
 
   async function applicablePnr(controlCenterId, area) {
@@ -488,12 +547,37 @@ function registerSafetyModule({
       if (!(await checkTicketParticipantAccess(req, res, req.params.ticketId))) return;
       const ticket = await ticketSafetyContext(req.params.ticketId);
       if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
-      const [documents, assessments, suggestion] = await Promise.all([
+      const [documents, assessments, suggestion, incidentResult, closureResult, controlsResult, inspectionsResult, verificationsResult] = await Promise.all([
         applicablePnr(ticket.control_center_id, ticket.citizen_work_area || ticket.event_sector_name || ""),
         pool.query(`SELECT r.*,u.full_name AS assessed_by_name FROM safety_ticket_risk_assessments r LEFT JOIN users u ON u.id=r.assessed_by WHERE r.ticket_id=$1 ORDER BY r.assessed_at DESC`, [ticket.id]),
-        frequencySuggestion(ticket.control_center_id, ticket)
+        frequencySuggestion(ticket.control_center_id, ticket),
+        pool.query(`SELECT * FROM safety_incidents WHERE linked_ticket_id=$1 ORDER BY created_at ASC LIMIT 1`, [ticket.id]),
+        pool.query(`SELECT c.*, requester.full_name AS requested_by_name, decider.full_name AS decided_by_name FROM safety_ticket_closure_requests c LEFT JOIN users requester ON requester.id=c.requested_by LEFT JOIN users decider ON decider.id=c.decided_by WHERE c.ticket_id=$1 ORDER BY c.requested_at DESC LIMIT 1`, [ticket.id]),
+        pool.query(`SELECT id,code,hazard,name,verification_question,performance_standard,active FROM safety_critical_controls WHERE control_center_id=$1 AND active=true ORDER BY code`, [ticket.control_center_id]),
+        pool.query(`SELECT * FROM safety_inspections WHERE linked_ticket_id=$1 ORDER BY created_at DESC`, [ticket.id]),
+        pool.query(`SELECT v.*,c.code AS control_code,c.name AS control_name FROM safety_control_verifications v JOIN safety_critical_controls c ON c.id=v.control_id WHERE v.ticket_id=$1 ORDER BY v.verified_at DESC`, [ticket.id])
       ]);
-      res.json({ status: "ok", ticket: { id: ticket.id, alert_type: ticket.alert_type, work_area: ticket.citizen_work_area || ticket.event_sector_name || null }, pnr_documents: documents, risk_assessments: assessments.rows, frequency_suggestion: suggestion, scale: { severity: { 1: "Leve", 2: "Menor", 3: "Seria", 4: "Grave", 5: "Crítica" }, frequency: { 1: "Rara", 2: "Poco probable", 3: "Posible", 4: "Probable", 5: "Frecuente" } } });
+      res.json({
+        status: "ok",
+        ticket: {
+          id: ticket.id,
+          title: ticket.title,
+          state: ticket.state,
+          alert_type: ticket.alert_type,
+          work_area: ticket.citizen_work_area || ticket.event_sector_name || null,
+          citizen_name: ticket.citizen_name || null,
+          resolver_name: ticket.resolver_name || null
+        },
+        pnr_documents: documents,
+        risk_assessments: assessments.rows,
+        incident: incidentResult.rows[0] || null,
+        closure_request: closureResult.rows[0] || null,
+        critical_controls: controlsResult.rows,
+        inspections: inspectionsResult.rows,
+        control_verifications: verificationsResult.rows,
+        frequency_suggestion: suggestion,
+        scale: { severity: { 1: "Leve", 2: "Menor", 3: "Seria", 4: "Grave", 5: "Crítica" }, frequency: { 1: "Rara", 2: "Poco probable", 3: "Posible", 4: "Probable", 5: "Frecuente" } }
+      });
     } catch (error) { res.status(500).json({ status: "error", message: error.message }); }
   });
 
@@ -523,6 +607,270 @@ function registerSafetyModule({
       );
       res.status(201).json({ status: "ok", risk_assessment: result.rows[0], frequency_suggestion: suggestion });
     } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.patch("/resolver/tickets/:ticketId/safety/investigation", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      if (!(await checkTicketParticipantAccess(req, res, req.params.ticketId))) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      if (["RESOLVED", "CLOSED", "CANCELLED"].includes(String(ticket.state || "").toUpperCase())) {
+        return res.status(409).json({ status: "error", message: "El caso ya está finalizado y no admite cambios operativos" });
+      }
+      const incident = await ensureTicketIncident(ticket, actorId(req));
+      const status = enumValue(req.body?.investigation_status, SAFETY_STATUSES.incident, "INVESTIGATING");
+      if (status === "CLOSED") throw new Error("El cierre debe ser aprobado por el Supervisor HSE");
+      const rootCauses = Array.isArray(req.body?.root_causes)
+        ? req.body.root_causes.map((item) => text(item, 500)).filter(Boolean).slice(0, 20)
+        : [];
+      const result = await pool.query(
+        `UPDATE safety_incidents SET
+           description=COALESCE($2,description),
+           immediate_actions=$3,
+           root_causes=$4::jsonb,
+           investigation_notes=$5,
+           recommendations=$6,
+           investigation_status=$7,
+           updated_by=$8,
+           updated_at=NOW()
+         WHERE id=$1
+         RETURNING *`,
+        [
+          incident.id,
+          text(req.body?.description, 8000) || null,
+          text(req.body?.immediate_actions, 8000) || null,
+          JSON.stringify(rootCauses),
+          text(req.body?.investigation_notes, 12000) || null,
+          text(req.body?.recommendations, 8000) || null,
+          status,
+          actorId(req)
+        ]
+      );
+      await pool.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,'RESOLVER','HSE_INVESTIGATION_UPDATED',$3,$4::jsonb)`,
+        [ticket.id, actorId(req), "Profesional HSE actualizó la investigación del caso", JSON.stringify({ incident_id: incident.id, investigation_status: status })]
+      );
+      res.json({ status: "ok", incident: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/tickets/:ticketId/safety/inspections", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      if (!(await checkTicketParticipantAccess(req, res, req.params.ticketId))) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const body = req.body || {};
+      const result = await pool.query(
+        `INSERT INTO safety_inspections(
+           control_center_id,linked_ticket_id,title,inspection_type,area,completed_at,status,result,score,
+           responses,findings,notes,inspector_user_id,created_by
+         ) VALUES($1,$2,$3,$4,$5,NOW(),'COMPLETED',$6,$7,'[]'::jsonb,$8::jsonb,$9,$10,$10)
+         RETURNING *`,
+        [
+          ticket.control_center_id,
+          ticket.id,
+          required(body.title, "Título de inspección", 180),
+          text(body.inspection_type || "FIELD_INSPECTION", 80).toUpperCase(),
+          text(body.area || ticket.citizen_work_area || ticket.event_sector_name, 180) || null,
+          enumValue(body.result, SAFETY_STATUSES.inspectionResult, "NOT_EVALUATED"),
+          numberOrNull(body.score, 0, 100),
+          JSON.stringify(Array.isArray(body.findings) ? body.findings : []),
+          text(body.notes, 5000) || null,
+          actorId(req)
+        ]
+      );
+      await pool.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,'RESOLVER','HSE_INSPECTION_COMPLETED',$3,$4::jsonb)`,
+        [ticket.id, actorId(req), "Profesional HSE registró una inspección en terreno", JSON.stringify({ inspection_id: result.rows[0].id, result: result.rows[0].result })]
+      );
+      res.status(201).json({ status: "ok", inspection: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/tickets/:ticketId/safety/control-verifications", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      if (!(await checkTicketParticipantAccess(req, res, req.params.ticketId))) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const body = req.body || {};
+      const resultValue = enumValue(body.result, SAFETY_STATUSES.verification, null);
+      if (!resultValue) throw new Error("Resultado de verificación inválido");
+      const result = await pool.query(
+        `INSERT INTO safety_control_verifications(
+           control_center_id,control_id,ticket_id,result,area,evidence,notes,verified_by,verified_at
+         )
+         SELECT $1,id,$3,$4,$5,$6::jsonb,$7,$8,NOW()
+         FROM safety_critical_controls WHERE id=$2 AND control_center_id=$1 AND active=true
+         RETURNING *`,
+        [
+          ticket.control_center_id,
+          body.control_id,
+          ticket.id,
+          resultValue,
+          text(body.area || ticket.citizen_work_area || ticket.event_sector_name, 180) || null,
+          JSON.stringify(Array.isArray(body.evidence) ? body.evidence : []),
+          text(body.notes, 3000) || null,
+          actorId(req)
+        ]
+      );
+      if (!result.rows.length) return res.status(404).json({ status: "error", message: "Control crítico no encontrado" });
+      await pool.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,'RESOLVER','HSE_CRITICAL_CONTROL_VERIFIED',$3,$4::jsonb)`,
+        [ticket.id, actorId(req), "Profesional HSE verificó un control crítico", JSON.stringify({ verification_id: result.rows[0].id, control_id: body.control_id, result: resultValue })]
+      );
+      res.status(201).json({ status: "ok", verification: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/tickets/:ticketId/safety/closure-request", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      if (!(await checkTicketParticipantAccess(req, res, req.params.ticketId))) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      if (["RESOLVED", "CLOSED", "CANCELLED"].includes(String(ticket.state || "").toUpperCase())) {
+        return res.status(409).json({ status: "error", message: "El caso ya está finalizado" });
+      }
+      const residualRisk = await pool.query(
+        `SELECT id,score,risk_level FROM safety_ticket_risk_assessments WHERE ticket_id=$1 AND phase='RESIDUAL' ORDER BY assessed_at DESC LIMIT 1`,
+        [ticket.id]
+      );
+      if (!residualRisk.rows.length) throw new Error("Registra la evaluación de riesgo residual antes de solicitar el cierre");
+      const incident = await ensureTicketIncident(ticket, actorId(req));
+      const requestSummary = required(req.body?.request_summary, "Resumen de cierre", 6000);
+      const result = await pool.query(
+        `INSERT INTO safety_ticket_closure_requests(
+           control_center_id,ticket_id,incident_id,status,request_summary,requested_by
+         ) VALUES($1,$2,$3,'REQUESTED',$4,$5)
+         ON CONFLICT(ticket_id) WHERE status='REQUESTED'
+         DO UPDATE SET incident_id=EXCLUDED.incident_id,request_summary=EXCLUDED.request_summary,
+                       requested_by=EXCLUDED.requested_by,requested_at=NOW(),updated_at=NOW()
+         RETURNING *`,
+        [ticket.control_center_id, ticket.id, incident.id, requestSummary, actorId(req)]
+      );
+      await pool.query(
+        `UPDATE safety_incidents SET investigation_status='ACTION_PLAN',updated_by=$2,updated_at=NOW() WHERE id=$1`,
+        [incident.id, actorId(req)]
+      );
+      await pool.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,'RESOLVER','HSE_CLOSURE_REQUESTED',$3,$4::jsonb)`,
+        [ticket.id, actorId(req), "Profesional HSE solicitó aprobación del cierre", JSON.stringify({ closure_request_id: result.rows[0].id, residual_risk: residualRisk.rows[0] })]
+      );
+      res.status(201).json({ status: "ok", closure_request: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.get("/hse/supervisor/closure-requests", async (req, res) => {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Sesión de Supervisor HSE requerida")) return;
+    try {
+      await ensureSchema();
+      let centerId = req.panel_session.control_center_id;
+      if (String(req.panel_session.role || "").toUpperCase() === "SUPER_ADMIN" && req.query.control_center_code) {
+        const center = await adminResolveControlCenter(req, req.query.control_center_code);
+        if (!center) return res.status(404).json({ status: "error", message: "Centro de Control no encontrado" });
+        centerId = center.id;
+      }
+      if (!centerId) return res.status(400).json({ status: "error", message: "Centro de Control requerido" });
+      const settingsRow = await getControlCenterSettingsById(centerId);
+      if (!safetyEnabled(settingsRow?.settings) || String(settingsRow?.settings?.vertical || "CITY").toUpperCase() !== "MINING") {
+        return res.status(403).json({ status: "error", message: "El portal Supervisor HSE no está habilitado para este Centro de Control" });
+      }
+      const status = text(req.query.status || "REQUESTED", 24).toUpperCase();
+      const result = await pool.query(
+        `SELECT c.*,t.title AS ticket_title,t.alert_type,t.state AS ticket_state,t.event_sector_name,
+                requester.full_name AS requested_by_name,resolver.full_name AS resolver_name,
+                incident.investigation_status,incident.investigation_notes,incident.immediate_actions,
+                incident.root_causes,incident.recommendations,
+                risk.score AS residual_risk_score,risk.risk_level AS residual_risk_level
+         FROM safety_ticket_closure_requests c
+         JOIN tickets t ON t.id=c.ticket_id
+         LEFT JOIN users requester ON requester.id=c.requested_by
+         LEFT JOIN users resolver ON resolver.id=t.assigned_resolver_id
+         LEFT JOIN safety_incidents incident ON incident.id=c.incident_id
+         LEFT JOIN LATERAL (
+           SELECT score,risk_level FROM safety_ticket_risk_assessments
+           WHERE ticket_id=t.id AND phase='RESIDUAL' ORDER BY assessed_at DESC LIMIT 1
+         ) risk ON TRUE
+         WHERE c.control_center_id=$1 AND ($2='ALL' OR c.status=$2)
+         ORDER BY CASE WHEN c.status='REQUESTED' THEN 0 ELSE 1 END,c.requested_at DESC
+         LIMIT 100`,
+        [centerId, status]
+      );
+      res.json({ status: "ok", closure_requests: result.rows });
+    } catch (error) { res.status(500).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/hse/supervisor/closure-requests/:id/decision", async (req, res) => {
+    if (!checkRoleAccess(req, res, ["OPERATOR", "ADMIN", "SUPER_ADMIN"], "Sesión de Supervisor HSE requerida")) return;
+    const decision = enumValue(req.body?.decision, CLOSURE_DECISIONS, null);
+    if (!decision) return res.status(400).json({ status: "error", message: "Decisión inválida" });
+    const decisionNotes = text(req.body?.decision_notes, 6000) || null;
+    if (decision === "REJECTED" && !decisionNotes) return res.status(400).json({ status: "error", message: "Indica el motivo del rechazo" });
+    await ensureSchema();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const requestResult = await client.query(
+        `SELECT c.*,t.state AS ticket_state FROM safety_ticket_closure_requests c
+         JOIN tickets t ON t.id=c.ticket_id
+         WHERE c.id=$1 FOR UPDATE`,
+        [req.params.id]
+      );
+      if (!requestResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ status: "error", message: "Solicitud no encontrada" });
+      }
+      const closure = requestResult.rows[0];
+      if (String(req.panel_session.role || "").toUpperCase() !== "SUPER_ADMIN" && String(closure.control_center_id) !== String(req.panel_session.control_center_id)) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ status: "error", message: "Solicitud de otro Centro de Control" });
+      }
+      if (closure.status !== "REQUESTED") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ status: "error", message: "La solicitud ya fue decidida" });
+      }
+      const updated = await client.query(
+        `UPDATE safety_ticket_closure_requests SET status=$2,decided_by=$3,decided_at=NOW(),decision_notes=$4,updated_at=NOW()
+         WHERE id=$1 RETURNING *`,
+        [closure.id, decision, actorId(req), decisionNotes]
+      );
+      if (decision === "APPROVED") {
+        await client.query(`UPDATE tickets SET state='RESOLVED',resolved_at=COALESCE(resolved_at,NOW()),updated_at=NOW() WHERE id=$1`, [closure.ticket_id]);
+        await client.query(`UPDATE safety_incidents SET investigation_status='CLOSED',updated_by=$2,updated_at=NOW() WHERE id=$1`, [closure.incident_id, actorId(req)]);
+      } else {
+        await client.query(`UPDATE safety_incidents SET investigation_status='INVESTIGATING',updated_by=$2,updated_at=NOW() WHERE id=$1`, [closure.incident_id, actorId(req)]);
+      }
+      await client.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,$3,$4,$5,$6::jsonb)`,
+        [
+          closure.ticket_id,
+          actorId(req),
+          String(req.panel_session.role || "OPERATOR").toUpperCase(),
+          decision === "APPROVED" ? "HSE_CLOSURE_APPROVED" : "HSE_CLOSURE_REJECTED",
+          decision === "APPROVED" ? "Supervisor HSE aprobó el cierre" : "Supervisor HSE devolvió el caso al profesional HSE",
+          JSON.stringify({ closure_request_id: closure.id, decision_notes: decisionNotes })
+        ]
+      );
+      await client.query("COMMIT");
+      if (decision === "APPROVED") {
+        if (typeof syncMobileEventStateFromTicket === "function") await syncMobileEventStateFromTicket(closure.ticket_id, "RESOLVED");
+        if (typeof releaseResolverFromTicket === "function") await releaseResolverFromTicket(closure.ticket_id, "HSE_CLOSURE_APPROVED");
+      }
+      res.json({ status: "ok", closure_request: updated.rows[0], ticket_state: decision === "APPROVED" ? "RESOLVED" : closure.ticket_state });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => null);
+      res.status(400).json({ status: "error", message: error.message });
+    } finally {
+      client.release();
+    }
   });
 
   app.post("/admin/control-centers/:code/safety/incidents", async (req, res) => {

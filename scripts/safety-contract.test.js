@@ -42,6 +42,10 @@ assert.match(safetyMigration, /ALTER TABLE users ADD COLUMN IF NOT EXISTS work_a
 assert.match(safety, /\/admin\/control-centers\/:code\/safety\/pnr/, "ADMIN debe gestionar la biblioteca PNR");
 assert.match(safety, /\/mobile\/safety\/pnr/, "la app Trabajador debe consultar PNR aplicables");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/risk/, "la app HSE debe registrar riesgo por ticket");
+assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/inspections/, "la app HSE debe registrar inspecciones asociadas al ticket");
+assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/control-verifications/, "la app HSE debe verificar controles críticos asociados al ticket");
+assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/closure-request/, "el Profesional HSE debe solicitar aprobación del cierre");
+assert.match(safety, /\/hse\/supervisor\/closure-requests/, "el Supervisor HSE debe revisar y decidir solicitudes de cierre");
 assert.match(safety, /severity \* frequency/, "el puntaje de riesgo debe usar una matriz 5x5");
 assert.match(safety, /PROFESSIONAL_ESTIMATE/, "la frecuencia debe aceptar estimación profesional");
 assert.match(safety, /SYSTEM_SUGGESTION/, "la frecuencia debe soportar sugerencia estadística trazable");

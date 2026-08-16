@@ -16787,7 +16787,9 @@ registerSafetyModule({
   checkTicketParticipantAccess,
   requestedControlCenterForSession,
   adminResolveControlCenter,
-  getControlCenterSettingsById
+  getControlCenterSettingsById,
+  syncMobileEventStateFromTicket,
+  releaseResolverFromTicket
 });
 
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 
