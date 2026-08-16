@@ -146,3 +146,48 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_safety_camera_cc_provider_event
   ON safety_camera_events(control_center_id, provider, external_event_id)
   WHERE external_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_safety_camera_cc_date ON safety_camera_events(control_center_id, occurred_at DESC);
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS work_area VARCHAR(180);
+
+CREATE TABLE IF NOT EXISTS safety_pnr_documents (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+  code VARCHAR(80) NOT NULL,
+  title VARCHAR(220) NOT NULL,
+  document_type VARCHAR(24) NOT NULL DEFAULT 'PROCEDURE',
+  work_area VARCHAR(180),
+  version VARCHAR(40) NOT NULL,
+  status VARCHAR(24) NOT NULL DEFAULT 'PUBLISHED',
+  summary TEXT,
+  effective_from DATE,
+  effective_until DATE,
+  file_name VARCHAR(255),
+  mime_type VARCHAR(100),
+  document_data BYTEA,
+  document_url TEXT,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE(control_center_id, code, version),
+  CHECK (document_data IS NOT NULL OR document_url IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_pnr_cc_area ON safety_pnr_documents(control_center_id, work_area, active, status);
+
+CREATE TABLE IF NOT EXISTS safety_ticket_risk_assessments (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+  ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  phase VARCHAR(20) NOT NULL DEFAULT 'INITIAL',
+  severity SMALLINT NOT NULL CHECK (severity BETWEEN 1 AND 5),
+  frequency SMALLINT NOT NULL CHECK (frequency BETWEEN 1 AND 5),
+  score SMALLINT NOT NULL CHECK (score BETWEEN 1 AND 25),
+  risk_level VARCHAR(20) NOT NULL,
+  frequency_source VARCHAR(40) NOT NULL DEFAULT 'PROFESSIONAL_ESTIMATE',
+  suggestion_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  notes TEXT,
+  assessed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  assessed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_safety_ticket_risk_ticket ON safety_ticket_risk_assessments(ticket_id, assessed_at DESC);

@@ -15649,6 +15649,7 @@ async function adminCreateOrUpdateUser(payload, actorSession = null) {
     rut,
     email,
     declared_address,
+    work_area,
     latitude,
     longitude,
     emergency_contacts
@@ -15728,10 +15729,11 @@ async function adminCreateOrUpdateUser(payload, actorSession = null) {
         rut = $6,
         email = $7,
         declared_address = $8,
-        latitude = $9,
-        longitude = $10,
+        work_area = $9,
+        latitude = $10,
+        longitude = $11,
         updated_at = NOW()
-      WHERE id = $11
+      WHERE id = $12
       RETURNING *
       `,
       [
@@ -15743,6 +15745,7 @@ async function adminCreateOrUpdateUser(payload, actorSession = null) {
         rut || null,
         email || null,
         declared_address || null,
+        work_area || null,
         latitude ?? null,
         longitude ?? null,
         existingResult.rows[0].id
@@ -15764,10 +15767,11 @@ async function adminCreateOrUpdateUser(payload, actorSession = null) {
         phone,
         email,
         declared_address,
+        work_area,
         latitude,
         longitude
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       RETURNING *
       `,
       [
@@ -15780,6 +15784,7 @@ async function adminCreateOrUpdateUser(payload, actorSession = null) {
         cleanPhone,
         email || null,
         declared_address || null,
+        work_area || null,
         latitude ?? null,
         longitude ?? null
       ]
@@ -15877,6 +15882,7 @@ app.get("/admin/users", async (req, res) => {
         u.email,
         u.rut,
         u.declared_address,
+        u.work_area,
         u.latitude,
         u.longitude,
         u.validation_status,
@@ -16268,6 +16274,7 @@ app.post("/admin/users/:id/update", async (req, res) => {
       rut,
       email,
       declared_address,
+      work_area,
       latitude,
       longitude
     } = req.body;
@@ -16280,10 +16287,11 @@ app.post("/admin/users/:id/update", async (req, res) => {
         rut = $2,
         email = $3,
         declared_address = $4,
-        latitude = $5,
-        longitude = $6,
+        work_area = $5,
+        latitude = $6,
+        longitude = $7,
         updated_at = NOW()
-      WHERE id = $7
+      WHERE id = $8
       RETURNING *
       `,
       [
@@ -16291,6 +16299,7 @@ app.post("/admin/users/:id/update", async (req, res) => {
         rut || null,
         email || null,
         declared_address || null,
+        work_area || null,
         latitude ?? null,
         longitude ?? null,
         id
@@ -16775,6 +16784,7 @@ registerSafetyModule({
   pool,
   checkAdminToken,
   checkRoleAccess,
+  checkTicketParticipantAccess,
   requestedControlCenterForSession,
   adminResolveControlCenter,
   getControlCenterSettingsById

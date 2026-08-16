@@ -10,6 +10,11 @@ const SAFETY_STATUSES = Object.freeze({
   camera: new Set(["NEW", "ACKNOWLEDGED", "DISMISSED", "LINKED"])
 });
 
+const RISK_PHASES = new Set(["INITIAL", "RESIDUAL"]);
+const FREQUENCY_SOURCES = new Set(["PROFESSIONAL_ESTIMATE", "SYSTEM_SUGGESTION"]);
+const PNR_STATUSES = new Set(["DRAFT", "PUBLISHED", "ARCHIVED"]);
+const MAX_PNR_BYTES = 12 * 1024 * 1024;
+
 function text(value, max = 500) {
   return String(value ?? "").trim().slice(0, max);
 }
@@ -59,11 +64,29 @@ function safetyEnabled(settings) {
   return settings?.safety_modules?.enabled === true;
 }
 
+function riskLevel(score) {
+  if (score >= 17) return "CRITICAL";
+  if (score >= 10) return "HIGH";
+  if (score >= 5) return "MODERATE";
+  return "LOW";
+}
+
+function pnrDocumentBuffer(body = {}) {
+  const raw = text(body.document_base64, 18_000_000).replace(/^data:application\/pdf;base64,/i, "");
+  if (!raw) return null;
+  const buffer = Buffer.from(raw, "base64");
+  if (!buffer.length) throw new Error("El archivo PNR está vacío o no es Base64 válido");
+  if (buffer.length > MAX_PNR_BYTES) throw new Error("El PDF PNR supera el máximo de 12 MB");
+  if (buffer.subarray(0, 4).toString("ascii") !== "%PDF") throw new Error("El documento PNR debe ser un PDF válido");
+  return buffer;
+}
+
 function registerSafetyModule({
   app,
   pool,
   checkAdminToken,
   checkRoleAccess,
+  checkTicketParticipantAccess,
   requestedControlCenterForSession,
   adminResolveControlCenter,
   getControlCenterSettingsById
@@ -214,6 +237,51 @@ function registerSafetyModule({
         );
         CREATE UNIQUE INDEX IF NOT EXISTS uq_safety_camera_cc_provider_event ON safety_camera_events(control_center_id, provider, external_event_id) WHERE external_event_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_safety_camera_cc_date ON safety_camera_events(control_center_id, occurred_at DESC);
+
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS work_area VARCHAR(180);
+
+        CREATE TABLE IF NOT EXISTS safety_pnr_documents (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+          code VARCHAR(80) NOT NULL,
+          title VARCHAR(220) NOT NULL,
+          document_type VARCHAR(24) NOT NULL DEFAULT 'PROCEDURE',
+          work_area VARCHAR(180),
+          version VARCHAR(40) NOT NULL,
+          status VARCHAR(24) NOT NULL DEFAULT 'PUBLISHED',
+          summary TEXT,
+          effective_from DATE,
+          effective_until DATE,
+          file_name VARCHAR(255),
+          mime_type VARCHAR(100),
+          document_data BYTEA,
+          document_url TEXT,
+          active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          UNIQUE(control_center_id, code, version),
+          CHECK (document_data IS NOT NULL OR document_url IS NOT NULL)
+        );
+        CREATE INDEX IF NOT EXISTS idx_safety_pnr_cc_area ON safety_pnr_documents(control_center_id, work_area, active, status);
+
+        CREATE TABLE IF NOT EXISTS safety_ticket_risk_assessments (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+          ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+          phase VARCHAR(20) NOT NULL DEFAULT 'INITIAL',
+          severity SMALLINT NOT NULL CHECK (severity BETWEEN 1 AND 5),
+          frequency SMALLINT NOT NULL CHECK (frequency BETWEEN 1 AND 5),
+          score SMALLINT NOT NULL CHECK (score BETWEEN 1 AND 25),
+          risk_level VARCHAR(20) NOT NULL,
+          frequency_source VARCHAR(40) NOT NULL DEFAULT 'PROFESSIONAL_ESTIMATE',
+          suggestion_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          notes TEXT,
+          assessed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+          assessed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_safety_ticket_risk_ticket ON safety_ticket_risk_assessments(ticket_id, assessed_at DESC);
       `);
     })().catch((error) => {
       schemaPromise = null;
@@ -245,13 +313,14 @@ function registerSafetyModule({
 
   async function listPayload(controlCenterId, limit = 40) {
     const bounded = Math.max(1, Math.min(100, Number(limit) || 40));
-    const [incidents, actions, inspections, controls, observations, cameraEvents, stats] = await Promise.all([
+    const [incidents, actions, inspections, controls, observations, cameraEvents, pnrDocuments, stats] = await Promise.all([
       pool.query(`SELECT * FROM safety_incidents WHERE control_center_id=$1 ORDER BY occurred_at DESC LIMIT $2`, [controlCenterId, bounded]),
       pool.query(`SELECT * FROM safety_actions WHERE control_center_id=$1 ORDER BY created_at DESC LIMIT $2`, [controlCenterId, bounded]),
       pool.query(`SELECT * FROM safety_inspections WHERE control_center_id=$1 ORDER BY COALESCE(scheduled_at, created_at) DESC LIMIT $2`, [controlCenterId, bounded]),
       pool.query(`SELECT c.*, v.result AS latest_result, v.verified_at AS latest_verified_at FROM safety_critical_controls c LEFT JOIN LATERAL (SELECT result, verified_at FROM safety_control_verifications WHERE control_id=c.id ORDER BY verified_at DESC LIMIT 1) v ON TRUE WHERE c.control_center_id=$1 ORDER BY c.code LIMIT $2`, [controlCenterId, bounded]),
       pool.query(`SELECT * FROM safety_behavior_observations WHERE control_center_id=$1 ORDER BY observed_at DESC LIMIT $2`, [controlCenterId, bounded]),
       pool.query(`SELECT * FROM safety_camera_events WHERE control_center_id=$1 ORDER BY occurred_at DESC LIMIT $2`, [controlCenterId, bounded]),
+      pool.query(`SELECT id,code,title,document_type,work_area,version,status,summary,effective_from,effective_until,file_name,mime_type,document_url,active,created_at,updated_at,(document_data IS NOT NULL) AS has_uploaded_file FROM safety_pnr_documents WHERE control_center_id=$1 ORDER BY active DESC, code, created_at DESC LIMIT $2`, [controlCenterId, bounded]),
       pool.query(`
         SELECT
           (SELECT COUNT(*)::int FROM safety_incidents WHERE control_center_id=$1 AND investigation_status <> 'CLOSED') AS open_incidents,
@@ -270,8 +339,68 @@ function registerSafetyModule({
       inspections: inspections.rows,
       critical_controls: controls.rows,
       behavior_observations: observations.rows,
-      camera_events: cameraEvents.rows
+      camera_events: cameraEvents.rows,
+      pnr_documents: pnrDocuments.rows
     };
+  }
+
+  async function frequencySuggestion(controlCenterId, ticket) {
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS sample_size
+       FROM tickets
+       WHERE control_center_id=$1
+         AND alert_type=$2
+         AND created_at >= NOW() - INTERVAL '365 days'`,
+      [controlCenterId, ticket.alert_type]
+    );
+    const sampleSize = Number(result.rows[0]?.sample_size || 0);
+    if (sampleSize < 5) {
+      return { available: false, sample_size: sampleSize, period_days: 365, alert_type: ticket.alert_type, reason: "INSUFFICIENT_HISTORY" };
+    }
+    const value = sampleSize >= 52 ? 5 : sampleSize >= 12 ? 4 : sampleSize >= 4 ? 3 : sampleSize >= 2 ? 2 : 1;
+    return { available: true, value, sample_size: sampleSize, period_days: 365, alert_type: ticket.alert_type, method: "ANNUAL_OCCURRENCE_BANDS_V1" };
+  }
+
+  async function ticketSafetyContext(ticketId) {
+    const result = await pool.query(
+      `SELECT t.id,t.control_center_id,t.alert_type,t.event_sector_name,t.citizen_user_id,t.assigned_resolver_id,
+              cc.code AS control_center_code,cc.name AS control_center_name,
+              COALESCE(u.work_area, '') AS citizen_work_area
+       FROM tickets t
+       JOIN control_centers cc ON cc.id=t.control_center_id
+       LEFT JOIN users u ON u.id=t.citizen_user_id
+       WHERE t.id=$1`,
+      [ticketId]
+    );
+    return result.rows[0] || null;
+  }
+
+  async function applicablePnr(controlCenterId, area) {
+    const normalizedArea = text(area, 180);
+    const result = await pool.query(
+      `SELECT id,code,title,document_type,work_area,version,status,summary,effective_from,effective_until,file_name,mime_type,document_url,updated_at,
+              (document_data IS NOT NULL) AS has_uploaded_file
+       FROM safety_pnr_documents
+       WHERE control_center_id=$1 AND active=true AND status='PUBLISHED'
+         AND (effective_from IS NULL OR effective_from <= CURRENT_DATE)
+         AND (effective_until IS NULL OR effective_until >= CURRENT_DATE)
+         AND (work_area IS NULL OR work_area='' OR UPPER(work_area)='ALL' OR ($2 <> '' AND LOWER(work_area)=LOWER($2)))
+       ORDER BY CASE WHEN work_area IS NULL OR work_area='' OR UPPER(work_area)='ALL' THEN 1 ELSE 0 END, code, version DESC`,
+      [controlCenterId, normalizedArea]
+    );
+    return result.rows;
+  }
+
+  async function mobileSafetyContext(req, res, allowedRoles) {
+    if (!checkRoleAccess(req, res, allowedRoles, "Sesión móvil requerida")) return null;
+    await ensureSchema();
+    const session = req.panel_session;
+    const settingsRow = await getControlCenterSettingsById(session.control_center_id);
+    if (!safetyEnabled(settingsRow?.settings) || String(settingsRow?.settings?.vertical || "CITY").toUpperCase() !== "MINING") {
+      res.status(403).json({ status: "error", code: "SAFETY_MODULE_NOT_AVAILABLE", message: "Seguridad Operacional no está habilitada para este Centro de Control" });
+      return null;
+    }
+    return { session, settings: settingsRow.settings };
   }
 
   app.get("/admin/control-centers/:code/safety/bootstrap", async (req, res) => {
@@ -284,6 +413,116 @@ function registerSafetyModule({
       console.error("[SAFETY BOOTSTRAP ERROR]", error);
       res.status(500).json({ status: "error", message: error.message });
     }
+  });
+
+  app.post("/admin/control-centers/:code/safety/pnr", async (req, res) => {
+    try {
+      const context = await resolveAdminContext(req, res); if (!context) return;
+      const body = req.body || {};
+      const documentData = pnrDocumentBuffer(body);
+      const documentUrl = httpsUrlOrNull(body.document_url);
+      if (!documentData && !documentUrl) throw new Error("Debes cargar un PDF o indicar una URL HTTPS");
+      const status = enumValue(body.status, PNR_STATUSES, "PUBLISHED");
+      const result = await pool.query(
+        `INSERT INTO safety_pnr_documents(control_center_id,code,title,document_type,work_area,version,status,summary,effective_from,effective_until,file_name,mime_type,document_data,document_url,active,created_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         ON CONFLICT(control_center_id,code,version) DO UPDATE SET title=EXCLUDED.title,document_type=EXCLUDED.document_type,work_area=EXCLUDED.work_area,status=EXCLUDED.status,summary=EXCLUDED.summary,effective_from=EXCLUDED.effective_from,effective_until=EXCLUDED.effective_until,file_name=COALESCE(EXCLUDED.file_name,safety_pnr_documents.file_name),mime_type=COALESCE(EXCLUDED.mime_type,safety_pnr_documents.mime_type),document_data=COALESCE(EXCLUDED.document_data,safety_pnr_documents.document_data),document_url=COALESCE(EXCLUDED.document_url,safety_pnr_documents.document_url),active=EXCLUDED.active,updated_at=NOW()
+         RETURNING id,code,title,document_type,work_area,version,status,summary,effective_from,effective_until,file_name,mime_type,document_url,active,created_at,updated_at,(document_data IS NOT NULL) AS has_uploaded_file`,
+        [context.center.id, required(body.code, "Código", 80).toUpperCase(), required(body.title, "Título", 220), text(body.document_type || "PROCEDURE", 24).toUpperCase(), text(body.work_area, 180) || null, required(body.version, "Versión", 40), status, text(body.summary, 5000) || null, body.effective_from || null, body.effective_until || null, text(body.file_name, 255) || (documentData ? `${text(body.code, 80) || "PNR"}.pdf` : null), documentData ? "application/pdf" : text(body.mime_type, 100) || null, documentData, documentUrl, body.active !== false, actorId(req)]
+      );
+      res.status(201).json({ status: "ok", pnr_document: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.patch("/admin/control-centers/:code/safety/pnr/:id", async (req, res) => {
+    try {
+      const context = await resolveAdminContext(req, res); if (!context) return;
+      const status = req.body?.status ? enumValue(req.body.status, PNR_STATUSES, null) : null;
+      if (req.body?.status && !status) throw new Error("Estado PNR inválido");
+      const result = await pool.query(
+        `UPDATE safety_pnr_documents SET status=COALESCE($3,status),active=COALESCE($4,active),updated_at=NOW() WHERE id=$1 AND control_center_id=$2 RETURNING id,code,title,version,status,active,updated_at`,
+        [req.params.id, context.center.id, status, typeof req.body?.active === "boolean" ? req.body.active : null]
+      );
+      if (!result.rows.length) return res.status(404).json({ status: "error", message: "PNR no encontrado" });
+      res.json({ status: "ok", pnr_document: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.get("/mobile/safety/pnr", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["NEIGHBOR", "RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      let area = "";
+      if (req.query.ticket_id) {
+        if (!(await checkTicketParticipantAccess(req, res, req.query.ticket_id))) return;
+        const ticket = await ticketSafetyContext(req.query.ticket_id);
+        if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+        area = ticket.citizen_work_area || ticket.event_sector_name || "";
+      } else {
+        const userResult = await pool.query(`SELECT work_area FROM users WHERE id=$1 AND control_center_id=$2`, [context.session.sub, context.session.control_center_id]);
+        area = userResult.rows[0]?.work_area || "";
+      }
+      const documents = await applicablePnr(context.session.control_center_id, area);
+      res.json({ status: "ok", enabled: true, vertical: "MINING", work_area: area || null, documents });
+    } catch (error) { res.status(500).json({ status: "error", message: error.message }); }
+  });
+
+  app.get("/mobile/safety/pnr/:id/content", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["NEIGHBOR", "RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      const result = await pool.query(`SELECT file_name,mime_type,document_data,document_url FROM safety_pnr_documents WHERE id=$1 AND control_center_id=$2 AND active=true AND status='PUBLISHED'`, [req.params.id, context.session.control_center_id]);
+      if (!result.rows.length) return res.status(404).send("PNR no encontrado");
+      const document = result.rows[0];
+      if (document.document_data) {
+        res.setHeader("Content-Type", document.mime_type || "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${text(document.file_name || "PNR.pdf", 200).replace(/[\"\\]/g, "_")}"`);
+        res.setHeader("Cache-Control", "private, max-age=300");
+        return res.send(document.document_data);
+      }
+      return res.redirect(302, document.document_url);
+    } catch (error) { res.status(500).send(error.message); }
+  });
+
+  app.get("/resolver/tickets/:ticketId/safety", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      if (!(await checkTicketParticipantAccess(req, res, req.params.ticketId))) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const [documents, assessments, suggestion] = await Promise.all([
+        applicablePnr(ticket.control_center_id, ticket.citizen_work_area || ticket.event_sector_name || ""),
+        pool.query(`SELECT r.*,u.full_name AS assessed_by_name FROM safety_ticket_risk_assessments r LEFT JOIN users u ON u.id=r.assessed_by WHERE r.ticket_id=$1 ORDER BY r.assessed_at DESC`, [ticket.id]),
+        frequencySuggestion(ticket.control_center_id, ticket)
+      ]);
+      res.json({ status: "ok", ticket: { id: ticket.id, alert_type: ticket.alert_type, work_area: ticket.citizen_work_area || ticket.event_sector_name || null }, pnr_documents: documents, risk_assessments: assessments.rows, frequency_suggestion: suggestion, scale: { severity: { 1: "Leve", 2: "Menor", 3: "Seria", 4: "Grave", 5: "Crítica" }, frequency: { 1: "Rara", 2: "Poco probable", 3: "Posible", 4: "Probable", 5: "Frecuente" } } });
+    } catch (error) { res.status(500).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/tickets/:ticketId/safety/risk", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      if (!(await checkTicketParticipantAccess(req, res, req.params.ticketId))) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const severity = numberOrNull(req.body?.severity, 1, 5);
+      const frequency = numberOrNull(req.body?.frequency, 1, 5);
+      if (!Number.isInteger(severity) || !Number.isInteger(frequency)) throw new Error("Gravedad y frecuencia deben ser enteros entre 1 y 5");
+      const phase = enumValue(req.body?.phase, RISK_PHASES, "INITIAL");
+      const frequencySource = enumValue(req.body?.frequency_source, FREQUENCY_SOURCES, "PROFESSIONAL_ESTIMATE");
+      const suggestion = await frequencySuggestion(ticket.control_center_id, ticket);
+      if (frequencySource === "SYSTEM_SUGGESTION" && (!suggestion.available || Number(suggestion.value) !== frequency)) throw new Error("La frecuencia seleccionada no coincide con una sugerencia estadística vigente");
+      const score = severity * frequency;
+      const result = await pool.query(
+        `INSERT INTO safety_ticket_risk_assessments(control_center_id,ticket_id,phase,severity,frequency,score,risk_level,frequency_source,suggestion_metadata,notes,assessed_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11) RETURNING *`,
+        [ticket.control_center_id, ticket.id, phase, severity, frequency, score, riskLevel(score), frequencySource, JSON.stringify(suggestion), text(req.body?.notes, 5000) || null, actorId(req)]
+      );
+      await pool.query(
+        `INSERT INTO safety_incidents(control_center_id,linked_ticket_id,title,event_type,severity,occurred_at,area,description,investigation_status,created_by)
+         SELECT t.control_center_id,t.id,t.title,t.alert_type,$2,t.created_at,t.event_sector_name,t.description,'OPEN',$3 FROM tickets t WHERE t.id=$1
+         AND NOT EXISTS(SELECT 1 FROM safety_incidents si WHERE si.linked_ticket_id=t.id)`,
+        [ticket.id, ({ LOW: "LOW", MODERATE: "MEDIUM", HIGH: "HIGH", CRITICAL: "CRITICAL" })[riskLevel(score)], actorId(req)]
+      );
+      res.status(201).json({ status: "ok", risk_assessment: result.rows[0], frequency_suggestion: suggestion });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
   });
 
   app.post("/admin/control-centers/:code/safety/incidents", async (req, res) => {

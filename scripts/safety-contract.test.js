@@ -20,7 +20,8 @@ assert.match(server, /carriesCitySeedTerminology[\s\S]*delete currentSettings\.t
 
 for (const table of [
   "safety_incidents", "safety_actions", "safety_inspections", "safety_critical_controls",
-  "safety_control_verifications", "safety_behavior_observations", "safety_camera_events"
+  "safety_control_verifications", "safety_behavior_observations", "safety_camera_events",
+  "safety_pnr_documents", "safety_ticket_risk_assessments"
 ]) {
   assert.ok(safety.includes(table), `falta contrato para ${table}`);
 }
@@ -37,5 +38,13 @@ assert.match(safety, /CAMERA_AI_NOT_LICENSED/, "el webhook debe respetar la lice
 assert.doesNotMatch(safety, /wa-center\.vsti\.cl|mqtt\.flespi\.io/, "Safety no debe modificar integraciones existentes");
 assert.match(safetyMigration, /CREATE TABLE IF NOT EXISTS safety_incidents/, "debe existir migración idempotente de Safety");
 assert.match(safetyMigration, /control_center_id UUID NOT NULL/g, "la migración debe segregar datos por Centro de Control");
+assert.match(safetyMigration, /ALTER TABLE users ADD COLUMN IF NOT EXISTS work_area/, "los trabajadores deben poder tener un área laboral");
+assert.match(safety, /\/admin\/control-centers\/:code\/safety\/pnr/, "ADMIN debe gestionar la biblioteca PNR");
+assert.match(safety, /\/mobile\/safety\/pnr/, "la app Trabajador debe consultar PNR aplicables");
+assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/risk/, "la app HSE debe registrar riesgo por ticket");
+assert.match(safety, /severity \* frequency/, "el puntaje de riesgo debe usar una matriz 5x5");
+assert.match(safety, /PROFESSIONAL_ESTIMATE/, "la frecuencia debe aceptar estimación profesional");
+assert.match(safety, /SYSTEM_SUGGESTION/, "la frecuencia debe soportar sugerencia estadística trazable");
+assert.match(safety, /INSUFFICIENT_HISTORY/, "la sugerencia debe fallar de forma explícita cuando la muestra es insuficiente");
 
 console.log("Safety contract tests: OK");
