@@ -13,6 +13,7 @@ const SAFETY_STATUSES = Object.freeze({
 const RISK_PHASES = new Set(["INITIAL", "RESIDUAL"]);
 const FREQUENCY_SOURCES = new Set(["PROFESSIONAL_ESTIMATE", "SYSTEM_SUGGESTION"]);
 const PNR_STATUSES = new Set(["DRAFT", "PUBLISHED", "ARCHIVED"]);
+const PNR_TYPES = new Set(["PROCEDURE", "STANDARD", "RULE"]);
 const CLOSURE_DECISIONS = new Set(["APPROVED", "REJECTED"]);
 const MAX_PNR_BYTES = 12 * 1024 * 1024;
 
@@ -487,7 +488,7 @@ function registerSafetyModule({
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
          ON CONFLICT(control_center_id,code,version) DO UPDATE SET title=EXCLUDED.title,document_type=EXCLUDED.document_type,work_area=EXCLUDED.work_area,status=EXCLUDED.status,summary=EXCLUDED.summary,effective_from=EXCLUDED.effective_from,effective_until=EXCLUDED.effective_until,file_name=COALESCE(EXCLUDED.file_name,safety_pnr_documents.file_name),mime_type=COALESCE(EXCLUDED.mime_type,safety_pnr_documents.mime_type),document_data=COALESCE(EXCLUDED.document_data,safety_pnr_documents.document_data),document_url=COALESCE(EXCLUDED.document_url,safety_pnr_documents.document_url),active=EXCLUDED.active,updated_at=NOW()
          RETURNING id,code,title,document_type,work_area,version,status,summary,effective_from,effective_until,file_name,mime_type,document_url,active,created_at,updated_at,(document_data IS NOT NULL) AS has_uploaded_file`,
-        [context.center.id, required(body.code, "Código", 80).toUpperCase(), required(body.title, "Título", 220), text(body.document_type || "PROCEDURE", 24).toUpperCase(), text(body.work_area, 180) || null, required(body.version, "Versión", 40), status, text(body.summary, 5000) || null, body.effective_from || null, body.effective_until || null, text(body.file_name, 255) || (documentData ? `${text(body.code, 80) || "PNR"}.pdf` : null), documentData ? "application/pdf" : text(body.mime_type, 100) || null, documentData, documentUrl, body.active !== false, actorId(req)]
+        [context.center.id, required(body.code, "Código", 80).toUpperCase(), required(body.title, "Título", 220), enumValue(body.document_type, PNR_TYPES, "PROCEDURE"), text(body.work_area, 180) || null, required(body.version, "Versión", 40), status, text(body.summary, 5000) || null, body.effective_from || null, body.effective_until || null, text(body.file_name, 255) || (documentData ? `${text(body.code, 80) || "PNR"}.pdf` : null), documentData ? "application/pdf" : text(body.mime_type, 100) || null, documentData, documentUrl, body.active !== false, actorId(req)]
       );
       res.status(201).json({ status: "ok", pnr_document: result.rows[0] });
     } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
@@ -496,15 +497,64 @@ function registerSafetyModule({
   app.patch("/admin/control-centers/:code/safety/pnr/:id", async (req, res) => {
     try {
       const context = await resolveAdminContext(req, res); if (!context) return;
-      const status = req.body?.status ? enumValue(req.body.status, PNR_STATUSES, null) : null;
-      if (req.body?.status && !status) throw new Error("Estado PNR inválido");
+      const body = req.body || {};
+      const has = field => Object.prototype.hasOwnProperty.call(body, field);
+      const status = has("status") ? enumValue(body.status, PNR_STATUSES, null) : null;
+      const documentType = has("document_type") ? enumValue(body.document_type, PNR_TYPES, null) : null;
+      if (has("status") && !status) throw new Error("Estado PNR inválido");
+      if (has("document_type") && !documentType) throw new Error("Tipo PNR inválido");
+      const documentData = has("document_base64") ? pnrDocumentBuffer(body) : null;
+      const requestedDocumentUrl = has("document_url") && body.document_url ? httpsUrlOrNull(body.document_url) : null;
+      const documentUrl = documentData ? null : requestedDocumentUrl;
+      const replaceDocument = Boolean(documentData || documentUrl);
+      const assignments = [];
+      const values = [req.params.id, context.center.id];
+      const assign = (column, value, cast = "") => {
+        values.push(value);
+        assignments.push(`${column}=$${values.length}${cast}`);
+      };
+      if (has("code")) assign("code", required(body.code, "Código", 80).toUpperCase());
+      if (has("title")) assign("title", required(body.title, "Título", 220));
+      if (has("document_type")) assign("document_type", documentType);
+      if (has("work_area")) assign("work_area", text(body.work_area, 180) || null);
+      if (has("version")) assign("version", required(body.version, "Versión", 40));
+      if (has("summary")) assign("summary", text(body.summary, 5000) || null);
+      if (has("effective_from")) assign("effective_from", body.effective_from || null, "::date");
+      if (has("effective_until")) assign("effective_until", body.effective_until || null, "::date");
+      if (has("status")) assign("status", status);
+      if (has("active")) assign("active", typeof body.active === "boolean" ? body.active : true);
+      if (replaceDocument) {
+        assign("file_name", documentData ? text(body.file_name, 255) || `${text(body.code, 80) || "PNR"}.pdf` : null);
+        assign("mime_type", documentData ? "application/pdf" : null);
+        assign("document_data", documentData, "::bytea");
+        assign("document_url", documentUrl);
+      }
+      if (!assignments.length) throw new Error("No hay cambios para guardar");
       const result = await pool.query(
-        `UPDATE safety_pnr_documents SET status=COALESCE($3,status),active=COALESCE($4,active),updated_at=NOW() WHERE id=$1 AND control_center_id=$2 RETURNING id,code,title,version,status,active,updated_at`,
-        [req.params.id, context.center.id, status, typeof req.body?.active === "boolean" ? req.body.active : null]
+        `UPDATE safety_pnr_documents SET ${assignments.join(",")},updated_at=NOW() WHERE id=$1 AND control_center_id=$2 RETURNING id,code,title,document_type,work_area,version,status,summary,effective_from,effective_until,file_name,mime_type,document_url,active,created_at,updated_at,(document_data IS NOT NULL) AS has_uploaded_file`,
+        values
       );
       if (!result.rows.length) return res.status(404).json({ status: "error", message: "PNR no encontrado" });
       res.json({ status: "ok", pnr_document: result.rows[0] });
     } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.get("/admin/control-centers/:code/safety/pnr/:id/content", async (req, res) => {
+    try {
+      const context = await resolveAdminContext(req, res); if (!context) return;
+      const result = await pool.query(`SELECT file_name,mime_type,document_data,document_url FROM safety_pnr_documents WHERE id=$1 AND control_center_id=$2`, [req.params.id, context.center.id]);
+      if (!result.rows.length) return res.status(404).send("PNR no encontrado");
+      const document = result.rows[0];
+      if (document.document_data) {
+        const safeFileName = (text(document.file_name, 180) || "pnr.pdf").replace(/["\r\n\\]/g, "_");
+        res.setHeader("Content-Type", document.mime_type || "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${safeFileName}"`);
+        res.setHeader("Cache-Control", "private, no-store");
+        return res.send(document.document_data);
+      }
+      if (document.document_url) return res.redirect(302, document.document_url);
+      return res.status(404).send("El PNR no tiene un documento disponible");
+    } catch (error) { res.status(500).send(error.message); }
   });
 
   app.get("/mobile/safety/pnr", async (req, res) => {

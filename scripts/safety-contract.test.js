@@ -40,6 +40,9 @@ assert.match(safetyMigration, /CREATE TABLE IF NOT EXISTS safety_incidents/, "de
 assert.match(safetyMigration, /control_center_id UUID NOT NULL/g, "la migración debe segregar datos por Centro de Control");
 assert.match(safetyMigration, /ALTER TABLE users ADD COLUMN IF NOT EXISTS work_area/, "los trabajadores deben poder tener un área laboral");
 assert.match(safety, /\/admin\/control-centers\/:code\/safety\/pnr/, "ADMIN debe gestionar la biblioteca PNR");
+assert.match(safety, /PNR_TYPES = new Set\(\["PROCEDURE", "STANDARD", "RULE"\]\)/, "la biblioteca debe distinguir Procedimientos, Normas y Reglas");
+assert.match(safety, /app\.patch\("\/admin\/control-centers\/:code\/safety\/pnr\/:id"/, "ADMIN debe poder mantener metadatos y documentos PNR existentes");
+assert.match(safety, /\/admin\/control-centers\/:code\/safety\/pnr\/:id\/content/, "ADMIN debe poder previsualizar documentos PNR activos o archivados");
 assert.match(safety, /\/mobile\/safety\/pnr/, "la app Trabajador debe consultar PNR aplicables");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/risk/, "la app HSE debe registrar riesgo por ticket");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/inspections/, "la app HSE debe registrar inspecciones asociadas al ticket");
