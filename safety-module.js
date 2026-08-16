@@ -16,6 +16,7 @@ const PNR_STATUSES = new Set(["DRAFT", "PUBLISHED", "ARCHIVED"]);
 const PNR_TYPES = new Set(["PROCEDURE", "STANDARD", "RULE"]);
 const CRITICAL_CONTROL_TYPES = new Set(["PREVENTIVE", "MITIGATING", "RECOVERY"]);
 const CLOSURE_DECISIONS = new Set(["APPROVED", "REJECTED"]);
+const INVESTIGATION_METHODS = new Set(["FIVE_WHYS", "ICAM", "BOW_TIE", "OTHER"]);
 const MAX_PNR_BYTES = 12 * 1024 * 1024;
 
 function text(value, max = 500) {
@@ -48,6 +49,16 @@ function dateOrNull(value) {
 
 function jsonObject(value, fallback = {}) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : fallback;
+}
+
+function jsonArray(value, maxItems = 50, maxBytes = 30_000) {
+  if (!Array.isArray(value)) return [];
+  const normalized = value.slice(0, maxItems);
+  const serialized = JSON.stringify(normalized);
+  if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
+    throw new Error("El detalle estructurado excede el tamaño permitido");
+  }
+  return normalized;
 }
 
 function httpsUrlOrNull(value) {
@@ -293,6 +304,13 @@ function registerSafetyModule({
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS investigation_notes TEXT;
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS recommendations TEXT;
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS updated_by UUID REFERENCES users(id) ON DELETE SET NULL;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS investigation_method VARCHAR(40) DEFAULT 'FIVE_WHYS';
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS problem_statement TEXT;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS event_sequence JSONB NOT NULL DEFAULT '[]'::jsonb;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS immediate_causes JSONB NOT NULL DEFAULT '[]'::jsonb;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS contributing_factors JSONB NOT NULL DEFAULT '[]'::jsonb;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS lessons_learned TEXT;
+        ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS conclusion TEXT;
         ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
         ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS control_type VARCHAR(32);
         ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS work_area VARCHAR(180);
@@ -400,7 +418,9 @@ function registerSafetyModule({
 
   async function ticketSafetyContext(ticketId) {
     const result = await pool.query(
-      `SELECT t.id,t.control_center_id,t.title,t.description,t.state,t.created_at,t.alert_type,t.event_sector_name,t.citizen_user_id,t.assigned_resolver_id,
+      `SELECT t.id,t.control_center_id,t.title,t.description,t.state,t.priority,t.latitude,t.longitude,t.accuracy,
+              t.created_at,t.updated_at,t.acknowledged_at,t.assigned_at,t.resolved_at,t.closed_at,
+              t.alert_type,t.event_sector_name,t.citizen_user_id,t.assigned_resolver_id,
               cc.code AS control_center_code,cc.name AS control_center_name,
               COALESCE(u.work_area, '') AS citizen_work_area,
               u.full_name AS citizen_name,
@@ -467,6 +487,87 @@ function registerSafetyModule({
       return null;
     }
     return { session, settings: settingsRow.settings };
+  }
+
+  async function professionalTicketContext(req, res, ticketId) {
+    const context = await mobileSafetyContext(req, res, ["RESOLVER"]);
+    if (!context) return null;
+    const result = await pool.query(
+      `SELECT t.id
+       FROM tickets t
+       WHERE t.id=$1
+         AND t.control_center_id=$2
+         AND (
+           t.assigned_resolver_id=$3
+           OR EXISTS (
+             SELECT 1 FROM ticket_assignments ta
+             WHERE ta.ticket_id=t.id AND ta.resolver_user_id=$3
+           )
+         )
+       LIMIT 1`,
+      [ticketId, context.session.control_center_id, context.session.sub]
+    );
+    if (!result.rows.length) {
+      res.status(403).json({ status: "error", message: "Caso no asignado a este Profesional HSE" });
+      return null;
+    }
+    return context;
+  }
+
+  async function updateInvestigation(ticket, incident, body, actor) {
+    if (String(incident.investigation_status || "").toUpperCase() === "CLOSED") {
+      throw new Error("La investigación ya fue cerrada por el Supervisor HSE");
+    }
+    const status = enumValue(body?.investigation_status, SAFETY_STATUSES.incident, "INVESTIGATING");
+    if (status === "CLOSED") throw new Error("El cierre debe ser aprobado por el Supervisor HSE");
+    const method = enumValue(body?.investigation_method, INVESTIGATION_METHODS, "FIVE_WHYS");
+    const rootCauses = jsonArray(body?.root_causes, 30);
+    const eventSequence = jsonArray(body?.event_sequence, 100, 60_000);
+    const immediateCauses = jsonArray(body?.immediate_causes, 40);
+    const contributingFactors = jsonArray(body?.contributing_factors, 40);
+    const result = await pool.query(
+      `UPDATE safety_incidents SET
+         description=COALESCE($2,description),
+         immediate_actions=$3,
+         root_causes=$4::jsonb,
+         investigation_notes=$5,
+         recommendations=$6,
+         investigation_status=$7,
+         investigation_method=$8,
+         problem_statement=$9,
+         event_sequence=$10::jsonb,
+         immediate_causes=$11::jsonb,
+         contributing_factors=$12::jsonb,
+         lessons_learned=$13,
+         conclusion=$14,
+         updated_by=$15,
+         updated_at=NOW()
+       WHERE id=$1
+       RETURNING *`,
+      [
+        incident.id,
+        text(body?.description, 8000) || null,
+        text(body?.immediate_actions, 8000) || null,
+        JSON.stringify(rootCauses),
+        text(body?.investigation_notes, 12000) || null,
+        text(body?.recommendations, 8000) || null,
+        status,
+        method,
+        text(body?.problem_statement, 8000) || null,
+        JSON.stringify(eventSequence),
+        JSON.stringify(immediateCauses),
+        JSON.stringify(contributingFactors),
+        text(body?.lessons_learned, 8000) || null,
+        text(body?.conclusion, 8000) || null,
+        actor
+      ]
+    );
+    await pool.query(
+      `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+       VALUES($1,$2,'RESOLVER','HSE_INVESTIGATION_UPDATED',$3,$4::jsonb)`,
+      [ticket.id, actor, "Profesional HSE actualizó la investigación del caso", JSON.stringify({ incident_id: incident.id, investigation_status: status, investigation_method: method })]
+    );
+    return result.rows[0];
   }
 
   app.get("/admin/control-centers/:code/safety/bootstrap", async (req, res) => {
@@ -597,6 +698,225 @@ function registerSafetyModule({
     } catch (error) { res.status(500).send(error.message); }
   });
 
+  app.get("/hse/professional/cases", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER"]); if (!context) return;
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+      const status = text(req.query.status, 32).toUpperCase();
+      const search = text(req.query.q, 120);
+      const result = await pool.query(
+        `SELECT
+           t.id,t.title,t.description,t.alert_type,t.state,t.priority,t.latitude,t.longitude,
+           t.event_sector_name,t.created_at,t.updated_at,t.resolved_at,t.closed_at,
+           citizen.full_name AS citizen_name,citizen.phone AS citizen_phone,
+           COALESCE(incident.id::text,'') AS incident_id,
+           COALESCE(incident.investigation_status,'OPEN') AS investigation_status,
+           incident.investigation_method,incident.area,incident.problem_statement,incident.updated_at AS investigation_updated_at,
+           initial_risk.score AS initial_risk_score,initial_risk.risk_level AS initial_risk_level,
+           residual_risk.score AS residual_risk_score,residual_risk.risk_level AS residual_risk_level,
+           closure.status AS closure_status,closure.requested_at AS closure_requested_at,
+           COALESCE(action_stats.open_actions,0)::int AS open_actions,
+           COALESCE(action_stats.overdue_actions,0)::int AS overdue_actions
+         FROM tickets t
+         LEFT JOIN users citizen ON citizen.id=t.citizen_user_id
+         LEFT JOIN LATERAL (
+           SELECT si.* FROM safety_incidents si WHERE si.linked_ticket_id=t.id ORDER BY si.created_at ASC LIMIT 1
+         ) incident ON true
+         LEFT JOIN LATERAL (
+           SELECT score,risk_level FROM safety_ticket_risk_assessments r WHERE r.ticket_id=t.id AND r.phase='INITIAL' ORDER BY r.assessed_at DESC LIMIT 1
+         ) initial_risk ON true
+         LEFT JOIN LATERAL (
+           SELECT score,risk_level FROM safety_ticket_risk_assessments r WHERE r.ticket_id=t.id AND r.phase='RESIDUAL' ORDER BY r.assessed_at DESC LIMIT 1
+         ) residual_risk ON true
+         LEFT JOIN LATERAL (
+           SELECT status,requested_at FROM safety_ticket_closure_requests c WHERE c.ticket_id=t.id ORDER BY c.requested_at DESC LIMIT 1
+         ) closure ON true
+         LEFT JOIN LATERAL (
+           SELECT
+             COUNT(*) FILTER (WHERE a.status IN ('OPEN','IN_PROGRESS'))::int AS open_actions,
+             COUNT(*) FILTER (WHERE a.status IN ('OPEN','IN_PROGRESS') AND a.due_date < CURRENT_DATE)::int AS overdue_actions
+           FROM safety_actions a WHERE a.source_id=incident.id
+         ) action_stats ON true
+         WHERE t.control_center_id=$2
+           AND (
+             t.assigned_resolver_id=$1
+             OR EXISTS (SELECT 1 FROM ticket_assignments ta WHERE ta.ticket_id=t.id AND ta.resolver_user_id=$1)
+           )
+           AND (
+             $4='' OR
+             ($4='ACTIVE' AND COALESCE(incident.investigation_status,'OPEN') <> 'CLOSED') OR
+             COALESCE(incident.investigation_status,'OPEN')=$4
+           )
+           AND (
+             $5='' OR t.title ILIKE '%' || $5 || '%' OR t.alert_type ILIKE '%' || $5 || '%' OR
+             COALESCE(t.event_sector_name,'') ILIKE '%' || $5 || '%' OR COALESCE(citizen.full_name,'') ILIKE '%' || $5 || '%'
+           )
+         ORDER BY
+           CASE COALESCE(incident.investigation_status,'OPEN') WHEN 'OPEN' THEN 0 WHEN 'INVESTIGATING' THEN 1 WHEN 'ACTION_PLAN' THEN 2 ELSE 3 END,
+           COALESCE(incident.updated_at,t.updated_at,t.created_at) DESC
+         LIMIT $3`,
+        [context.session.sub, context.session.control_center_id, limit, status, search]
+      );
+      res.json({ status: "ok", cases: result.rows, count: result.rows.length });
+    } catch (error) { res.status(500).json({ status: "error", message: error.message }); }
+  });
+
+  app.get("/hse/professional/tickets/:ticketId/workspace", async (req, res) => {
+    try {
+      const context = await professionalTicketContext(req, res, req.params.ticketId); if (!context) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const incident = await ensureTicketIncident(ticket, actorId(req));
+      const [documents, assessments, suggestion, closure, controls, inspections, verifications, actions, timeline, notes, reports, voiceSessions] = await Promise.all([
+        applicablePnr(ticket.control_center_id, ticket.citizen_work_area || ticket.event_sector_name || ""),
+        pool.query(`SELECT r.*,u.full_name AS assessed_by_name FROM safety_ticket_risk_assessments r LEFT JOIN users u ON u.id=r.assessed_by WHERE r.ticket_id=$1 ORDER BY r.assessed_at DESC`, [ticket.id]),
+        frequencySuggestion(ticket.control_center_id, ticket),
+        pool.query(`SELECT c.*,requester.full_name AS requested_by_name,decider.full_name AS decided_by_name FROM safety_ticket_closure_requests c LEFT JOIN users requester ON requester.id=c.requested_by LEFT JOIN users decider ON decider.id=c.decided_by WHERE c.ticket_id=$1 ORDER BY c.requested_at DESC LIMIT 1`, [ticket.id]),
+        pool.query(`SELECT id,code,hazard,name,control_type,work_area,verification_question,performance_standard,active FROM safety_critical_controls WHERE control_center_id=$1 AND active=true ORDER BY code`, [ticket.control_center_id]),
+        pool.query(`SELECT * FROM safety_inspections WHERE linked_ticket_id=$1 ORDER BY created_at DESC`, [ticket.id]),
+        pool.query(`SELECT v.*,c.code AS control_code,c.name AS control_name FROM safety_control_verifications v JOIN safety_critical_controls c ON c.id=v.control_id WHERE v.ticket_id=$1 ORDER BY v.verified_at DESC`, [ticket.id]),
+        pool.query(`SELECT a.*,owner.full_name AS owner_user_name FROM safety_actions a LEFT JOIN users owner ON owner.id=a.owner_user_id WHERE a.control_center_id=$1 AND a.source_id=$2 ORDER BY a.created_at DESC`, [ticket.control_center_id, incident.id]),
+        pool.query(`SELECT ta.id,ta.action_type,ta.actor_role,ta.description,ta.metadata,ta.created_at,u.full_name AS actor_name FROM ticket_actions ta LEFT JOIN users u ON u.id=ta.actor_user_id WHERE ta.ticket_id=$1 ORDER BY ta.created_at ASC`, [ticket.id]),
+        pool.query(`SELECT tn.id,tn.note,tn.created_at,u.full_name AS author_name FROM ticket_notes tn LEFT JOIN users u ON u.id=tn.author_user_id WHERE tn.ticket_id=$1 ORDER BY tn.created_at ASC`, [ticket.id]),
+        pool.query(`SELECT id,reporter_name,reporter_phone,latitude,longitude,accuracy,alert_type,title,description,is_primary_report,created_at FROM ticket_reports WHERE ticket_id=$1 ORDER BY created_at ASC`, [ticket.id]),
+        pool.query(`SELECT id,status,target_type,requested_by,started_at,connected_at,ended_at,duration_seconds,recording_url,created_at FROM ticket_voice_sessions WHERE ticket_id=$1 ORDER BY created_at DESC LIMIT 20`, [ticket.id])
+      ]);
+      res.json({
+        status: "ok",
+        ticket,
+        incident,
+        pnr_documents: documents,
+        risk_assessments: assessments.rows,
+        frequency_suggestion: suggestion,
+        closure_request: closure.rows[0] || null,
+        critical_controls: controls.rows,
+        inspections: inspections.rows,
+        control_verifications: verifications.rows,
+        corrective_actions: actions.rows,
+        timeline: timeline.rows,
+        notes: notes.rows,
+        reports: reports.rows,
+        voice_sessions: voiceSessions.rows,
+        scale: { severity: { 1: "Leve", 2: "Menor", 3: "Seria", 4: "Grave", 5: "Crítica" }, frequency: { 1: "Rara", 2: "Poco probable", 3: "Posible", 4: "Probable", 5: "Frecuente" } }
+      });
+    } catch (error) { res.status(500).json({ status: "error", message: error.message }); }
+  });
+
+  app.patch("/hse/professional/tickets/:ticketId/investigation", async (req, res) => {
+    try {
+      const context = await professionalTicketContext(req, res, req.params.ticketId); if (!context) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const incident = await ensureTicketIncident(ticket, actorId(req));
+      const updated = await updateInvestigation(ticket, incident, req.body || {}, actorId(req));
+      res.json({ status: "ok", incident: updated });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/hse/professional/tickets/:ticketId/actions", async (req, res) => {
+    try {
+      const context = await professionalTicketContext(req, res, req.params.ticketId); if (!context) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const incident = await ensureTicketIncident(ticket, actorId(req));
+      const body = req.body || {};
+      const actionType = enumValue(body.action_type, new Set(["CORRECTIVE", "PREVENTIVE"]), "CORRECTIVE");
+      const priority = enumValue(body.priority, new Set(["LOW", "MEDIUM", "HIGH", "CRITICAL"]), "MEDIUM");
+      const result = await pool.query(
+        `INSERT INTO safety_actions(control_center_id,source_type,source_id,title,description,action_type,priority,owner_name,due_date,status,evidence,created_by)
+         VALUES($1,'HSE_INVESTIGATION',$2,$3,$4,$5,$6,$7,$8,'OPEN',$9::jsonb,$10) RETURNING *`,
+        [ticket.control_center_id, incident.id, required(body.title, "Título", 180), text(body.description, 5000) || null, actionType, priority, text(body.owner_name, 180) || null, body.due_date || null, JSON.stringify(jsonArray(body.evidence, 20)), actorId(req)]
+      );
+      await pool.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,'RESOLVER','HSE_ACTION_CREATED',$3,$4::jsonb)`,
+        [ticket.id, actorId(req), "Profesional HSE creó una acción correctiva/preventiva", JSON.stringify({ safety_action_id: result.rows[0].id, priority })]
+      );
+      res.status(201).json({ status: "ok", action: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.patch("/hse/professional/tickets/:ticketId/actions/:actionId", async (req, res) => {
+    try {
+      const context = await professionalTicketContext(req, res, req.params.ticketId); if (!context) return;
+      const status = enumValue(req.body?.status, SAFETY_STATUSES.action, null);
+      if (!status) throw new Error("Estado de acción inválido");
+      const result = await pool.query(
+        `UPDATE safety_actions a SET status=$4,updated_at=NOW()
+         FROM safety_incidents i
+         WHERE a.id=$1 AND a.control_center_id=$2 AND a.source_id=i.id AND i.linked_ticket_id=$3
+         RETURNING a.*`,
+        [req.params.actionId, context.session.control_center_id, req.params.ticketId, status]
+      );
+      if (!result.rows.length) return res.status(404).json({ status: "error", message: "Acción no encontrada" });
+      res.json({ status: "ok", action: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/hse/professional/tickets/:ticketId/risk", async (req, res) => {
+    try {
+      const context = await professionalTicketContext(req, res, req.params.ticketId); if (!context) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const severity = numberOrNull(req.body?.severity, 1, 5);
+      const frequency = numberOrNull(req.body?.frequency, 1, 5);
+      if (!Number.isInteger(severity) || !Number.isInteger(frequency)) throw new Error("Gravedad y frecuencia deben ser enteros entre 1 y 5");
+      const phase = enumValue(req.body?.phase, RISK_PHASES, "INITIAL");
+      const frequencySource = enumValue(req.body?.frequency_source, FREQUENCY_SOURCES, "PROFESSIONAL_ESTIMATE");
+      const suggestion = await frequencySuggestion(ticket.control_center_id, ticket);
+      if (frequencySource === "SYSTEM_SUGGESTION" && (!suggestion.available || Number(suggestion.value) !== frequency)) {
+        throw new Error("La frecuencia seleccionada no coincide con una sugerencia estadística vigente");
+      }
+      const score = severity * frequency;
+      const result = await pool.query(
+        `INSERT INTO safety_ticket_risk_assessments(control_center_id,ticket_id,phase,severity,frequency,score,risk_level,frequency_source,suggestion_metadata,notes,assessed_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11) RETURNING *`,
+        [ticket.control_center_id, ticket.id, phase, severity, frequency, score, riskLevel(score), frequencySource, JSON.stringify(suggestion), text(req.body?.notes, 5000) || null, actorId(req)]
+      );
+      const incident = await ensureTicketIncident(ticket, actorId(req));
+      await pool.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,'RESOLVER','HSE_RISK_ASSESSED',$3,$4::jsonb)`,
+        [ticket.id, actorId(req), `Profesional HSE registró evaluación de riesgo ${phase === "RESIDUAL" ? "residual" : "inicial"}`, JSON.stringify({ incident_id: incident.id, risk_assessment_id: result.rows[0].id, phase, score, risk_level: riskLevel(score) })]
+      );
+      res.status(201).json({ status: "ok", risk_assessment: result.rows[0], frequency_suggestion: suggestion });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/hse/professional/tickets/:ticketId/closure-request", async (req, res) => {
+    try {
+      const context = await professionalTicketContext(req, res, req.params.ticketId); if (!context) return;
+      const ticket = await ticketSafetyContext(req.params.ticketId);
+      if (!ticket) return res.status(404).json({ status: "error", message: "Ticket no encontrado" });
+      const residualRisk = await pool.query(
+        `SELECT id,score,risk_level FROM safety_ticket_risk_assessments WHERE ticket_id=$1 AND phase='RESIDUAL' ORDER BY assessed_at DESC LIMIT 1`,
+        [ticket.id]
+      );
+      if (!residualRisk.rows.length) throw new Error("Registra la evaluación de riesgo residual antes de solicitar el cierre");
+      const incident = await ensureTicketIncident(ticket, actorId(req));
+      if (String(incident.investigation_status || "").toUpperCase() === "CLOSED") {
+        return res.status(409).json({ status: "error", message: "La investigación ya fue cerrada por el Supervisor HSE" });
+      }
+      const requestSummary = required(req.body?.request_summary, "Resumen de cierre", 6000);
+      const result = await pool.query(
+        `INSERT INTO safety_ticket_closure_requests(control_center_id,ticket_id,incident_id,status,request_summary,requested_by)
+         VALUES($1,$2,$3,'REQUESTED',$4,$5)
+         ON CONFLICT(ticket_id) WHERE status='REQUESTED'
+         DO UPDATE SET incident_id=EXCLUDED.incident_id,request_summary=EXCLUDED.request_summary,
+                       requested_by=EXCLUDED.requested_by,requested_at=NOW(),updated_at=NOW()
+         RETURNING *`,
+        [ticket.control_center_id, ticket.id, incident.id, requestSummary, actorId(req)]
+      );
+      await pool.query(`UPDATE safety_incidents SET investigation_status='ACTION_PLAN',updated_by=$2,updated_at=NOW() WHERE id=$1`, [incident.id, actorId(req)]);
+      await pool.query(
+        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+         VALUES($1,$2,'RESOLVER','HSE_CLOSURE_REQUESTED',$3,$4::jsonb)`,
+        [ticket.id, actorId(req), "Profesional HSE solicitó aprobación del cierre desde el portal de investigación", JSON.stringify({ closure_request_id: result.rows[0].id, residual_risk: residualRisk.rows[0] })]
+      );
+      res.status(201).json({ status: "ok", closure_request: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
   app.get("/resolver/tickets/:ticketId/safety", async (req, res) => {
     try {
       const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
@@ -675,40 +995,8 @@ function registerSafetyModule({
         return res.status(409).json({ status: "error", message: "El caso ya está finalizado y no admite cambios operativos" });
       }
       const incident = await ensureTicketIncident(ticket, actorId(req));
-      const status = enumValue(req.body?.investigation_status, SAFETY_STATUSES.incident, "INVESTIGATING");
-      if (status === "CLOSED") throw new Error("El cierre debe ser aprobado por el Supervisor HSE");
-      const rootCauses = Array.isArray(req.body?.root_causes)
-        ? req.body.root_causes.map((item) => text(item, 500)).filter(Boolean).slice(0, 20)
-        : [];
-      const result = await pool.query(
-        `UPDATE safety_incidents SET
-           description=COALESCE($2,description),
-           immediate_actions=$3,
-           root_causes=$4::jsonb,
-           investigation_notes=$5,
-           recommendations=$6,
-           investigation_status=$7,
-           updated_by=$8,
-           updated_at=NOW()
-         WHERE id=$1
-         RETURNING *`,
-        [
-          incident.id,
-          text(req.body?.description, 8000) || null,
-          text(req.body?.immediate_actions, 8000) || null,
-          JSON.stringify(rootCauses),
-          text(req.body?.investigation_notes, 12000) || null,
-          text(req.body?.recommendations, 8000) || null,
-          status,
-          actorId(req)
-        ]
-      );
-      await pool.query(
-        `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
-         VALUES($1,$2,'RESOLVER','HSE_INVESTIGATION_UPDATED',$3,$4::jsonb)`,
-        [ticket.id, actorId(req), "Profesional HSE actualizó la investigación del caso", JSON.stringify({ incident_id: incident.id, investigation_status: status })]
-      );
-      res.json({ status: "ok", incident: result.rows[0] });
+      const updated = await updateInvestigation(ticket, incident, req.body || {}, actorId(req));
+      res.json({ status: "ok", incident: updated });
     } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
   });
 

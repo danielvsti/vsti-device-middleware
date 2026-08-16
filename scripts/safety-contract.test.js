@@ -8,6 +8,7 @@ const root = path.resolve(__dirname, "..");
 const server = fs.readFileSync(path.join(root, "server.js"), "utf8");
 const safety = fs.readFileSync(path.join(root, "safety-module.js"), "utf8");
 const safetyMigration = fs.readFileSync(path.join(root, "db/migrations/20260814_safety_operations.sql"), "utf8");
+const hsePortalMigration = fs.readFileSync(path.join(root, "db/migrations/20260816_hse_professional_portal.sql"), "utf8");
 
 assert.match(server, /registerSafetyModule\s*\(/, "server.js debe registrar el módulo Safety");
 assert.match(server, /VERTICAL_CONTROL_CENTER_DEFAULTS/, "deben existir defaults por vertical");
@@ -52,6 +53,17 @@ assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/inspections/, "la 
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/control-verifications/, "la app HSE debe verificar controles críticos asociados al ticket");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/closure-request/, "el Profesional HSE debe solicitar aprobación del cierre");
 assert.match(safety, /\/hse\/supervisor\/closure-requests/, "el Supervisor HSE debe revisar y decidir solicitudes de cierre");
+assert.match(safety, /\/hse\/professional\/cases/, "el Profesional HSE debe tener una bandeja histórica separada de la PWA");
+assert.match(safety, /\/hse\/professional\/tickets\/:ticketId\/workspace/, "el portal HSE debe exponer un espacio de investigación por ticket");
+assert.match(safety, /\/hse\/professional\/tickets\/:ticketId\/investigation/, "el portal HSE debe mantener el análisis de causa raíz");
+assert.match(safety, /\/hse\/professional\/tickets\/:ticketId\/actions/, "el portal HSE debe gestionar acciones correctivas y preventivas");
+assert.match(safety, /\/hse\/professional\/tickets\/:ticketId\/risk/, "el portal HSE debe evaluar riesgo incluso después de la atención operativa");
+assert.match(safety, /\/hse\/professional\/tickets\/:ticketId\/closure-request/, "el portal HSE debe solicitar cierre con autorización histórica propia");
+assert.match(safety, /INVESTIGATION_METHODS = new Set\(\["FIVE_WHYS", "ICAM", "BOW_TIE", "OTHER"\]\)/, "la investigación debe declarar una metodología trazable");
+assert.match(hsePortalMigration, /problem_statement TEXT/, "la investigación debe persistir la definición del problema");
+assert.match(hsePortalMigration, /event_sequence JSONB/, "la investigación debe persistir la secuencia del evento");
+assert.match(hsePortalMigration, /immediate_causes JSONB/, "la investigación debe persistir causas inmediatas estructuradas");
+assert.match(hsePortalMigration, /contributing_factors JSONB/, "la investigación debe persistir factores contribuyentes estructurados");
 assert.match(safety, /severity \* frequency/, "el puntaje de riesgo debe usar una matriz 5x5");
 assert.match(safety, /PROFESSIONAL_ESTIMATE/, "la frecuencia debe aceptar estimación profesional");
 assert.match(safety, /SYSTEM_SUGGESTION/, "la frecuencia debe soportar sugerencia estadística trazable");
