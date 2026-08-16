@@ -41,6 +41,9 @@ assert.match(safetyMigration, /control_center_id UUID NOT NULL/g, "la migración
 assert.match(safetyMigration, /ALTER TABLE users ADD COLUMN IF NOT EXISTS work_area/, "los trabajadores deben poder tener un área laboral");
 assert.match(safety, /\/admin\/control-centers\/:code\/safety\/pnr/, "ADMIN debe gestionar la biblioteca PNR");
 assert.match(safety, /PNR_TYPES = new Set\(\["PROCEDURE", "STANDARD", "RULE"\]\)/, "la biblioteca debe distinguir Procedimientos, Normas y Reglas");
+assert.match(safety, /CRITICAL_CONTROL_TYPES = new Set\(\["PREVENTIVE", "MITIGATING", "RECOVERY"\]\)/, "los controles críticos deben distinguir su tipo operacional");
+assert.match(safetyMigration, /safety_critical_controls ADD COLUMN IF NOT EXISTS work_area/, "los controles críticos deben poder filtrarse por área de trabajo");
+assert.match(safetyMigration, /safety_critical_controls ADD COLUMN IF NOT EXISTS control_type/, "los controles críticos deben poder filtrarse por tipo");
 assert.match(safety, /app\.patch\("\/admin\/control-centers\/:code\/safety\/pnr\/:id"/, "ADMIN debe poder mantener metadatos y documentos PNR existentes");
 assert.match(safety, /\/admin\/control-centers\/:code\/safety\/pnr\/:id\/content/, "ADMIN debe poder previsualizar documentos PNR activos o archivados");
 assert.match(safety, /\/mobile\/safety\/pnr/, "la app Trabajador debe consultar PNR aplicables");

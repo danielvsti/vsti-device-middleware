@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS safety_critical_controls (
   code VARCHAR(50) NOT NULL,
   hazard VARCHAR(180) NOT NULL,
   name VARCHAR(180) NOT NULL,
+  control_type VARCHAR(32),
+  work_area VARCHAR(180),
   verification_question TEXT NOT NULL,
   performance_standard TEXT,
   active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -196,7 +198,10 @@ ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS investigation_notes TEXT;
 ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS recommendations TEXT;
 ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS updated_by UUID REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS control_type VARCHAR(32);
+ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS work_area VARCHAR(180);
 ALTER TABLE safety_control_verifications ADD COLUMN IF NOT EXISTS ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_safety_critical_controls_cc_filters ON safety_critical_controls(control_center_id, work_area, control_type, active);
 CREATE INDEX IF NOT EXISTS idx_safety_inspections_ticket ON safety_inspections(linked_ticket_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_safety_control_verifications_ticket ON safety_control_verifications(ticket_id, verified_at DESC);
 

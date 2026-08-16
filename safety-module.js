@@ -14,6 +14,7 @@ const RISK_PHASES = new Set(["INITIAL", "RESIDUAL"]);
 const FREQUENCY_SOURCES = new Set(["PROFESSIONAL_ESTIMATE", "SYSTEM_SUGGESTION"]);
 const PNR_STATUSES = new Set(["DRAFT", "PUBLISHED", "ARCHIVED"]);
 const PNR_TYPES = new Set(["PROCEDURE", "STANDARD", "RULE"]);
+const CRITICAL_CONTROL_TYPES = new Set(["PREVENTIVE", "MITIGATING", "RECOVERY"]);
 const CLOSURE_DECISIONS = new Set(["APPROVED", "REJECTED"]);
 const MAX_PNR_BYTES = 12 * 1024 * 1024;
 
@@ -182,6 +183,8 @@ function registerSafetyModule({
           code VARCHAR(50) NOT NULL,
           hazard VARCHAR(180) NOT NULL,
           name VARCHAR(180) NOT NULL,
+          control_type VARCHAR(32),
+          work_area VARCHAR(180),
           verification_question TEXT NOT NULL,
           performance_standard TEXT,
           active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -291,7 +294,10 @@ function registerSafetyModule({
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS recommendations TEXT;
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS updated_by UUID REFERENCES users(id) ON DELETE SET NULL;
         ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+        ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS control_type VARCHAR(32);
+        ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS work_area VARCHAR(180);
         ALTER TABLE safety_control_verifications ADD COLUMN IF NOT EXISTS ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+        CREATE INDEX IF NOT EXISTS idx_safety_critical_controls_cc_filters ON safety_critical_controls(control_center_id, work_area, control_type, active);
         CREATE INDEX IF NOT EXISTS idx_safety_inspections_ticket ON safety_inspections(linked_ticket_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_safety_control_verifications_ticket ON safety_control_verifications(ticket_id, verified_at DESC);
 
@@ -603,7 +609,7 @@ function registerSafetyModule({
         frequencySuggestion(ticket.control_center_id, ticket),
         pool.query(`SELECT * FROM safety_incidents WHERE linked_ticket_id=$1 ORDER BY created_at ASC LIMIT 1`, [ticket.id]),
         pool.query(`SELECT c.*, requester.full_name AS requested_by_name, decider.full_name AS decided_by_name FROM safety_ticket_closure_requests c LEFT JOIN users requester ON requester.id=c.requested_by LEFT JOIN users decider ON decider.id=c.decided_by WHERE c.ticket_id=$1 ORDER BY c.requested_at DESC LIMIT 1`, [ticket.id]),
-        pool.query(`SELECT id,code,hazard,name,verification_question,performance_standard,active FROM safety_critical_controls WHERE control_center_id=$1 AND active=true ORDER BY code`, [ticket.control_center_id]),
+        pool.query(`SELECT id,code,hazard,name,control_type,work_area,verification_question,performance_standard,active FROM safety_critical_controls WHERE control_center_id=$1 AND active=true ORDER BY code`, [ticket.control_center_id]),
         pool.query(`SELECT * FROM safety_inspections WHERE linked_ticket_id=$1 ORDER BY created_at DESC`, [ticket.id]),
         pool.query(`SELECT v.*,c.code AS control_code,c.name AS control_name FROM safety_control_verifications v JOIN safety_critical_controls c ON c.id=v.control_id WHERE v.ticket_id=$1 ORDER BY v.verified_at DESC`, [ticket.id])
       ]);
@@ -967,7 +973,7 @@ function registerSafetyModule({
     try {
       const context = await resolveAdminContext(req, res); if (!context) return;
       const body = req.body || {};
-      const result = await pool.query(`INSERT INTO safety_critical_controls(control_center_id,code,hazard,name,verification_question,performance_standard,active,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(control_center_id,code) DO UPDATE SET hazard=EXCLUDED.hazard,name=EXCLUDED.name,verification_question=EXCLUDED.verification_question,performance_standard=EXCLUDED.performance_standard,active=EXCLUDED.active,updated_at=NOW() RETURNING *`, [context.center.id, required(body.code, "Código", 50).toUpperCase(), required(body.hazard, "Peligro", 180), required(body.name, "Nombre", 180), required(body.verification_question, "Pregunta de verificación", 2000), text(body.performance_standard, 3000) || null, body.active !== false, actorId(req)]);
+      const result = await pool.query(`INSERT INTO safety_critical_controls(control_center_id,code,hazard,name,control_type,work_area,verification_question,performance_standard,active,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(control_center_id,code) DO UPDATE SET hazard=EXCLUDED.hazard,name=EXCLUDED.name,control_type=EXCLUDED.control_type,work_area=EXCLUDED.work_area,verification_question=EXCLUDED.verification_question,performance_standard=EXCLUDED.performance_standard,active=EXCLUDED.active,updated_at=NOW() RETURNING *`, [context.center.id, required(body.code, "Código", 50).toUpperCase(), required(body.hazard, "Peligro", 180), required(body.name, "Nombre", 180), enumValue(body.control_type, CRITICAL_CONTROL_TYPES, "PREVENTIVE"), text(body.work_area, 180) || null, required(body.verification_question, "Pregunta de verificación", 2000), text(body.performance_standard, 3000) || null, body.active !== false, actorId(req)]);
       res.status(201).json({ status: "ok", critical_control: result.rows[0] });
     } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
   });
