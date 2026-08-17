@@ -14155,6 +14155,7 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         t.priority,
         t.latitude,
         t.longitude,
+        t.event_sector_name AS persisted_event_sector_name,
 
         COALESCE(t.event_sector_name,
           CASE
@@ -14249,6 +14250,44 @@ app.get("/resolver/:user_id/state", async (req, res) => {
       [user_id, resolver.control_center_id]
     );
 
+    const resolverVertical = String(resolverPlatformSettings.vertical || 'CITY').toUpperCase();
+    const resolverZone = String(
+      resolverPlatformSettings?.terminology?.zone
+      || (resolverVertical === 'MINING' ? 'Área o faena' : 'Sector')
+    ).trim();
+    const legacyCitySectors = new Set([
+      'Sector no informado',
+      'Dentro de la comuna, sin unidad vecinal identificada',
+      'Reñaca Bajo / Jardín del Mar',
+      'Reñaca Alto',
+      'Gómez Carreño / Glorias Navales',
+      'Achupallas / Santa Julia',
+      'Santa Inés / Población Vergara',
+      'Plan Viña / Libertad',
+      'Miraflores / Chorrillos',
+      'Recreo / Agua Santa',
+      'Forestal / Nueva Aurora',
+      'Viña del Mar'
+    ]);
+    const resolverTickets = ticketsResult.rows.map((ticket) => {
+      const shouldUseVerticalFallback = resolverVertical !== 'CITY'
+        && (
+          !ticket.persisted_event_sector_name
+          || legacyCitySectors.has(ticket.incident_sector)
+          || String(ticket.sector_method || '').includes('pendiente cartografía oficial')
+          || String(ticket.sector_method || '').includes('No intersecta sectores cargados')
+        );
+      const normalized = {
+        ...ticket,
+        ...(shouldUseVerticalFallback ? {
+          incident_sector: `${resolverZone} no informada`,
+          sector_method: `Sin ${resolverZone.toLocaleLowerCase('es-CL')} clasificada`
+        } : {})
+      };
+      delete normalized.persisted_event_sector_name;
+      return normalized;
+    });
+
     res.json({
       status: "ok",
       updated_at: nowChile(),
@@ -14256,12 +14295,12 @@ app.get("/resolver/:user_id/state", async (req, res) => {
       location: locationResult.rows[0] || null,
       reconciliation,
       platform_settings: publicSettingsPayload(resolverPlatformSettings),
-      tickets: ticketsResult.rows,
+      tickets: resolverTickets,
       counts: {
-        tickets: ticketsResult.rows.length,
-        assigned_to_me: ticketsResult.rows.filter(t => t.assigned_resolver_id === user_id).length,
-        pending_for_me: ticketsResult.rows.filter(t => t.assignment_state === "PENDING").length,
-        unassigned: ticketsResult.rows.filter(t => !t.assigned_resolver_id).length
+        tickets: resolverTickets.length,
+        assigned_to_me: resolverTickets.filter(t => t.assigned_resolver_id === user_id).length,
+        pending_for_me: resolverTickets.filter(t => t.assignment_state === "PENDING").length,
+        unassigned: resolverTickets.filter(t => !t.assigned_resolver_id).length
       }
     });
 
@@ -14834,6 +14873,311 @@ function requestedControlCenterForSession(req, requestedCode, fallback = "CC-VIN
   }
   return String(requestedCode || fallback).trim().toUpperCase();
 }
+
+function deterministicDemoUuid(seed) {
+  const hex = crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 32).split("");
+  hex[12] = "4";
+  hex[16] = ["8", "9", "a", "b"][parseInt(hex[16], 16) % 4];
+  const value = hex.join("");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+app.post("/admin/control-centers/:code/demo/historical-cases", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  const requestedCode = String(req.params.code || "").trim().toUpperCase();
+  const effectiveCode = requestedControlCenterForSession(req, requestedCode, "CC-JAGUAR-DEMO");
+  if (requestedCode !== "CC-JAGUAR-DEMO" || effectiveCode !== requestedCode) {
+    return res.status(403).json({ status: "error", message: "Esta carga demo sólo está permitida para CC-JAGUAR-DEMO" });
+  }
+  if (!SECURITY_DEMO_MODE) {
+    return res.status(403).json({ status: "error", message: "La carga de datos históricos requiere modo demo" });
+  }
+  if (String(req.body?.confirm || "") !== "SEED_JAGUAR_HISTORY_V1") {
+    return res.status(400).json({ status: "error", message: "Confirmación de carga demo inválida" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await ensureGeofenceSchema();
+    await ensureSectorSchema();
+
+    const ccResult = await client.query(
+      `SELECT id, code, name, boundary_geojson FROM control_centers WHERE code = $1 LIMIT 1`,
+      [requestedCode]
+    );
+    if (!ccResult.rows.length) {
+      return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    }
+    const controlCenter = ccResult.rows[0];
+    const boundary = normalizeGeoJsonGeometry(controlCenter.boundary_geojson);
+    if (!boundary) {
+      return res.status(409).json({ status: "error", message: "CC-JAGUAR-DEMO no tiene una geocerca válida" });
+    }
+
+    const usersResult = await client.query(
+      `SELECT id, role, full_name FROM users WHERE control_center_id = $1 AND is_active = true ORDER BY full_name`,
+      [controlCenter.id]
+    );
+    const workers = usersResult.rows.filter((user) => String(user.role).toUpperCase() === "NEIGHBOR");
+    const hseProfessionals = usersResult.rows.filter((user) => String(user.role).toUpperCase() === "RESOLVER");
+    const supervisors = usersResult.rows.filter((user) => ["OPERATOR", "ADMIN"].includes(String(user.role).toUpperCase()));
+    if (!workers.length || !hseProfessionals.length || !supervisors.length) {
+      return res.status(409).json({
+        status: "error",
+        message: "La demo requiere al menos un trabajador, un Profesional HSE y un supervisor/administrador"
+      });
+    }
+
+    const locations = [
+      { area: "Mina Subterrânea", sector: "Nível 850", latitude: -19.8842, longitude: -43.6718 },
+      { area: "Mina Subterrânea", sector: "Rampa Norte", latitude: -19.8812, longitude: -43.6740 },
+      { area: "Mina Subterrânea", sector: "Galeria Sul", latitude: -19.8880, longitude: -43.6728 },
+      { area: "Mina Subterrânea", sector: "Frente de lavra", latitude: -19.8860, longitude: -43.6780 },
+      { area: "Mina Subterrânea", sector: "Ventilação auxiliar", latitude: -19.8820, longitude: -43.6785 },
+      { area: "Mina Subterrânea", sector: "Câmara de refúgio", latitude: -19.8890, longitude: -43.6695 },
+      { area: "Planta de Beneficiamento", sector: "Britagem primária", latitude: -19.8818, longitude: -43.6687 },
+      { area: "Planta de Beneficiamento", sector: "Correia transportadora", latitude: -19.8830, longitude: -43.6655 },
+      { area: "Planta de Beneficiamento", sector: "Espessamento", latitude: -19.8795, longitude: -43.6670 },
+      { area: "Planta de Beneficiamento", sector: "Pátio ROM", latitude: -19.8768, longitude: -43.6710 },
+      { area: "Manutenção / Oficina", sector: "Oficina mecânica", latitude: -19.8865, longitude: -43.6664 },
+      { area: "Manutenção / Oficina", sector: "Almoxarifado", latitude: -19.8880, longitude: -43.6635 },
+      { area: "Manutenção / Oficina", sector: "Abastecimento", latitude: -19.8900, longitude: -43.6660 },
+      { area: "Depósito de Explosivos", sector: "Paiol", latitude: -19.8912, longitude: -43.6751 },
+      { area: "Depósito de Explosivos", sector: "Área de exclusão", latitude: -19.8935, longitude: -43.6720 },
+      { area: "Acesso e Superfície", sector: "Portaria", latitude: -19.8787, longitude: -43.6638 },
+      { area: "Acesso e Superfície", sector: "Rota de fuga", latitude: -19.8805, longitude: -43.6615 },
+      { area: "Acesso e Superfície", sector: "Via interna", latitude: -19.8850, longitude: -43.6600 }
+    ];
+    const outside = locations.filter((location) => !pointInGeoJson(location.longitude, location.latitude, boundary));
+    if (outside.length) {
+      return res.status(409).json({
+        status: "error",
+        message: "La carga fue cancelada: existen ubicaciones fuera de la geocerca",
+        outside: outside.map(({ area, sector, latitude, longitude }) => ({ area, sector, latitude, longitude }))
+      });
+    }
+
+    const caseTemplates = [
+      ["RISK", "Condição insegura em frente de lavra", "Rocha solta identificada durante inspeção inicial."],
+      ["MEDICAL", "Atendimento por mal-estar de trabalhador", "Trabalhador apresentou tontura durante o turno."],
+      ["FIRE", "Princípio de incêndio em equipamento", "Aquecimento anormal e fumaça controlados pela brigada."],
+      ["SECURITY", "Acesso não autorizado em área restrita", "Pessoa detectada junto ao perímetro operacional."],
+      ["FALL_DETECTED", "Queda de mesmo nível", "Trabalhador escorregou em piso úmido, sem lesão grave."],
+      ["RISK", "Falha de iluminação em galeria", "Trecho com luminosidade abaixo do padrão operacional."],
+      ["OTHER", "Derramamento de óleo hidráulico", "Vazamento contido e área isolada para limpeza."],
+      ["TRAFFIC_ACCIDENT", "Quase colisão em via interna", "Interação entre veículo leve e equipamento móvel."],
+      ["RISK", "Proteção de correia transportadora aberta", "Guarda lateral encontrada fora de posição."],
+      ["MEDICAL", "Lesão leve durante manutenção", "Escoriação na mão durante ajuste de componente."],
+      ["RISK", "Desvio em bloqueio e etiquetagem", "Fonte de energia secundária exigiu bloqueio adicional."],
+      ["SOS_MANUAL", "Solicitação de apoio operacional", "Equipe solicitou suporte preventivo do HSE."],
+      ["FIRE", "Alarme de fumaça na oficina", "Inspeção confirmou superaquecimento sem propagação."],
+      ["RISK", "Material solto próximo à rota de fuga", "Obstrução parcial removida pela equipe local."],
+      ["SECURITY", "Portão de acesso encontrado aberto", "Controle de acesso restabelecido e ocorrência registrada."],
+      ["RISK", "Ventilação auxiliar abaixo do esperado", "Medição indicou vazão reduzida no início do turno."],
+      ["OTHER", "Comunicação de rádio intermitente", "Falha de cobertura reportada em trecho subterrâneo."],
+      ["FALL_DETECTED", "Risco de queda em trabalho em altura", "Linha de vida precisava de verificação complementar."],
+      ["MEDICAL", "Atendimento preventivo por fadiga", "Trabalhador encaminhado para avaliação e descanso."],
+      ["RISK", "Segregação deficiente no pátio ROM", "Barreira física deslocada após movimentação de carga."],
+      ["TRAFFIC_ACCIDENT", "Contato leve entre veículos", "Ocorrência sem feridos, com danos materiais menores."],
+      ["RISK", "Sinalização insuficiente na britagem", "Placa de advertência ausente em ponto de manutenção."],
+      ["OTHER", "Ruído anormal em bomba de processo", "Equipamento isolado para diagnóstico de manutenção."],
+      ["FIRE", "Odor de queimado no almoxarifado", "Circuito elétrico preventivamente desenergizado."],
+      ["SECURITY", "Falha temporária no controle de acesso", "Leitor de credencial operou de forma intermitente."],
+      ["RISK", "Piso irregular em rota de pedestres", "Desnível sinalizado até execução da correção."],
+      ["MEDICAL", "Pequeno corte durante inspeção", "Primeiros socorros realizados no local."],
+      ["RISK", "Ausência de calço em equipamento parado", "Controle crítico restabelecido antes da operação."],
+      ["SOS_MANUAL", "Acionamento preventivo da equipe HSE", "Verificação solicitada por trabalhador da área."],
+      ["RISK", "Instabilidade observada em talude interno", "Área isolada para avaliação geotécnica."],
+    ];
+    const openStates = [
+      "ACTIVE", "ACKNOWLEDGED", "ASSIGNED", "EN_ROUTE",
+      "ACTIVE", "ACTIVE", "ACKNOWLEDGED", "ASSIGNED", "ACCEPTED_BY_RESOLVER", "ON_SITE", "RESOLVED"
+    ];
+    const previousWeekSlots = [
+      [0, 6, 15], [0, 12, 40], [0, 21, 10],
+      [1, 7, 35], [1, 15, 20], [1, 23, 5],
+      [2, 5, 50], [2, 11, 25], [2, 18, 45],
+      [3, 8, 10], [3, 14, 55], [3, 20, 30],
+      [4, 6, 45], [4, 13, 15], [4, 22, 20],
+      [5, 9, 5], [5, 16, 35], [6, 19, 10]
+    ];
+
+    const now = new Date();
+    const utcDayOffset = (now.getUTCDay() + 6) % 7;
+    const currentWeekStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - utcDayOffset));
+    const previousWeekStart = new Date(currentWeekStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const elapsedCurrentWeekMs = Math.max(60 * 60 * 1000, now.getTime() - currentWeekStart.getTime());
+    const currentRatios = [0.06, 0.13, 0.21, 0.30, 0.40, 0.51, 0.60, 0.68, 0.76, 0.84, 0.90, 0.94];
+
+    const createdAtForIndex = (index) => {
+      if (index < previousWeekSlots.length) {
+        const [day, hour, minute] = previousWeekSlots[index];
+        return new Date(previousWeekStart.getTime() + day * 86400000 + hour * 3600000 + minute * 60000);
+      }
+      return new Date(currentWeekStart.getTime() + elapsedCurrentWeekMs * currentRatios[index - previousWeekSlots.length]);
+    };
+    const finalStateForIndex = (index) => {
+      if (index < 14 || (index >= 18 && index < 23)) return "CLOSED";
+      return openStates[index < 18 ? index - 14 : index - 19];
+    };
+    const stateRank = {
+      ACTIVE: 0,
+      ACKNOWLEDGED: 1,
+      ASSIGNED: 2,
+      ACCEPTED_BY_RESOLVER: 3,
+      EN_ROUTE: 4,
+      ON_SITE: 5,
+      RESOLVED: 6,
+      CLOSED: 7
+    };
+
+    await client.query("BEGIN");
+    const seeded = [];
+    for (let index = 0; index < caseTemplates.length; index += 1) {
+      const [alertType, title, description] = caseTemplates[index];
+      const location = locations[(index * 5 + Math.floor(index / locations.length)) % locations.length];
+      const state = finalStateForIndex(index);
+      const rank = stateRank[state];
+      const worker = workers[index % workers.length];
+      const resolver = hseProfessionals[index % hseProfessionals.length];
+      const supervisor = supervisors[index % supervisors.length];
+      const createdAt = createdAtForIndex(index);
+      const capAtNow = (offsetMinutes) => new Date(Math.min(createdAt.getTime() + offsetMinutes * 60000, now.getTime() - 60000));
+      const acknowledgedAt = rank >= 1 ? capAtNow(7 + (index % 5)) : null;
+      const assignedAt = rank >= 2 ? capAtNow(18 + (index % 9)) : null;
+      const acceptedAt = rank >= 3 ? capAtNow(24 + (index % 9)) : null;
+      const enRouteAt = rank >= 4 ? capAtNow(31 + (index % 11)) : null;
+      const onSiteAt = rank >= 5 ? capAtNow(47 + (index % 13)) : null;
+      const resolvedAt = rank >= 6 ? capAtNow(72 + (index % 24)) : null;
+      const closedAt = rank >= 7 ? capAtNow(91 + (index % 31)) : null;
+      const updatedAt = closedAt || resolvedAt || onSiteAt || enRouteAt || acceptedAt || assignedAt || acknowledgedAt || createdAt;
+      const ticketId = deterministicDemoUuid(`CC-JAGUAR-DEMO:HISTORY-V1:TICKET:${index + 1}`);
+      const sectorCode = `DEMO-${String(locations.indexOf(location) + 1).padStart(2, "0")}`;
+
+      await client.query(
+        `
+        INSERT INTO tickets (
+          id, control_center_id, citizen_user_id, source_type, source_event_id,
+          alert_type, title, description, state, priority, latitude, longitude, accuracy,
+          assigned_operator_id, assigned_resolver_id, created_at, acknowledged_at, assigned_at,
+          resolved_at, closed_at, updated_at, jurisdiction_status, jurisdiction_reason,
+          event_sector_code, event_sector_name, event_sector_method, event_sector_source, event_sector_updated_at
+        ) VALUES (
+          $1,$2,$3,'DEMO_SEED',NULL,$4,$5,$6,$7,$8,$9,$10,8,
+          $11,$12,$13,$14,$15,$16,$17,$18,'IN_JURISDICTION',$19,$20,$21,
+          'DEMO_GEOFENCE_VALIDATED','JAGUAR_HISTORY_SEED_V1',$18
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          control_center_id=EXCLUDED.control_center_id, citizen_user_id=EXCLUDED.citizen_user_id,
+          source_type=EXCLUDED.source_type, alert_type=EXCLUDED.alert_type, title=EXCLUDED.title,
+          description=EXCLUDED.description, state=EXCLUDED.state, priority=EXCLUDED.priority,
+          latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude, accuracy=EXCLUDED.accuracy,
+          assigned_operator_id=EXCLUDED.assigned_operator_id, assigned_resolver_id=EXCLUDED.assigned_resolver_id,
+          created_at=EXCLUDED.created_at, acknowledged_at=EXCLUDED.acknowledged_at,
+          assigned_at=EXCLUDED.assigned_at, resolved_at=EXCLUDED.resolved_at,
+          closed_at=EXCLUDED.closed_at, updated_at=EXCLUDED.updated_at,
+          jurisdiction_status=EXCLUDED.jurisdiction_status, jurisdiction_reason=EXCLUDED.jurisdiction_reason,
+          event_sector_code=EXCLUDED.event_sector_code, event_sector_name=EXCLUDED.event_sector_name,
+          event_sector_method=EXCLUDED.event_sector_method, event_sector_source=EXCLUDED.event_sector_source,
+          event_sector_updated_at=EXCLUDED.event_sector_updated_at
+        `,
+        [
+          ticketId, controlCenter.id, worker.id, alertType, `[DEMO JAGUAR HIST] ${title}`,
+          `${description} Área: ${location.area}. Ponto: ${location.sector}.`, state,
+          1 + (index % 4), location.latitude, location.longitude,
+          rank >= 1 ? supervisor.id : null, rank >= 2 ? resolver.id : null,
+          createdAt, acknowledgedAt, assignedAt, resolvedAt, closedAt, updatedAt,
+          `Coordenada validada dentro da geocerca de ${controlCenter.name}`,
+          sectorCode, `${location.area} · ${location.sector}`
+        ]
+      );
+
+      await client.query(`DELETE FROM ticket_actions WHERE ticket_id = $1`, [ticketId]);
+      await client.query(`DELETE FROM ticket_notes WHERE ticket_id = $1`, [ticketId]);
+      await client.query(`DELETE FROM ticket_assignments WHERE ticket_id = $1`, [ticketId]);
+
+      const actions = [
+        ["TICKET_CREATED", "NEIGHBOR", worker.id, "Caso comunicado pelo trabalhador", createdAt]
+      ];
+      if (acknowledgedAt) actions.push(["ACKNOWLEDGED", "OPERATOR", supervisor.id, "Supervisor tomou conhecimento do caso", acknowledgedAt]);
+      if (assignedAt) actions.push(["MANUAL_ASSIGNED", "OPERATOR", supervisor.id, `Caso atribuído ao Profissional HSE ${resolver.full_name}`, assignedAt]);
+      if (acceptedAt) actions.push(["RESOLVER_ACCEPTED", "RESOLVER", resolver.id, "Profissional HSE aceitou o atendimento", acceptedAt]);
+      if (enRouteAt) actions.push(["RESOLVER_EN_ROUTE", "RESOLVER", resolver.id, "Profissional HSE em deslocamento", enRouteAt]);
+      if (onSiteAt) actions.push(["RESOLVER_ON_SITE", "RESOLVER", resolver.id, "Profissional HSE chegou ao local", onSiteAt]);
+      if (resolvedAt) actions.push(["TICKET_RESOLVED", "RESOLVER", resolver.id, "Atendimento de campo concluído e evidências registradas", resolvedAt]);
+      if (closedAt) actions.push(["TICKET_CLOSED", "OPERATOR", supervisor.id, "Investigação revisada e caso encerrado", closedAt]);
+      for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+        const [actionType, actorRole, actorUserId, actionDescription, actionCreatedAt] = actions[actionIndex];
+        await client.query(
+          `INSERT INTO ticket_actions (id,ticket_id,actor_user_id,actor_role,action_type,description,metadata,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)`,
+          [
+            deterministicDemoUuid(`CC-JAGUAR-DEMO:HISTORY-V1:ACTION:${index + 1}:${actionIndex + 1}`),
+            ticketId, actorUserId, actorRole, actionType, actionDescription,
+            JSON.stringify({ demo: true, dataset: "JAGUAR_HISTORY_V1", area: location.area, sector: location.sector }),
+            actionCreatedAt
+          ]
+        );
+      }
+
+      if (assignedAt) {
+        await client.query(
+          `INSERT INTO ticket_assignments (
+             id,ticket_id,resolver_user_id,assignment_type,state,distance_meters,
+             notified_at,accepted_at,created_at,updated_at
+           ) VALUES ($1,$2,$3,'MANUAL',$4,$5,$6,$7,$6,$8)`,
+          [
+            deterministicDemoUuid(`CC-JAGUAR-DEMO:HISTORY-V1:ASSIGNMENT:${index + 1}`),
+            ticketId, resolver.id, acceptedAt ? "ACCEPTED" : "PENDING", 120 + ((index * 83) % 1800),
+            assignedAt, acceptedAt, updatedAt
+          ]
+        );
+      }
+      if (rank >= 5) {
+        await client.query(
+          `INSERT INTO ticket_notes (id,ticket_id,author_user_id,note,created_at) VALUES ($1,$2,$3,$4,$5)`,
+          [
+            deterministicDemoUuid(`CC-JAGUAR-DEMO:HISTORY-V1:NOTE:${index + 1}`),
+            ticketId, resolver.id,
+            `Inspeção realizada em ${location.sector}. Condições do local documentadas para análise HSE.`,
+            onSiteAt || updatedAt
+          ]
+        );
+      }
+
+      seeded.push({ id: ticketId, state, created_at: createdAt, area: location.area, sector: location.sector });
+    }
+    await client.query("COMMIT");
+
+    const stateCounts = seeded.reduce((counts, ticket) => {
+      counts[ticket.state] = (counts[ticket.state] || 0) + 1;
+      return counts;
+    }, {});
+    res.json({
+      status: "ok",
+      message: "Casos históricos demo creados/actualizados",
+      control_center_code: requestedCode,
+      total: seeded.length,
+      closed: stateCounts.CLOSED || 0,
+      open: seeded.length - (stateCounts.CLOSED || 0),
+      states: stateCounts,
+      distinct_locations: locations.length,
+      geofence_validation: "ALL_INSIDE",
+      date_range: {
+        from: seeded[0]?.created_at,
+        to: seeded[seeded.length - 1]?.created_at
+      },
+      cases: seeded
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    console.error("[JAGUAR DEMO HISTORICAL CASES ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  } finally {
+    client.release();
+  }
+});
 
 async function adminResolveControlCenter(reqOrCode, maybeCode) {
   const requestedCode = typeof reqOrCode === "object" && reqOrCode?.headers
@@ -16530,10 +16874,14 @@ function pointInPolygonGeometry(lat, lon, geometry) {
 async function classifySectorForPoint(controlCenterCode, latitude, longitude) {
   const lat = Number(latitude);
   const lon = Number(longitude);
+  const settingsRow = await getControlCenterSettingsByCode(controlCenterCode).catch(() => null);
+  const settings = settingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+  const vertical = String(settings.vertical || 'CITY').toUpperCase();
+  const zone = String(settings?.terminology?.zone || (vertical === 'MINING' ? 'Área o faena' : 'Sector')).trim();
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return {
       event_sector_code: null,
-      event_sector_name: 'Sector no informado',
+      event_sector_name: vertical === 'CITY' ? 'Sector no informado' : `${zone} no informada`,
       event_sector_method: 'Sin coordenadas de evento',
       event_sector_source: null
     };
@@ -16554,7 +16902,9 @@ async function classifySectorForPoint(controlCenterCode, latitude, longitude) {
 
   return {
     event_sector_code: null,
-    event_sector_name: 'Dentro de la comuna, sin unidad vecinal identificada',
+    event_sector_name: vertical === 'CITY'
+      ? 'Dentro de la comuna, sin unidad vecinal identificada'
+      : `${zone} no informada`,
     event_sector_method: 'No intersecta sectores cargados',
     event_sector_source: 'control_center_sectors'
   };
