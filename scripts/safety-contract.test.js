@@ -50,6 +50,11 @@ assert.match(safety, /\/admin\/control-centers\/:code\/safety\/pnr\/:id\/content
 assert.match(safety, /\/mobile\/safety\/pnr/, "la app Trabajador debe consultar PNR aplicables");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/risk/, "la app HSE debe registrar riesgo por ticket");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/inspections/, "la app HSE debe registrar inspecciones asociadas al ticket");
+assert.match(safety, /app\.post\("\/resolver\/safety\/inspections"/, "la app HSE debe crear inspecciones autónomas");
+assert.match(safety, /\/resolver\/safety\/inspections\/:inspectionId\/evidence/, "la inspección autónoma debe admitir evidencia multimedia");
+assert.match(safetyMigration, /safety_inspections ADD COLUMN IF NOT EXISTS evidence JSONB/, "las inspecciones deben persistir metadatos de evidencia");
+assert.match(safetyMigration, /CREATE TABLE IF NOT EXISTS safety_inspection_evidence/, "la evidencia HSE debe persistir fuera del filesystem efímero");
+assert.match(safety, /\/resolver\/safety\/inspections\/:inspectionId\/evidence\/:evidenceId\/content/, "la evidencia HSE debe poder recuperarse posteriormente");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/control-verifications/, "la app HSE debe verificar controles críticos asociados al ticket");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/closure-request/, "el Profesional HSE debe solicitar aprobación del cierre");
 assert.match(safety, /\/hse\/supervisor\/closure-requests/, "el Supervisor HSE debe revisar y decidir solicitudes de cierre");

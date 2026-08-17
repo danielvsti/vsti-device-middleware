@@ -5108,6 +5108,38 @@ function publicBaseUrl(req) {
   return process.env.PUBLIC_BASE_URL || SOS_PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
 }
 
+function storeUploadedMedia(req, { scopeId, mediaType, dataUrl, fileName, prefix = "media" }) {
+  if (!["audio", "video"].includes(mediaType)) {
+    const error = new Error("media_type must be audio or video");
+    error.statusCode = 400;
+    throw error;
+  }
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed || !String(parsed.mimeType || "").toLowerCase().startsWith(`${mediaType}/`)) {
+    const error = new Error("data_url must contain valid media content");
+    error.statusCode = 400;
+    throw error;
+  }
+  const maxBytes = mediaType === "video" ? 20 * 1024 * 1024 : 8 * 1024 * 1024;
+  if (parsed.buffer.length > maxBytes) {
+    const error = new Error("media file too large");
+    error.statusCode = 413;
+    throw error;
+  }
+  const ext = safeFileExtension(parsed.mimeType, mediaType);
+  const safeScope = String(scopeId || "record").replace(/[^a-zA-Z0-9_-]/g, "");
+  const safePrefix = String(prefix || "media").replace(/[^a-zA-Z0-9_-]/g, "");
+  const uploadName = `${safePrefix}-${safeScope}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+  return {
+    media_type: mediaType,
+    file_name: fileName || uploadName,
+    mime_type: parsed.mimeType,
+    size_bytes: parsed.buffer.length,
+    content_buffer: parsed.buffer,
+    created_at: new Date().toISOString()
+  };
+}
+
 function meetingRoomForTicket(ticketId) {
   return `VSTI-SOS-${String(ticketId).replace(/[^a-zA-Z0-9]/g, "").slice(0, 32)}`;
 }
@@ -17147,7 +17179,8 @@ registerSafetyModule({
   adminResolveControlCenter,
   getControlCenterSettingsById,
   syncMobileEventStateFromTicket,
-  releaseResolverFromTicket
+  releaseResolverFromTicket,
+  storeUploadedMedia
 });
 
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 

@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS safety_inspections (
   score NUMERIC(5,2),
   responses JSONB NOT NULL DEFAULT '[]'::jsonb,
   findings JSONB NOT NULL DEFAULT '[]'::jsonb,
+  evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
   notes TEXT,
   inspector_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
   created_by UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -78,6 +79,23 @@ CREATE TABLE IF NOT EXISTS safety_inspections (
   updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_safety_inspections_cc_date ON safety_inspections(control_center_id, COALESCE(scheduled_at, created_at) DESC);
+ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE TABLE IF NOT EXISTS safety_inspection_evidence (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  inspection_id UUID NOT NULL REFERENCES safety_inspections(id) ON DELETE CASCADE,
+  control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+  media_type VARCHAR(20) NOT NULL,
+  file_name VARCHAR(255),
+  mime_type VARCHAR(120) NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  content BYTEA NOT NULL,
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  CONSTRAINT safety_inspection_evidence_media_type CHECK (media_type IN ('audio','video'))
+);
+CREATE INDEX IF NOT EXISTS idx_safety_inspection_evidence_inspection
+  ON safety_inspection_evidence(inspection_id, created_at);
 
 CREATE TABLE IF NOT EXISTS safety_critical_controls (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

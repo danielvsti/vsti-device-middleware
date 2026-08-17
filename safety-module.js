@@ -105,7 +105,8 @@ function registerSafetyModule({
   adminResolveControlCenter,
   getControlCenterSettingsById,
   syncMobileEventStateFromTicket,
-  releaseResolverFromTicket
+  releaseResolverFromTicket,
+  storeUploadedMedia
 }) {
   let schemaPromise = null;
 
@@ -180,6 +181,7 @@ function registerSafetyModule({
           score NUMERIC(5,2),
           responses JSONB NOT NULL DEFAULT '[]'::jsonb,
           findings JSONB NOT NULL DEFAULT '[]'::jsonb,
+          evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
           notes TEXT,
           inspector_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
           created_by UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -187,6 +189,22 @@ function registerSafetyModule({
           updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_safety_inspections_cc_date ON safety_inspections(control_center_id, COALESCE(scheduled_at, created_at) DESC);
+
+        CREATE TABLE IF NOT EXISTS safety_inspection_evidence (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          inspection_id UUID NOT NULL REFERENCES safety_inspections(id) ON DELETE CASCADE,
+          control_center_id UUID NOT NULL REFERENCES control_centers(id) ON DELETE CASCADE,
+          media_type VARCHAR(20) NOT NULL,
+          file_name VARCHAR(255),
+          mime_type VARCHAR(120) NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          content BYTEA NOT NULL,
+          created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          CONSTRAINT safety_inspection_evidence_media_type CHECK (media_type IN ('audio','video'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_safety_inspection_evidence_inspection
+          ON safety_inspection_evidence(inspection_id, created_at);
 
         CREATE TABLE IF NOT EXISTS safety_critical_controls (
           id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -312,6 +330,7 @@ function registerSafetyModule({
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS lessons_learned TEXT;
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS conclusion TEXT;
         ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
         ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS control_type VARCHAR(32);
         ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS work_area VARCHAR(180);
         ALTER TABLE safety_control_verifications ADD COLUMN IF NOT EXISTS ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
@@ -997,6 +1016,125 @@ function registerSafetyModule({
       const incident = await ensureTicketIncident(ticket, actorId(req));
       const updated = await updateInvestigation(ticket, incident, req.body || {}, actorId(req));
       res.json({ status: "ok", incident: updated });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.get("/resolver/safety/inspections", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER"]); if (!context) return;
+      const limit = Math.max(1, Math.min(30, Number(req.query.limit) || 10));
+      const result = await pool.query(
+        `SELECT id,title,inspection_type,area,completed_at,status,result,score,notes,evidence,created_at,updated_at
+         FROM safety_inspections
+         WHERE control_center_id=$1 AND inspector_user_id=$2 AND linked_ticket_id IS NULL
+         ORDER BY COALESCE(completed_at, created_at) DESC
+         LIMIT $3`,
+        [context.session.control_center_id, context.session.sub, limit]
+      );
+      res.json({ status: "ok", inspections: result.rows });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/safety/inspections", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER"]); if (!context) return;
+      const body = req.body || {};
+      const result = await pool.query(
+        `INSERT INTO safety_inspections(
+           control_center_id,title,inspection_type,area,completed_at,status,result,score,
+           responses,findings,evidence,notes,inspector_user_id,created_by
+         ) VALUES($1,$2,$3,$4,NOW(),'COMPLETED',$5,$6,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,$7,$8,$8)
+         RETURNING *`,
+        [
+          context.session.control_center_id,
+          required(body.title, "Título de inspección", 180),
+          text(body.inspection_type || "ROUTINE_INSPECTION", 80).toUpperCase(),
+          text(body.area, 180) || null,
+          enumValue(body.result, SAFETY_STATUSES.inspectionResult, "NOT_EVALUATED"),
+          numberOrNull(body.score, 0, 100),
+          text(body.notes, 5000) || null,
+          actorId(req)
+        ]
+      );
+      res.status(201).json({ status: "ok", inspection: result.rows[0] });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/safety/inspections/:inspectionId/evidence", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER"]); if (!context) return;
+      if (typeof storeUploadedMedia !== "function") throw new Error("Almacenamiento de evidencia no configurado");
+      const inspection = await pool.query(
+        `SELECT id FROM safety_inspections
+         WHERE id=$1 AND control_center_id=$2 AND inspector_user_id=$3 AND linked_ticket_id IS NULL
+         LIMIT 1`,
+        [req.params.inspectionId, context.session.control_center_id, context.session.sub]
+      );
+      if (!inspection.rows.length) return res.status(404).json({ status: "error", message: "Inspección no encontrada" });
+
+      const mediaType = text(req.body?.media_type, 20).toLowerCase();
+      if (!["audio", "video"].includes(mediaType)) throw new Error("La evidencia debe ser audio o video");
+      const uploaded = storeUploadedMedia(req, {
+        scopeId: req.params.inspectionId,
+        mediaType,
+        dataUrl: req.body?.data_url,
+        fileName: text(req.body?.file_name, 255) || null,
+        prefix: "hse-inspection"
+      });
+      const stored = await pool.query(
+        `INSERT INTO safety_inspection_evidence(
+           inspection_id,control_center_id,media_type,file_name,mime_type,size_bytes,content,created_by
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+         RETURNING id,media_type,file_name,mime_type,size_bytes,created_at`,
+        [
+          req.params.inspectionId,
+          context.session.control_center_id,
+          uploaded.media_type,
+          uploaded.file_name,
+          uploaded.mime_type,
+          uploaded.size_bytes,
+          uploaded.content_buffer,
+          actorId(req)
+        ]
+      );
+      const evidence = {
+        ...stored.rows[0],
+        media_url: `/resolver/safety/inspections/${encodeURIComponent(req.params.inspectionId)}/evidence/${encodeURIComponent(stored.rows[0].id)}/content`
+      };
+      const updated = await pool.query(
+        `UPDATE safety_inspections
+         SET evidence=COALESCE(evidence,'[]'::jsonb) || $2::jsonb, updated_at=NOW()
+         WHERE id=$1
+         RETURNING id,evidence,updated_at`,
+        [req.params.inspectionId, JSON.stringify([evidence])]
+      );
+      res.status(201).json({ status: "ok", evidence, inspection: updated.rows[0] });
+    } catch (error) {
+      const status = Number(error.statusCode) || 400;
+      res.status(status).json({ status: "error", message: error.message });
+    }
+  });
+
+  app.get("/resolver/safety/inspections/:inspectionId/evidence/:evidenceId/content", async (req, res) => {
+    try {
+      const context = await mobileSafetyContext(req, res, ["RESOLVER", "ADMIN", "SUPER_ADMIN"]); if (!context) return;
+      const result = await pool.query(
+        `SELECT e.content,e.mime_type,e.file_name,e.size_bytes,i.inspector_user_id
+         FROM safety_inspection_evidence e
+         JOIN safety_inspections i ON i.id=e.inspection_id
+         WHERE e.id=$1 AND e.inspection_id=$2 AND e.control_center_id=$3
+         LIMIT 1`,
+        [req.params.evidenceId, req.params.inspectionId, context.session.control_center_id]
+      );
+      if (!result.rows.length) return res.status(404).json({ status: "error", message: "Evidencia no encontrada" });
+      const evidence = result.rows[0];
+      if (String(context.session.role || "").toUpperCase() === "RESOLVER" && String(evidence.inspector_user_id) !== String(context.session.sub)) {
+        return res.status(403).json({ status: "error", message: "Evidencia no autorizada" });
+      }
+      res.setHeader("Content-Type", evidence.mime_type || "application/octet-stream");
+      res.setHeader("Content-Length", evidence.size_bytes);
+      res.setHeader("Content-Disposition", `inline; filename="${String(evidence.file_name || "evidencia").replace(/[\r\n\"]/g, "")}"`);
+      res.send(evidence.content);
     } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
   });
 
