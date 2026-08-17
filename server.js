@@ -15098,7 +15098,7 @@ app.post("/admin/control-centers/:code/demo/historical-cases", async (req, res) 
         ) VALUES (
           $1,$2,$3,'DEMO_SEED',NULL,$4,$5,$6,$7,$8,$9,$10,8,
           $11,$12,$13,$14,$15,$16,$17,$18,'IN_JURISDICTION',$19,$20,$21,
-          'DEMO_GEOFENCE_VALIDATED','JAGUAR_HISTORY_SEED_V1',$18
+          'DEMO_GEOFENCE_VALIDATED','JAGUAR_HISTORY_SEED_V1',$22
         )
         ON CONFLICT (id) DO UPDATE SET
           control_center_id=EXCLUDED.control_center_id, citizen_user_id=EXCLUDED.citizen_user_id,
@@ -15121,7 +15121,7 @@ app.post("/admin/control-centers/:code/demo/historical-cases", async (req, res) 
           rank >= 1 ? supervisor.id : null, rank >= 2 ? resolver.id : null,
           createdAt, acknowledgedAt, assignedAt, resolvedAt, closedAt, updatedAt,
           `Coordenada validada dentro da geocerca de ${controlCenter.name}`,
-          sectorCode, `${location.area} · ${location.sector}`
+          sectorCode, `${location.area} · ${location.sector}`, updatedAt
         ]
       );
 
