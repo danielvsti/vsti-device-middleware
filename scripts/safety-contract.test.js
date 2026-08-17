@@ -12,7 +12,7 @@ const hsePortalMigration = fs.readFileSync(path.join(root, "db/migrations/202608
 
 assert.match(server, /registerSafetyModule\s*\(/, "server.js debe registrar el módulo Safety");
 assert.match(server, /VERTICAL_CONTROL_CENTER_DEFAULTS/, "deben existir defaults por vertical");
-assert.match(server, /MINING[\s\S]*Trabajador[\s\S]*Brigadista/, "MINING debe parametrizar terminología visible");
+assert.match(server, /MINING[\s\S]*Trabajador[\s\S]*Profesional HSE/, "MINING debe parametrizar terminología visible");
 assert.match(server, /INDUSTRY[\s\S]*Colaborador[\s\S]*Equipo de Emergencia/, "INDUSTRY debe parametrizar terminología visible");
 assert.match(server, /DEFAULT_CONTROL_CENTER_SETTINGS[\s\S]*vertical: 'CITY'/, "CITY debe seguir siendo la vertical predeterminada para compatibilidad");
 assert.match(server, /CITY: \{\}/, "CITY no debe alterar los valores operacionales existentes");

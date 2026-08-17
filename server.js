@@ -402,7 +402,7 @@ const VERTICAL_CONTROL_CENTER_DEFAULTS = Object.freeze({
   CITY: {},
   MINING: {
     terminology: {
-      endUser: 'Trabajador', responder: 'Brigadista', operator: 'Operador', incident: 'Incidente',
+      endUser: 'Trabajador', responder: 'Profesional HSE', operator: 'Supervisor HSE', incident: 'Incidente',
       organization: 'Compañía Minera', zone: 'Área o Faena', controlCenter: 'Centro de Control'
     },
     safety_modules: { enabled: true, incidents: true, inspections: true, critical_controls: true, behavior_observations: true, camera_ai: false }
@@ -708,6 +708,14 @@ function normalizeControlCenterSettings(input = {}) {
   const terminologyDefaults = deepMergeSettings(DEFAULT_CONTROL_CENTER_SETTINGS.terminology, verticalDefaults.terminology || {});
   for (const key of Object.keys(DEFAULT_CONTROL_CENTER_SETTINGS.terminology)) {
     merged.terminology[key] = String(merged.terminology[key] || terminologyDefaults[key]).trim().slice(0, 100);
+  }
+  // Los primeros perfiles MINING usaban "Brigadista" como término genérico.
+  // La operación HSE definida para QUELTU Minería usa Profesional HSE.
+  if (vertical === 'MINING' && merged.terminology.responder === 'Brigadista') {
+    merged.terminology.responder = 'Profesional HSE';
+  }
+  if (vertical === 'MINING' && merged.terminology.operator === 'Operador') {
+    merged.terminology.operator = 'Supervisor HSE';
   }
 
   merged.features = merged.features || {};
