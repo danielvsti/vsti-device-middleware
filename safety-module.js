@@ -1039,11 +1039,19 @@ function registerSafetyModule({
     try {
       const context = await mobileSafetyContext(req, res, ["RESOLVER"]); if (!context) return;
       const body = req.body || {};
+      const textEvidence = jsonArray(body.text_evidence, 30, 100_000)
+        .map((item) => ({
+          media_type: "text",
+          text: text(item?.text, 3000),
+          created_at: dateOrNull(item?.created_at) || new Date().toISOString(),
+          created_by: actorId(req)
+        }))
+        .filter((item) => item.text);
       const result = await pool.query(
         `INSERT INTO safety_inspections(
            control_center_id,title,inspection_type,area,completed_at,status,result,score,
            responses,findings,evidence,notes,inspector_user_id,created_by
-         ) VALUES($1,$2,$3,$4,NOW(),'COMPLETED',$5,$6,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,$7,$8,$8)
+         ) VALUES($1,$2,$3,$4,NOW(),'COMPLETED',$5,$6,'[]'::jsonb,'[]'::jsonb,$7::jsonb,$8,$9,$9)
          RETURNING *`,
         [
           context.session.control_center_id,
@@ -1052,6 +1060,7 @@ function registerSafetyModule({
           text(body.area, 180) || null,
           enumValue(body.result, SAFETY_STATUSES.inspectionResult, "NOT_EVALUATED"),
           numberOrNull(body.score, 0, 100),
+          JSON.stringify(textEvidence),
           text(body.notes, 5000) || null,
           actorId(req)
         ]
