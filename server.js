@@ -15180,6 +15180,69 @@ app.post("/admin/control-centers/:code/demo/historical-cases", async (req, res) 
 
       seeded.push({ id: ticketId, state, created_at: createdAt, area: location.area, sector: location.sector });
     }
+
+    // The first Jaguar demo dataset was created through the public ticket API,
+    // so every case inherited NOW() as created_at. Keep those useful cases, but
+    // spread their complete timeline deterministically across the preceding two
+    // weeks so dashboard history and SLA charts represent a credible operation.
+    const legacyResult = await client.query(
+      `SELECT id, created_at
+       FROM tickets
+       WHERE control_center_id = $1
+         AND title LIKE '[DEMO JAGUAR] %'
+       ORDER BY title ASC`,
+      [controlCenter.id]
+    );
+    const legacyStart = new Date(currentWeekStart.getTime() - 14 * 86400000);
+    const legacyHours = [5, 7, 9, 11, 13, 15, 17, 19, 21, 23];
+    for (let index = 0; index < legacyResult.rows.length; index += 1) {
+      const legacy = legacyResult.rows[index];
+      const dayOffset = Math.min(13, Math.floor(index * 14 / Math.max(1, legacyResult.rows.length)));
+      const targetCreatedAt = new Date(
+        legacyStart.getTime() +
+        dayOffset * 86400000 +
+        legacyHours[index % legacyHours.length] * 3600000 +
+        (index * 7 % 60) * 60000
+      );
+      const deltaMs = targetCreatedAt.getTime() - new Date(legacy.created_at).getTime();
+
+      await client.query(
+        `UPDATE tickets SET
+           created_at = $2,
+           acknowledged_at = CASE WHEN acknowledged_at IS NULL THEN NULL ELSE acknowledged_at + $3::double precision * interval '1 millisecond' END,
+           assigned_at = CASE WHEN assigned_at IS NULL THEN NULL ELSE assigned_at + $3::double precision * interval '1 millisecond' END,
+           resolved_at = CASE WHEN resolved_at IS NULL THEN NULL ELSE resolved_at + $3::double precision * interval '1 millisecond' END,
+           closed_at = CASE WHEN closed_at IS NULL THEN NULL ELSE closed_at + $3::double precision * interval '1 millisecond' END,
+           cancelled_at = CASE WHEN cancelled_at IS NULL THEN NULL ELSE cancelled_at + $3::double precision * interval '1 millisecond' END,
+           updated_at = updated_at + $3::double precision * interval '1 millisecond',
+           event_sector_updated_at = CASE WHEN event_sector_updated_at IS NULL THEN NULL ELSE event_sector_updated_at + $3::double precision * interval '1 millisecond' END
+         WHERE id = $1`,
+        [legacy.id, targetCreatedAt, deltaMs]
+      );
+      await client.query(
+        `UPDATE ticket_actions SET created_at = created_at + $2::double precision * interval '1 millisecond' WHERE ticket_id = $1`,
+        [legacy.id, deltaMs]
+      );
+      await client.query(
+        `UPDATE ticket_notes SET created_at = created_at + $2::double precision * interval '1 millisecond' WHERE ticket_id = $1`,
+        [legacy.id, deltaMs]
+      );
+      await client.query(
+        `UPDATE ticket_attachments SET created_at = created_at + $2::double precision * interval '1 millisecond' WHERE ticket_id = $1`,
+        [legacy.id, deltaMs]
+      );
+      await client.query(
+        `UPDATE ticket_assignments SET
+           notified_at = CASE WHEN notified_at IS NULL THEN NULL ELSE notified_at + $2::double precision * interval '1 millisecond' END,
+           accepted_at = CASE WHEN accepted_at IS NULL THEN NULL ELSE accepted_at + $2::double precision * interval '1 millisecond' END,
+           rejected_at = CASE WHEN rejected_at IS NULL THEN NULL ELSE rejected_at + $2::double precision * interval '1 millisecond' END,
+           expired_at = CASE WHEN expired_at IS NULL THEN NULL ELSE expired_at + $2::double precision * interval '1 millisecond' END,
+           created_at = created_at + $2::double precision * interval '1 millisecond',
+           updated_at = updated_at + $2::double precision * interval '1 millisecond'
+         WHERE ticket_id = $1`,
+        [legacy.id, deltaMs]
+      );
+    }
     await client.query("COMMIT");
 
     const stateCounts = seeded.reduce((counts, ticket) => {
@@ -15195,6 +15258,7 @@ app.post("/admin/control-centers/:code/demo/historical-cases", async (req, res) 
       open: seeded.length - (stateCounts.CLOSED || 0),
       states: stateCounts,
       distinct_locations: locations.length,
+      legacy_cases_redistributed: legacyResult.rows.length,
       geofence_validation: "ALL_INSIDE",
       date_range: {
         from: seeded[0]?.created_at,
