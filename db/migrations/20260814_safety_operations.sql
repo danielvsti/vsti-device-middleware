@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS safety_inspection_evidence (
   content BYTEA NOT NULL,
   created_by UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  CONSTRAINT safety_inspection_evidence_media_type CHECK (media_type IN ('audio','video'))
+  CONSTRAINT safety_inspection_evidence_media_type CHECK (media_type IN ('audio','image','video'))
 );
 CREATE INDEX IF NOT EXISTS idx_safety_inspection_evidence_inspection
   ON safety_inspection_evidence(inspection_id, created_at);

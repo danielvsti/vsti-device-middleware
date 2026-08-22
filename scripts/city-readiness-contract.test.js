@@ -1,0 +1,39 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const root = path.resolve(__dirname, '..');
+const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+const migration = fs.readFileSync(path.join(root, 'db/migrations/20260822_city_sla_readiness.sql'), 'utf8');
+const offlineMigration = fs.readFileSync(path.join(root, 'db/migrations/20260822_mobile_offline_idempotency.sql'), 'utf8');
+const resolverOfflineMigration = fs.readFileSync(path.join(root, 'db/migrations/20260822_resolver_offline_actions.sql'), 'utf8');
+const cityCompliance = fs.readFileSync(path.join(root, 'city-compliance.js'), 'utf8');
+
+assert.match(server, /sla_policy:\s*\{[\s\S]*automatic_reassignment_enabled:\s*true/, 'Debe existir política SLA configurable por Centro de Control');
+assert.match(server, /by_priority/, 'SLA debe aceptar overrides por prioridad');
+assert.match(server, /by_category/, 'SLA debe aceptar overrides por categoría');
+assert.match(server, /function effectiveTicketSla/, 'Debe resolver la política efectiva por ticket');
+assert.match(server, /SLA_ACCEPTANCE_EXPIRED/, 'Debe auditar vencimientos de aceptación');
+assert.match(server, /expirePendingTicketAssignments/, 'Debe barrer asignaciones vencidas');
+assert.match(server, /ASSIGNMENT_NOT_PENDING_OR_EXPIRED/, 'Una aceptación tardía debe fallar cerrada');
+assert.match(server, /startTicketSlaMaintenance\(\)/, 'El mantenimiento SLA debe iniciar con la API');
+assert.match(server, /mobileSosRateLimit/, 'Debe limitar ráfagas de activaciones SOS por usuario y origen');
+assert.match(server, /hasValidMediaSignature/, 'Debe proteger evidencia con enlaces firmados y vencimiento');
+assert.match(server, /signProtectedMediaUrls/, 'Debe firmar URLs de evidencia solo al responder a sesiones autorizadas');
+assert.match(server, /findMobileSosIdempotentReplay/, 'Debe reconciliar reintentos offline sin duplicar incidentes');
+assert.match(server, /resolver_action_receipts/, 'Debe reconciliar acciones offline del resolutor');
+assert.match(server, /WHATSAPP_OPERATOR/, 'El ingreso manual debe distinguir WhatsApp atendido por operador');
+assert.match(server, /PHONE_14XX/, 'El ingreso manual debe distinguir el canal telefónico municipal');
+assert.match(server, /intake_mode: "OPERATOR_MANUAL"/, 'El ticket debe declarar que la recepción no fue automatizada');
+assert.match(migration, /accept_due_at TIMESTAMPTZ/, 'La fecha límite de aceptación debe persistirse');
+assert.match(migration, /sla_policy_snapshot JSONB/, 'La política aplicada debe quedar congelada para auditoría');
+assert.match(offlineMigration, /client_request_id TEXT/, 'La clave idempotente offline debe persistirse');
+assert.match(offlineMigration, /UNIQUE INDEX/, 'Los reintentos offline deben tener unicidad por usuario');
+assert.match(resolverOfflineMigration, /client_action_id TEXT PRIMARY KEY/, 'Las acciones del resolutor deben ser idempotentes');
+assert.match(cityCompliance, /city_security_assets/, 'Debe existir inventario geoespacial de cámaras, IoT y LPR');
+assert.match(cityCompliance, /city_criminogenic_observations/, 'Debe existir clasificación de factores criminógenos');
+assert.match(cityCompliance, /city_external_api_audit/, 'Todo acceso externo debe ser auditable');
+assert.match(cityCompliance, /privacy_profile:\s*"NO_DIRECT_PERSONAL_IDENTIFIERS"/, 'La API externa de incidentes debe excluir identificadores personales directos');
+assert.match(cityCompliance, /detections_available:false/, 'No debe sobreprometer lecturas LPR inexistentes');
+
+console.log('City readiness contract OK');

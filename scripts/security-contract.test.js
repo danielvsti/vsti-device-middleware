@@ -79,7 +79,7 @@ const mobileSosSql = routeBlock('app.post("/public/mobile/sos"', 2600);
 assert(!mobileSosSql.includes("rawLonNum"), "La corrección del simulador no debe contaminar la creación de SOS vecino");
 
 const manualTicketSql = routeBlock('app.post("/tickets/manual"', 9000);
-assert(manualTicketSql.includes('source_type: "PHONE_CALL"'), "El ingreso telefónico debe usar una fuente de ticket diferenciada");
+assert(manualTicketSql.includes('PHONE_14XX: "PHONE_CALL"') && manualTicketSql.includes('source_type: sourceTypeByChannel[intakeChannel]'), "El ingreso telefónico debe usar una fuente de ticket diferenciada");
 assert(manualTicketSql.includes("wa_center_session_id"), "El ticket telefónico debe permitir asociar la sesión de WA-Center");
 
 const waWebhookSql = routeBlock('app.post("/integrations/wa-center/voice-events"', 6200);

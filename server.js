@@ -30,6 +30,7 @@ const path = require("path");
 const crypto = require("crypto");
 const http2 = require("http2");
 const { registerSafetyModule } = require("./safety-module");
+const { registerCityCompliance } = require("./city-compliance");
 
 console.log(
   "DATABASE_URL configurada:",
@@ -139,6 +140,12 @@ const locationRequestRateLimit = rateLimit({
   key: (req) => getRemoteIp(req),
   message: "Demasiados intentos de ubicación. Espera un minuto e intenta nuevamente."
 });
+const mobileSosRateLimit = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: Number(process.env.MOBILE_SOS_RATE_LIMIT_MAX || 6),
+  key: (req) => `${getRemoteIp(req)}:${String(req.body?.user_id || "anonymous")}`,
+  message: "Se detectaron demasiadas activaciones en pocos minutos. La central mantendrá visibles los incidentes ya creados; espera antes de generar uno nuevo."
+});
 
 function requireDebugAccess(req, res) {
   if (process.env.SOS_DEBUG_ENDPOINTS_ENABLED !== "true") {
@@ -156,7 +163,72 @@ function requireDebugAccess(req, res) {
 
 const UPLOAD_DIR = process.env.SOS_UPLOAD_DIR || "/tmp/sos_uploads";
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-app.use("/uploads", express.static(UPLOAD_DIR));
+
+const MEDIA_URL_TTL_SECONDS = Math.max(60, Number(process.env.MEDIA_URL_TTL_SECONDS || 15 * 60));
+
+function mediaSignature(pathname, expiresAt) {
+  return crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(`queltu-media:${pathname}:${expiresAt}`)
+    .digest("base64url");
+}
+
+function hasValidMediaSignature(req) {
+  const expiresAt = Number(req.query?.exp || 0);
+  const provided = String(req.query?.sig || "");
+  if (!Number.isFinite(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000) || !provided) return false;
+  const pathname = `/uploads${req.path}`.replace(/\/+/g, "/");
+  const expected = mediaSignature(pathname, expiresAt);
+  const left = Buffer.from(provided);
+  const right = Buffer.from(expected);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function requestCanReceiveProtectedMedia(req) {
+  if (panelSessionFromRequest(req)) return true;
+  if (req.admin_legacy_token) return true;
+  const expected = String(process.env.ADMIN_TOKEN || "");
+  const provided = String(req.headers["x-admin-token"] || "");
+  return Boolean(expected && provided && expected === provided);
+}
+
+function signedMediaUrl(value) {
+  if (typeof value !== "string" || !value.includes("/uploads/")) return value;
+  try {
+    const isAbsolute = /^https?:\/\//i.test(value);
+    const parsed = new URL(value, "https://api.queltu.invalid");
+    if (!parsed.pathname.startsWith("/uploads/")) return value;
+    const expiresAt = Math.floor(Date.now() / 1000) + MEDIA_URL_TTL_SECONDS;
+    parsed.searchParams.set("exp", String(expiresAt));
+    parsed.searchParams.set("sig", mediaSignature(parsed.pathname, expiresAt));
+    return isAbsolute ? parsed.toString() : `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch (_) {
+    return value;
+  }
+}
+
+function signProtectedMediaUrls(value, visited = new WeakSet()) {
+  if (typeof value === "string") return signedMediaUrl(value);
+  if (!value || typeof value !== "object" || Buffer.isBuffer(value) || value instanceof Date) return value;
+  if (visited.has(value)) return value;
+  visited.add(value);
+  if (Array.isArray(value)) return value.map((item) => signProtectedMediaUrls(item, visited));
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, signProtectedMediaUrls(item, visited)]));
+}
+
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (payload) => originalJson(requestCanReceiveProtectedMedia(req) ? signProtectedMediaUrls(payload) : payload);
+  next();
+});
+
+app.use("/uploads", (req, res, next) => {
+  if (!hasValidMediaSignature(req) && !panelSessionFromRequest(req)) {
+    return res.status(401).json({ status: "error", message: "Evidencia protegida: enlace vencido o sesión requerida" });
+  }
+  res.setHeader("Cache-Control", "private, no-store");
+  return next();
+}, express.static(UPLOAD_DIR, { fallthrough: false, index: false }));
 
 
 app.get("/debug/db", async (req, res) => {
@@ -383,6 +455,17 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     auto_assignment_enabled: true,
     max_location_age_seconds: 180,
     max_active_tickets: 1
+  },
+  sla_policy: {
+    enabled: true,
+    automatic_reassignment_enabled: true,
+    notify_central_on_breach: true,
+    acknowledgement_minutes: 5,
+    assignment_minutes: 15,
+    acceptance_minutes: 5,
+    resolution_minutes: 60,
+    by_priority: {},
+    by_category: {}
   },
   operator_tools: {
     dashboard_roles: ['OPERATOR', 'ADMIN', 'SUPER_ADMIN'],
@@ -786,6 +869,30 @@ function normalizeControlCenterSettings(input = {}) {
   merged.resolver_policy.max_location_age_seconds = clampPolicyNumber(merged.resolver_policy.max_location_age_seconds, 180, 30, 86400);
   merged.resolver_policy.max_active_tickets = clampPolicyNumber(merged.resolver_policy.max_active_tickets, 1, 1, 20);
 
+  const normalizeSlaTargetSet = (raw = {}, fallback = {}) => ({
+    acknowledgement_minutes: clampPolicyNumber(raw.acknowledgement_minutes, fallback.acknowledgement_minutes ?? 5, 1, 10080),
+    assignment_minutes: clampPolicyNumber(raw.assignment_minutes, fallback.assignment_minutes ?? 15, 1, 10080),
+    acceptance_minutes: clampPolicyNumber(raw.acceptance_minutes, fallback.acceptance_minutes ?? 5, 1, 1440),
+    resolution_minutes: clampPolicyNumber(raw.resolution_minutes, fallback.resolution_minutes ?? 60, 1, 43200)
+  });
+  const defaultSla = DEFAULT_CONTROL_CENTER_SETTINGS.sla_policy;
+  const rawSla = isPlainObject(merged.sla_policy) ? merged.sla_policy : {};
+  const normalizedSla = normalizeSlaTargetSet(rawSla, defaultSla);
+  normalizedSla.enabled = normalizePolicyBoolean(rawSla.enabled, true);
+  normalizedSla.automatic_reassignment_enabled = normalizePolicyBoolean(rawSla.automatic_reassignment_enabled, true);
+  normalizedSla.notify_central_on_breach = normalizePolicyBoolean(rawSla.notify_central_on_breach, true);
+  normalizedSla.by_priority = {};
+  for (const [priority, targets] of Object.entries(isPlainObject(rawSla.by_priority) ? rawSla.by_priority : {})) {
+    const key = String(clampPolicyNumber(priority, 3, 1, 5));
+    normalizedSla.by_priority[key] = normalizeSlaTargetSet(targets, normalizedSla);
+  }
+  normalizedSla.by_category = {};
+  for (const [category, targets] of Object.entries(isPlainObject(rawSla.by_category) ? rawSla.by_category : {})) {
+    const key = String(category || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 48);
+    if (key) normalizedSla.by_category[key] = normalizeSlaTargetSet(targets, normalizedSla);
+  }
+  merged.sla_policy = normalizedSla;
+
   merged.operator_tools = merged.operator_tools || {};
   const defaultDashboardRoles = DEFAULT_CONTROL_CENTER_SETTINGS.operator_tools.dashboard_roles;
   merged.operator_tools.dashboard_roles = Array.isArray(merged.operator_tools.dashboard_roles)
@@ -940,6 +1047,7 @@ function publicSettingsPayload(settings) {
     safety_modules: normalized.safety_modules,
     incident_policy: normalized.incident_policy,
     resolver_policy: normalized.resolver_policy,
+    sla_policy: normalized.sla_policy,
     operator_tools: normalized.operator_tools,
     neighbor_app: {
       emergency_categories: normalized.neighbor_app.emergency_categories
@@ -1581,6 +1689,61 @@ async function checkTicketParticipantAccess(req, res, ticketId) {
   return true;
 }
 
+let resolverActionIdempotencySchemaReady = false;
+async function ensureResolverActionIdempotencySchema() {
+  if (resolverActionIdempotencySchemaReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS resolver_action_receipts (
+      client_action_id TEXT PRIMARY KEY,
+      actor_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      ticket_id UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+      action_type TEXT NOT NULL,
+      result_payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_resolver_action_receipts_ticket ON resolver_action_receipts(ticket_id, created_at DESC)`);
+  resolverActionIdempotencySchemaReady = true;
+}
+
+app.use(/^\/tickets\/[^/]+\/(?:en-route|on-site|resolve)$/, async (req, res, next) => {
+  if (req.method !== "POST") return next();
+  const clientActionId = String(req.body?.client_action_id || "").trim().slice(0, 120);
+  const actorUserId = String(req.body?.resolver_user_id || "").trim();
+  if (!clientActionId || !actorUserId) return next();
+  const session = panelSessionFromRequest(req);
+  if (!session || (String(session.sub) !== actorUserId && !isSuperAdminSession(session))) return next();
+  const originalPath = String(req.originalUrl || req.url || "").split("?")[0];
+  const pathParts = originalPath.split("/").filter(Boolean);
+  const ticketId = String(pathParts[1] || "");
+  const actionType = String(pathParts[2] || "").toUpperCase().replace(/-/g, "_");
+  try {
+    await ensureResolverActionIdempotencySchema();
+    const replay = await pool.query(
+      `SELECT result_payload FROM resolver_action_receipts WHERE client_action_id = $1 AND actor_user_id = $2 AND ticket_id = $3 LIMIT 1`,
+      [clientActionId, actorUserId, ticketId]
+    );
+    if (replay.rows.length) {
+      return res.json({ ...replay.rows[0].result_payload, idempotent_replay: true });
+    }
+    const originalJson = res.json.bind(res);
+    res.json = (payload) => {
+      if (res.statusCode >= 200 && res.statusCode < 300 && payload?.status !== "error") {
+        pool.query(
+          `INSERT INTO resolver_action_receipts (client_action_id, actor_user_id, ticket_id, action_type, result_payload)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (client_action_id) DO NOTHING`,
+          [clientActionId, actorUserId, ticketId, actionType, JSON.stringify(payload)]
+        ).catch((error) => console.warn("[RESOLVER IDEMPOTENCY]", error.message));
+      }
+      return originalJson(payload);
+    };
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+});
+
 function allowedRolesForPanel(panelType) {
   const normalized = String(panelType || "CONTROL_CENTER").toUpperCase();
 
@@ -1655,6 +1818,16 @@ async function ensureNeighborProvisioningSchema() {
     CREATE INDEX IF NOT EXISTS idx_users_neighbor_validation_review
     ON users(control_center_id, validation_status, provisional_expires_at)
     WHERE role = 'NEIGHBOR'
+  `);
+
+  await pool.query(`
+    ALTER TABLE mobile_events
+      ADD COLUMN IF NOT EXISTS client_request_id TEXT
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_events_user_client_request
+    ON mobile_events(user_id, client_request_id)
+    WHERE client_request_id IS NOT NULL
   `);
 
   neighborProvisioningSchemaReady = true;
@@ -2742,7 +2915,7 @@ async function getRejectedResolverIdsForTicket(ticketId) {
       SELECT DISTINCT resolver_user_id
       FROM ticket_assignments
       WHERE ticket_id = $1
-        AND UPPER(COALESCE(state,'')) = 'REJECTED'
+        AND UPPER(COALESCE(state,'')) IN ('REJECTED','EXPIRED')
         AND resolver_user_id IS NOT NULL
       `,
       [ticketId]
@@ -2759,7 +2932,7 @@ async function getRejectedResolverIdsForTicket(ticketId) {
       SELECT DISTINCT actor_user_id
       FROM ticket_actions
       WHERE ticket_id = $1
-        AND action_type = 'RESOLVER_REJECTED'
+        AND action_type IN ('RESOLVER_REJECTED','SLA_ACCEPTANCE_EXPIRED')
         AND actor_user_id IS NOT NULL
       `,
       [ticketId]
@@ -2770,6 +2943,86 @@ async function getRejectedResolverIdsForTicket(ticketId) {
   }
 
   return Array.from(rejected);
+}
+
+let ticketSlaSchemaReady = false;
+
+async function ensureTicketSlaSchema() {
+  if (ticketSlaSchemaReady) return;
+  await pool.query(`
+    ALTER TABLE ticket_assignments
+      ADD COLUMN IF NOT EXISTS accept_due_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS sla_policy_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb;
+    CREATE INDEX IF NOT EXISTS idx_ticket_assignments_pending_accept_due
+      ON ticket_assignments(accept_due_at)
+      WHERE state = 'PENDING' AND accept_due_at IS NOT NULL;
+    ALTER TABLE tickets
+      ADD COLUMN IF NOT EXISTS sla_policy_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS acknowledged_due_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS assigned_due_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS resolved_due_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_tickets_open_sla_due
+      ON tickets(control_center_id, assigned_due_at, resolved_due_at)
+      WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED');
+  `);
+  ticketSlaSchemaReady = true;
+}
+
+function effectiveTicketSla(settings, ticket = {}) {
+  const normalized = normalizeControlCenterSettings(settings || {});
+  const base = normalized.sla_policy || DEFAULT_CONTROL_CENTER_SETTINGS.sla_policy;
+  const priority = String(clampPolicyNumber(ticket.priority, 3, 1, 5));
+  const category = String(ticket.alert_type || '').trim().toUpperCase();
+  const priorityOverride = isPlainObject(base.by_priority?.[priority]) ? base.by_priority[priority] : {};
+  const categoryOverride = isPlainObject(base.by_category?.[category]) ? base.by_category[category] : {};
+  const target = { ...base, ...priorityOverride, ...categoryOverride };
+  return {
+    enabled: base.enabled !== false,
+    automatic_reassignment_enabled: base.automatic_reassignment_enabled !== false,
+    notify_central_on_breach: base.notify_central_on_breach !== false,
+    acknowledgement_minutes: clampPolicyNumber(target.acknowledgement_minutes, 5, 1, 10080),
+    assignment_minutes: clampPolicyNumber(target.assignment_minutes, 15, 1, 10080),
+    acceptance_minutes: clampPolicyNumber(target.acceptance_minutes, 5, 1, 1440),
+    resolution_minutes: clampPolicyNumber(target.resolution_minutes, 60, 1, 43200),
+    matched_priority: priority,
+    matched_category: category || null,
+    source: categoryOverride && Object.keys(categoryOverride).length
+      ? 'CATEGORY'
+      : priorityOverride && Object.keys(priorityOverride).length
+        ? 'PRIORITY'
+        : 'DEFAULT'
+  };
+}
+
+function minutesAfter(baseValue, minutes) {
+  const base = new Date(baseValue || Date.now());
+  return new Date(base.getTime() + Number(minutes || 0) * 60000);
+}
+
+async function applyTicketSlaSnapshot(ticket, settings) {
+  if (!ticket?.id) return ticket;
+  await ensureTicketSlaSchema();
+  const policy = effectiveTicketSla(settings, ticket);
+  if (policy.enabled === false) return ticket;
+  const base = ticket.created_at || new Date();
+  const update = await pool.query(
+    `UPDATE tickets
+     SET sla_policy_snapshot=$2::jsonb,
+         acknowledged_due_at=$3,
+         assigned_due_at=$4,
+         resolved_due_at=$5,
+         updated_at=updated_at
+     WHERE id=$1
+     RETURNING *`,
+    [
+      ticket.id,
+      JSON.stringify(policy),
+      minutesAfter(base, policy.acknowledgement_minutes),
+      minutesAfter(base, policy.assignment_minutes),
+      minutesAfter(base, policy.resolution_minutes)
+    ]
+  );
+  return update.rows[0] || ticket;
 }
 
 function distanceMeters(lat1, lon1, lat2, lon2) {
@@ -3023,6 +3276,13 @@ async function autoAssignResolver(ticket, options = {}) {
     return null;
   }
 
+  await ensureTicketSlaSchema();
+  const assignmentSettings = await getControlCenterSettingsById(ticket.control_center_id).catch(() => null);
+  const assignmentSla = effectiveTicketSla(assignmentSettings?.settings || {}, ticket);
+  const acceptDueAt = assignmentSla.enabled === false
+    ? null
+    : minutesAfter(new Date(), assignmentSla.acceptance_minutes);
+
   if (!force && ticket.assigned_resolver_id) {
     return {
       ticket,
@@ -3192,14 +3452,18 @@ async function autoAssignResolver(ticket, options = {}) {
       assignment_type,
       state,
       distance_meters,
-      notified_at
+      notified_at,
+      accept_due_at,
+      sla_policy_snapshot
     )
-    VALUES ($1,$2,'AUTO','PENDING',$3,NOW())
+    VALUES ($1,$2,'AUTO','PENDING',$3,NOW(),$4,$5::jsonb)
     `,
     [
       ticket.id,
       selected.id,
-      selected.distance_meters
+      selected.distance_meters,
+      acceptDueAt,
+      JSON.stringify(assignmentSla)
     ]
   );
 
@@ -3239,6 +3503,8 @@ async function autoAssignResolver(ticket, options = {}) {
         resolver_name: selected.full_name,
         distance_meters: Math.round(selected.distance_meters),
         location_age_seconds: selected.location_age_seconds == null ? null : Math.round(selected.location_age_seconds),
+        accept_due_at: acceptDueAt,
+        sla_policy: assignmentSla,
         force
       })
     ]
@@ -3258,6 +3524,126 @@ async function autoAssignResolver(ticket, options = {}) {
     ticket: update.rows[0],
     resolver: selected
   };
+}
+
+async function expirePendingTicketAssignments(options = {}) {
+  await ensureTicketSlaSchema();
+  const limit = Math.max(1, Math.min(200, Number(options.limit || 50)));
+  const controlCenterId = options.control_center_id || null;
+  const params = [limit];
+  let controlCenterSql = '';
+  if (controlCenterId) {
+    params.push(controlCenterId);
+    controlCenterSql = `AND t.control_center_id = $${params.length}`;
+  }
+
+  const due = await pool.query(
+    `SELECT ta.id AS assignment_id,
+            ta.ticket_id,
+            ta.resolver_user_id,
+            ta.accept_due_at,
+            ta.sla_policy_snapshot AS assignment_sla_policy,
+            t.*
+     FROM ticket_assignments ta
+     JOIN tickets t ON t.id = ta.ticket_id
+     WHERE ta.state = 'PENDING'
+       AND ta.accept_due_at IS NOT NULL
+       AND ta.accept_due_at <= NOW()
+       AND t.assigned_resolver_id = ta.resolver_user_id
+       AND t.state = 'ASSIGNED'
+       ${controlCenterSql}
+     ORDER BY ta.accept_due_at ASC
+     LIMIT $1`,
+    params
+  );
+
+  const summary = { scanned: due.rows.length, expired: 0, reassigned: 0, left_unassigned: 0 };
+  for (const row of due.rows) {
+    const expired = await pool.query(
+      `UPDATE ticket_assignments
+       SET state='EXPIRED', expired_at=NOW(), updated_at=NOW()
+       WHERE id=$1 AND state='PENDING' AND accept_due_at <= NOW()
+       RETURNING *`,
+      [row.assignment_id]
+    );
+    if (!expired.rows.length) continue;
+    summary.expired += 1;
+
+    const released = await pool.query(
+      `UPDATE tickets
+       SET assigned_resolver_id=NULL,
+           state='ACTIVE',
+           assigned_at=NULL,
+           updated_at=NOW()
+       WHERE id=$1
+         AND assigned_resolver_id=$2
+         AND state='ASSIGNED'
+       RETURNING *`,
+      [row.ticket_id, row.resolver_user_id]
+    );
+
+    await pool.query(
+      `INSERT INTO ticket_actions (
+         ticket_id, actor_user_id, actor_role, action_type, description, metadata
+       ) VALUES ($1,$2,'SYSTEM','SLA_ACCEPTANCE_EXPIRED',$3,$4::jsonb)`,
+      [
+        row.ticket_id,
+        row.resolver_user_id,
+        'El resolutor no aceptó dentro del SLA. La asignación expiró y la central fue alertada.',
+        JSON.stringify({
+          assignment_id: row.assignment_id,
+          expired_resolver_user_id: row.resolver_user_id,
+          accept_due_at: row.accept_due_at,
+          sla_policy: row.assignment_sla_policy || {},
+          central_alert: true
+        })
+      ]
+    );
+
+    await pool.query(
+      `UPDATE resolver_locations rl
+       SET status='AVAILABLE', updated_at=NOW()
+       WHERE rl.user_id=$1
+         AND NOT EXISTS (
+           SELECT 1 FROM tickets t
+           WHERE t.assigned_resolver_id=$1
+             AND t.state = ANY($2::text[])
+         )`,
+      [row.resolver_user_id, ACTIVE_RESOLVER_TICKET_STATES]
+    ).catch(() => null);
+
+    if (!released.rows.length) continue;
+    const policy = row.assignment_sla_policy || {};
+    if (policy.automatic_reassignment_enabled === false) {
+      summary.left_unassigned += 1;
+      continue;
+    }
+
+    const excluded = await getRejectedResolverIdsForTicket(row.ticket_id);
+    const reassignment = await autoAssignResolver(released.rows[0], {
+      force: true,
+      excludeResolverUserIds: excluded
+    }).catch((error) => {
+      console.error('[SLA AUTO REASSIGN ERROR]', error);
+      return null;
+    });
+    if (reassignment?.resolver) summary.reassigned += 1;
+    else summary.left_unassigned += 1;
+  }
+  return summary;
+}
+
+let ticketSlaMaintenanceStarted = false;
+function startTicketSlaMaintenance() {
+  if (ticketSlaMaintenanceStarted) return;
+  ticketSlaMaintenanceStarted = true;
+  const sweep = () => expirePendingTicketAssignments().catch((error) => {
+    console.error('[TICKET SLA MAINTENANCE ERROR]', error);
+  });
+  const initial = setTimeout(sweep, 5_000);
+  const interval = setInterval(sweep, 15_000);
+  if (typeof initial.unref === 'function') initial.unref();
+  if (typeof interval.unref === 'function') interval.unref();
 }
 
 async function countActiveTicketsForResolver(resolverUserId) {
@@ -3303,6 +3689,12 @@ async function assignTicketToResolverManually(ticketId, resolverUserId, options 
   }
 
   const ticket = ticketResult.rows[0];
+  await ensureTicketSlaSchema();
+  const assignmentSettings = await getControlCenterSettingsById(ticket.control_center_id).catch(() => null);
+  const assignmentSla = effectiveTicketSla(assignmentSettings?.settings || {}, ticket);
+  const acceptDueAt = assignmentSla.enabled === false
+    ? null
+    : minutesAfter(new Date(), assignmentSla.acceptance_minutes);
 
   const resolverResult = await pool.query(
     `
@@ -3394,11 +3786,13 @@ async function assignTicketToResolverManually(ticketId, resolverUserId, options 
       assignment_type,
       state,
       distance_meters,
-      notified_at
+      notified_at,
+      accept_due_at,
+      sla_policy_snapshot
     )
-    VALUES ($1,$2,'MANUAL','PENDING',$3,NOW())
+    VALUES ($1,$2,'MANUAL','PENDING',$3,NOW(),$4,$5::jsonb)
     `,
-    [ticket.id, resolver.id, distance]
+    [ticket.id, resolver.id, distance, acceptDueAt, JSON.stringify(assignmentSla)]
   );
 
   const update = await pool.query(
@@ -3451,7 +3845,9 @@ async function assignTicketToResolverManually(ticketId, resolverUserId, options 
         previous_resolver_user_id: ticket.assigned_resolver_id || null,
         resolver_status: resolver.status || null,
         resolver_active_tickets_count_before: activeTicketsCount,
-        distance_meters: distance == null ? null : Math.round(distance)
+        distance_meters: distance == null ? null : Math.round(distance),
+        accept_due_at: acceptDueAt,
+        sla_policy: assignmentSla
       })
     ]
   );
@@ -3680,6 +4076,13 @@ async function createTicket({
     return ticket;
   });
 
+  const ccSettings = await getControlCenterSettingsById(control_center_id).catch(() => null);
+  const settings = ccSettings?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+  ticket = await applyTicketSlaSnapshot(ticket, settings).catch((error) => {
+    console.warn('[CREATE TICKET SLA WARNING]', error.message);
+    return ticket;
+  });
+
   await pool.query(
     `
     INSERT INTO ticket_actions (
@@ -3701,8 +4104,6 @@ async function createTicket({
       metadata
     ]
   );
-const ccSettings = await getControlCenterSettingsById(control_center_id).catch(() => null);
-  const settings = ccSettings?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
   if (settings.features?.resolver_auto_assignment_enabled !== false && settings.resolver_policy?.auto_assignment_enabled !== false) {
     const assignment = await autoAssignResolver(ticket);
     return assignment?.ticket || ticket;
@@ -5081,12 +5482,17 @@ function safeFileExtension(mimeType, fallbackType) {
     "audio/mp4": "m4a",
     "audio/mpeg": "mp3",
     "audio/wav": "wav",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/heic": "heic",
+    "image/heif": "heif",
     "video/webm": "webm",
     "video/mp4": "mp4",
     "video/quicktime": "mov"
   };
 
-  return map[mimeType] || (fallbackType === "video" ? "mp4" : "webm");
+  return map[mimeType] || (fallbackType === "video" ? "mp4" : fallbackType === "image" ? "jpg" : "webm");
 }
 
 function parseDataUrl(dataUrl) {
@@ -5109,8 +5515,8 @@ function publicBaseUrl(req) {
 }
 
 function storeUploadedMedia(req, { scopeId, mediaType, dataUrl, fileName, prefix = "media" }) {
-  if (!["audio", "video"].includes(mediaType)) {
-    const error = new Error("media_type must be audio or video");
+  if (!["audio", "image", "video"].includes(mediaType)) {
+    const error = new Error("media_type must be audio, image or video");
     error.statusCode = 400;
     throw error;
   }
@@ -6085,6 +6491,27 @@ async function createTicketVoiceSession({ req, ticket, requestedBy, targetType, 
 }
 
 
+async function findMobileSosIdempotentReplay(userId, clientRequestId) {
+  if (!userId || !clientRequestId) return null;
+  const result = await pool.query(
+    `
+    SELECT
+      me.*,
+      COALESCE(me.linked_ticket_id, source_ticket.id) AS ticket_id
+    FROM mobile_events me
+    LEFT JOIN tickets source_ticket
+      ON source_ticket.source_type = 'MOBILE_APP'
+     AND source_ticket.source_event_id = me.id
+    WHERE me.user_id = $1
+      AND me.client_request_id = $2
+    ORDER BY source_ticket.created_at DESC NULLS LAST
+    LIMIT 1
+    `,
+    [userId, clientRequestId]
+  );
+  return result.rows[0] || null;
+}
+
 function normalizeMobileSosPayload(reqBody = {}) {
   const rawType = String(reqBody.alert_type || "SOS_MANUAL").toUpperCase();
 
@@ -6151,7 +6578,7 @@ function normalizeMobileSosPayload(reqBody = {}) {
   };
 }
 
-app.post("/public/mobile/sos", async (req, res) => {
+app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
   try {
     const {
       user_id,
@@ -6170,6 +6597,7 @@ app.post("/public/mobile/sos", async (req, res) => {
       silent,
       confidence,
       qr_context,
+      client_request_id,
       control_center_code = "CC-VINA"
     } = req.body;
 
@@ -6259,6 +6687,25 @@ app.post("/public/mobile/sos", async (req, res) => {
       });
     }
 
+    await ensureIncidentAggregationSchema();
+    const normalizedClientRequestId = String(client_request_id || "").trim().slice(0, 120) || null;
+    const previousSubmission = await findMobileSosIdempotentReplay(user_id, normalizedClientRequestId);
+    if (previousSubmission) {
+      const outOfJurisdiction = String(previousSubmission.state || "").toUpperCase() === "OUT_OF_JURISDICTION";
+      return res.status(outOfJurisdiction ? 422 : 200).json({
+        status: outOfJurisdiction ? "out_of_jurisdiction" : "ok",
+        message: outOfJurisdiction
+          ? "La alerta ya había sido recibida fuera del territorio cubierto."
+          : "Alerta ya recibida; se devolvió el mismo incidente sin duplicarlo.",
+        event_id: previousSubmission.id,
+        ticket_id: previousSubmission.ticket_id || null,
+        state: previousSubmission.state,
+        received_at: previousSubmission.created_at,
+        idempotent_replay: true,
+        user: publicUserPayload(citizen)
+      });
+    }
+
     const controlCenterId = citizen.control_center_id;
     const citizenUserId = citizen.id;
 
@@ -6270,7 +6717,6 @@ app.post("/public/mobile/sos", async (req, res) => {
     }
 
     await ensureGeofenceSchema();
-    await ensureIncidentAggregationSchema();
     const jurisdiction = evaluateJurisdiction(citizen, Number(latitude), Number(longitude));
 
     if (!jurisdiction.valid) {
@@ -6303,10 +6749,11 @@ app.post("/public/mobile/sos", async (req, res) => {
           state,
           acknowledged,
           cancelled,
+          client_request_id,
           jurisdiction_status,
           jurisdiction_reason
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'OUT_OF_JURISDICTION',false,true,$9,$10)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'OUT_OF_JURISDICTION',false,true,$9,$10,$11)
         RETURNING *
         `,
         [
@@ -6318,6 +6765,7 @@ app.post("/public/mobile/sos", async (req, res) => {
           Number(longitude),
           accuracy ?? null,
           battery ?? null,
+          normalizedClientRequestId,
           jurisdiction.status,
           jurisdiction.reason
         ]
@@ -6406,13 +6854,14 @@ app.post("/public/mobile/sos", async (req, res) => {
         state,
         acknowledged,
         cancelled,
+        client_request_id,
         jurisdiction_status,
         jurisdiction_reason,
         qr_point_id,
         qr_visit_id,
         qr_context
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',false,false,$9,$10,$11,$12,$13)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'ACTIVE',false,false,$9,$10,$11,$12,$13,$14)
       RETURNING *
       `,
       [
@@ -6424,6 +6873,7 @@ app.post("/public/mobile/sos", async (req, res) => {
         Number(longitude),
         accuracy ?? null,
         battery ?? null,
+        normalizedClientRequestId,
         jurisdiction.status,
         jurisdiction.reason,
         qrAttribution?.id || null,
@@ -6589,6 +7039,25 @@ app.post("/public/mobile/sos", async (req, res) => {
 
   } catch (error) {
     console.error("[MOBILE SOS DB ERROR]", error);
+
+    // Dos reintentos simultáneos pueden superar la lectura previa y competir por
+    // el índice único. En ese caso devolvemos el evento ganador en vez de un 500.
+    if (error?.code === "23505" && req.body?.user_id && req.body?.client_request_id) {
+      const normalizedClientRequestId = String(req.body.client_request_id).trim().slice(0, 120);
+      const replay = await findMobileSosIdempotentReplay(req.body.user_id, normalizedClientRequestId);
+      if (replay) {
+        const outOfJurisdiction = String(replay.state || "").toUpperCase() === "OUT_OF_JURISDICTION";
+        return res.status(outOfJurisdiction ? 422 : 200).json({
+          status: outOfJurisdiction ? "out_of_jurisdiction" : "ok",
+          message: "Alerta ya recibida; se devolvió el mismo incidente sin duplicarlo.",
+          event_id: replay.id,
+          ticket_id: replay.ticket_id || null,
+          state: replay.state,
+          received_at: replay.created_at,
+          idempotent_replay: true
+        });
+      }
+    }
 
     res.status(500).json({
       status: "error",
@@ -8418,6 +8887,26 @@ app.post("/tickets/manual", async (req, res) => {
       return res.status(400).json({ status: "error", message: "La categoría seleccionada no está habilitada" });
     }
 
+    const allowedIntakeChannels = new Set(["PHONE_14XX", "WHATSAPP_OPERATOR", "WALK_IN", "RADIO", "OTHER"]);
+    const intakeChannel = String(req.body?.intake_channel || "PHONE_14XX").trim().toUpperCase();
+    if (!allowedIntakeChannels.has(intakeChannel)) {
+      return res.status(400).json({ status: "error", message: "Canal de ingreso no permitido" });
+    }
+    const sourceTypeByChannel = {
+      PHONE_14XX: "PHONE_CALL",
+      WHATSAPP_OPERATOR: "WHATSAPP",
+      WALK_IN: "WALK_IN",
+      RADIO: "RADIO",
+      OTHER: "MANUAL_ENTRY"
+    };
+    const channelLabel = {
+      PHONE_14XX: "teléfono municipal 14XX",
+      WHATSAPP_OPERATOR: "WhatsApp atendido por operador",
+      WALK_IN: "atención presencial",
+      RADIO: "radio operacional",
+      OTHER: "ingreso manual"
+    }[intakeChannel];
+
     const callerName = String(req.body?.caller_name || "").trim().slice(0, 160) || null;
     const callerPhone = String(req.body?.caller_phone || "").trim().slice(0, 40) || null;
     const reportedAddress = String(req.body?.reported_address || "").trim().slice(0, 300) || null;
@@ -8457,7 +8946,8 @@ app.post("/tickets/manual", async (req, res) => {
     }
 
     const metadata = {
-      intake_channel: "MUNICIPAL_PHONE",
+      intake_channel: intakeChannel,
+      intake_mode: "OPERATOR_MANUAL",
       caller_name: callerName,
       caller_phone: callerPhone,
       reported_address: reportedAddress,
@@ -8475,8 +8965,8 @@ app.post("/tickets/manual", async (req, res) => {
       control_center_id: controlCenterResult.rows[0].id,
       created_by_user_id: actor.sub || null,
       created_by_role: String(actor.role || "OPERATOR").toUpperCase(),
-      creation_description: "Ticket ingresado manualmente por llamada al teléfono municipal",
-      source_type: "PHONE_CALL",
+      creation_description: `Ticket ingresado manualmente desde ${channelLabel}`,
+      source_type: sourceTypeByChannel[intakeChannel],
       source_event_id: waCenterSessionId || waCenterCallId || externalReference,
       alert_type: category.type,
       title: String(req.body?.title || category.title || "Emergencia telefónica").trim().slice(0, 180),
@@ -8999,36 +9489,36 @@ app.post("/tickets/:id/accept", async (req, res) => {
       });
     }
 
+    await ensureTicketSlaSchema();
     const assignmentResult = await pool.query(
       `
-      SELECT *
-      FROM ticket_assignments
-      WHERE ticket_id = $1
-        AND resolver_user_id = $2
+      UPDATE ticket_assignments
+      SET state = 'ACCEPTED',
+          accepted_at = NOW(),
+          updated_at = NOW()
+      WHERE id = (
+        SELECT id
+        FROM ticket_assignments
+        WHERE ticket_id = $1
+          AND resolver_user_id = $2
+          AND state = 'PENDING'
+        ORDER BY created_at DESC
+        LIMIT 1
+      )
         AND state = 'PENDING'
-      ORDER BY created_at DESC
-      LIMIT 1
+        AND (accept_due_at IS NULL OR accept_due_at > NOW())
+      RETURNING *
       `,
       [id, resolver_user_id]
     );
 
     if (assignmentResult.rows.length === 0) {
-      return res.status(404).json({
+      return res.status(409).json({
         status: "error",
-        message: "No pending assignment found for this resolver"
+        code: "ASSIGNMENT_NOT_PENDING_OR_EXPIRED",
+        message: "La asignación ya no está vigente. Actualiza la bandeja para ver el estado actual."
       });
     }
-
-    await pool.query(
-      `
-      UPDATE ticket_assignments
-      SET
-        state = 'ACCEPTED',
-        accepted_at = NOW()
-      WHERE id = $1
-      `,
-      [assignmentResult.rows[0].id]
-    );
 
     const ticketResult = await pool.query(
       `
@@ -9109,6 +9599,7 @@ app.post("/tickets/:id/en-route", async (req, res) => {
         updated_at = NOW()
       WHERE id = $1
         AND assigned_resolver_id = $2
+        AND state IN ('ASSIGNED','ACKNOWLEDGED','EN_ROUTE')
       RETURNING *
       `,
       [id, resolver_user_id]
@@ -9187,6 +9678,7 @@ app.post("/tickets/:id/on-site", async (req, res) => {
         updated_at = NOW()
       WHERE id = $1
         AND assigned_resolver_id = $2
+        AND state IN ('ASSIGNED','ACKNOWLEDGED','EN_ROUTE','ON_SITE')
       RETURNING *
       `,
       [id, resolver_user_id]
@@ -9269,6 +9761,7 @@ app.post("/tickets/:id/resolve", async (req, res) => {
         updated_at = NOW()
       WHERE id = $1
         AND assigned_resolver_id = $2
+        AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
       RETURNING *
       `,
       [id, resolver_user_id]
@@ -12087,6 +12580,41 @@ app.get("/dashboard/analytics", async (req, res) => {
       [ccId, days]
     );
 
+    await ensureTicketSlaSchema();
+    const slaRowsResult = await pool.query(
+      `SELECT
+         COALESCE(alert_type, 'SIN_TIPO') AS alert_type,
+         priority,
+         COUNT(*)::int AS open_tickets,
+         COUNT(*) FILTER (WHERE acknowledged_at IS NULL AND acknowledged_due_at < NOW())::int AS acknowledgement_breaches,
+         COUNT(*) FILTER (WHERE assigned_at IS NULL AND assigned_due_at < NOW())::int AS assignment_breaches,
+         COUNT(*) FILTER (WHERE resolved_at IS NULL AND resolved_due_at < NOW())::int AS resolution_breaches
+       FROM tickets
+       WHERE control_center_id=$1
+         AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+         AND sla_policy_snapshot <> '{}'::jsonb
+       GROUP BY alert_type, priority
+       ORDER BY priority ASC, alert_type ASC`,
+      [ccId]
+    );
+    const slaExpirationResult = await pool.query(
+      `SELECT COUNT(*)::int AS expired_assignments
+       FROM ticket_actions ta
+       JOIN tickets t ON t.id=ta.ticket_id
+       WHERE t.control_center_id=$1
+         AND ta.action_type='SLA_ACCEPTANCE_EXPIRED'
+         AND ta.created_at >= NOW() - ($2::int || ' days')::interval`,
+      [ccId, days]
+    );
+    const slaPolicy = dashboardSettingsRow?.settings?.sla_policy || DEFAULT_CONTROL_CENTER_SETTINGS.sla_policy;
+    const slaTotals = slaRowsResult.rows.reduce((totals, row) => {
+      totals.open_tickets += Number(row.open_tickets || 0);
+      totals.acknowledgement_breaches += Number(row.acknowledgement_breaches || 0);
+      totals.assignment_breaches += Number(row.assignment_breaches || 0);
+      totals.resolution_breaches += Number(row.resolution_breaches || 0);
+      return totals;
+    }, { open_tickets: 0, acknowledgement_breaches: 0, assignment_breaches: 0, resolution_breaches: 0 });
+
     const hourly = Array.from({ length: 24 }, (_, hour) => {
       const found = hourlyResult.rows.find((item) => Number(item.hour) === hour);
       return { hour, label: `${String(hour).padStart(2, "0")}:00`, value: found ? Number(found.value) : 0 };
@@ -12140,6 +12668,14 @@ app.get("/dashboard/analytics", async (req, res) => {
         pending_validation_neighbors: pendingValidationResult.rows,
         resolver_status: resolverStatusResult.rows,
         resolver_reconciliation: resolverReconciliation
+      },
+      sla: {
+        policy: slaPolicy,
+        totals: {
+          ...slaTotals,
+          expired_assignments: Number(slaExpirationResult.rows[0]?.expired_assignments || 0)
+        },
+        by_category_priority: slaRowsResult.rows
       },
       geo: {
         center: {
@@ -17233,6 +17769,11 @@ ensureSectorSchema().catch((error) => {
   console.warn('[SECTOR SCHEMA STARTUP WARNING]', error.message);
 });
 
+ensureTicketSlaSchema().catch((error) => {
+  console.warn('[TICKET SLA SCHEMA STARTUP WARNING]', error.message);
+});
+startTicketSlaMaintenance();
+
 registerSafetyModule({
   app,
   pool,
@@ -17245,6 +17786,13 @@ registerSafetyModule({
   syncMobileEventStateFromTicket,
   releaseResolverFromTicket,
   storeUploadedMedia
+});
+
+registerCityCompliance({
+  app,
+  pool,
+  checkRoleAccess,
+  dashboardAuthorizedControlCenterCode
 });
 
 /* kotto insertamos endpoints todo antes de ir a Flespi */ 

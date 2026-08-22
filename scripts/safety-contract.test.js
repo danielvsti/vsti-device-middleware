@@ -8,6 +8,7 @@ const root = path.resolve(__dirname, "..");
 const server = fs.readFileSync(path.join(root, "server.js"), "utf8");
 const safety = fs.readFileSync(path.join(root, "safety-module.js"), "utf8");
 const safetyMigration = fs.readFileSync(path.join(root, "db/migrations/20260814_safety_operations.sql"), "utf8");
+const inspectionImageMigration = fs.readFileSync(path.join(root, "db/migrations/20260817_safety_inspection_image_evidence.sql"), "utf8");
 const hsePortalMigration = fs.readFileSync(path.join(root, "db/migrations/20260816_hse_professional_portal.sql"), "utf8");
 
 assert.match(server, /registerSafetyModule\s*\(/, "server.js debe registrar el módulo Safety");
@@ -54,6 +55,10 @@ assert.match(safety, /app\.post\("\/resolver\/safety\/inspections"/, "la app HSE
 assert.match(safety, /\/resolver\/safety\/inspections\/:inspectionId\/evidence/, "la inspección autónoma debe admitir evidencia multimedia");
 assert.match(safetyMigration, /safety_inspections ADD COLUMN IF NOT EXISTS evidence JSONB/, "las inspecciones deben persistir metadatos de evidencia");
 assert.match(safetyMigration, /CREATE TABLE IF NOT EXISTS safety_inspection_evidence/, "la evidencia HSE debe persistir fuera del filesystem efímero");
+assert.match(safetyMigration, /media_type IN \('audio','image','video'\)/, "la evidencia HSE debe admitir audio, foto y video");
+assert.match(inspectionImageMigration, /media_type IN \('audio','image','video'\)/, "la migración incremental debe habilitar fotografías en instalaciones existentes");
+assert.match(server, /\["audio", "image", "video"\]\.includes\(mediaType\)/, "el almacenamiento común debe aceptar fotografías HSE");
+assert.match(safety, /\["audio", "image", "video"\]\.includes\(mediaType\)/, "el endpoint de inspección HSE debe aceptar fotografías");
 assert.match(safety, /\/resolver\/safety\/inspections\/:inspectionId\/evidence\/:evidenceId\/content/, "la evidencia HSE debe poder recuperarse posteriormente");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/control-verifications/, "la app HSE debe verificar controles críticos asociados al ticket");
 assert.match(safety, /\/resolver\/tickets\/:ticketId\/safety\/closure-request/, "el Profesional HSE debe solicitar aprobación del cierre");

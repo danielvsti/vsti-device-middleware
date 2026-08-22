@@ -201,8 +201,13 @@ function registerSafetyModule({
           content BYTEA NOT NULL,
           created_by UUID REFERENCES users(id) ON DELETE SET NULL,
           created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-          CONSTRAINT safety_inspection_evidence_media_type CHECK (media_type IN ('audio','video'))
+          CONSTRAINT safety_inspection_evidence_media_type CHECK (media_type IN ('audio','image','video'))
         );
+        ALTER TABLE safety_inspection_evidence
+          DROP CONSTRAINT IF EXISTS safety_inspection_evidence_media_type;
+        ALTER TABLE safety_inspection_evidence
+          ADD CONSTRAINT safety_inspection_evidence_media_type
+          CHECK (media_type IN ('audio','image','video'));
         CREATE INDEX IF NOT EXISTS idx_safety_inspection_evidence_inspection
           ON safety_inspection_evidence(inspection_id, created_at);
 
@@ -1082,7 +1087,7 @@ function registerSafetyModule({
       if (!inspection.rows.length) return res.status(404).json({ status: "error", message: "Inspección no encontrada" });
 
       const mediaType = text(req.body?.media_type, 20).toLowerCase();
-      if (!["audio", "video"].includes(mediaType)) throw new Error("La evidencia debe ser audio o video");
+      if (!["audio", "image", "video"].includes(mediaType)) throw new Error("La evidencia debe ser audio, foto o video");
       const uploaded = storeUploadedMedia(req, {
         scopeId: req.params.inspectionId,
         mediaType,
