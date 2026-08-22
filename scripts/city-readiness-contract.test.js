@@ -22,6 +22,9 @@ assert.match(server, /hasValidMediaSignature/, 'Debe proteger evidencia con enla
 assert.match(server, /signProtectedMediaUrls/, 'Debe firmar URLs de evidencia solo al responder a sesiones autorizadas');
 assert.match(server, /findMobileSosIdempotentReplay/, 'Debe reconciliar reintentos offline sin duplicar incidentes');
 assert.match(server, /resolver_action_receipts/, 'Debe reconciliar acciones offline del resolutor');
+assert.match(server, /en-route\|on-site\|resolve\|messages\|media/, 'La idempotencia debe cubrir estados, antecedentes y evidencia offline');
+assert.match(server, /client_action_id:\s*client_action_id\s*\|\|\s*undefined/, 'Mensajes y medios deben conservar la clave idempotente en auditoría');
+assert.match(server, /session\?\.sub\s*\|\|\s*null/, 'La evidencia debe registrar al actor autenticado');
 assert.match(server, /WHATSAPP_OPERATOR/, 'El ingreso manual debe distinguir WhatsApp atendido por operador');
 assert.match(server, /PHONE_14XX/, 'El ingreso manual debe distinguir el canal telefónico municipal');
 assert.match(server, /intake_mode: "OPERATOR_MANUAL"/, 'El ticket debe declarar que la recepción no fue automatizada');

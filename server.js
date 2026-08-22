@@ -1706,17 +1706,22 @@ async function ensureResolverActionIdempotencySchema() {
   resolverActionIdempotencySchemaReady = true;
 }
 
-app.use(/^\/tickets\/[^/]+\/(?:en-route|on-site|resolve)$/, async (req, res, next) => {
+app.use(/^\/tickets\/[^/]+\/(?:en-route|on-site|resolve|messages|media)$/, async (req, res, next) => {
   if (req.method !== "POST") return next();
   const clientActionId = String(req.body?.client_action_id || "").trim().slice(0, 120);
-  const actorUserId = String(req.body?.resolver_user_id || "").trim();
-  if (!clientActionId || !actorUserId) return next();
   const session = panelSessionFromRequest(req);
-  if (!session || (String(session.sub) !== actorUserId && !isSuperAdminSession(session))) return next();
   const originalPath = String(req.originalUrl || req.url || "").split("?")[0];
   const pathParts = originalPath.split("/").filter(Boolean);
+  const actionPath = String(pathParts[2] || "").toLowerCase();
+  const actorUserId = String(
+    ["en-route", "on-site", "resolve"].includes(actionPath)
+      ? req.body?.resolver_user_id || ""
+      : session?.sub || ""
+  ).trim();
+  if (!clientActionId || !actorUserId || !session) return next();
+  if (!session || (String(session.sub) !== actorUserId && !isSuperAdminSession(session))) return next();
   const ticketId = String(pathParts[1] || "");
-  const actionType = String(pathParts[2] || "").toUpperCase().replace(/-/g, "_");
+  const actionType = actionPath.toUpperCase().replace(/-/g, "_");
   try {
     await ensureResolverActionIdempotencySchema();
     const replay = await pool.query(
@@ -10290,8 +10295,15 @@ app.post("/tickets/:id/messages", async (req, res) => {
     const {
       message,
       sender_role = "NEIGHBOR",
-      sender_name = "Vecino"
+      sender_name = "Vecino",
+      client_action_id = null
     } = req.body;
+    const session = panelSessionFromRequest(req);
+    const actorIdentity = session?.sub
+      ? await pool.query(`SELECT full_name, role FROM users WHERE id = $1 LIMIT 1`, [session.sub])
+      : { rows: [] };
+    const effectiveSenderRole = actorIdentity.rows[0]?.role || sender_role;
+    const effectiveSenderName = actorIdentity.rows[0]?.full_name || sender_name;
 
     const cleanMessage = String(message || "").trim();
 
@@ -10327,17 +10339,19 @@ app.post("/tickets/:id/messages", async (req, res) => {
         description,
         metadata
       )
-      VALUES ($1,NULL,$2,'MESSAGE_TEXT',$3,$4)
+      VALUES ($1,$2,$3,'MESSAGE_TEXT',$4,$5)
       RETURNING *
       `,
       [
         id,
-        sender_role,
-        `${sender_name} envió un mensaje de texto`,
+        session?.sub || null,
+        effectiveSenderRole,
+        `${effectiveSenderName} envió un mensaje de texto`,
         JSON.stringify({
           channel: "text",
           message: cleanMessage,
-          sender_name
+          sender_name: effectiveSenderName,
+          client_action_id: client_action_id || undefined
         })
       ]
     );
@@ -10372,8 +10386,15 @@ app.post("/tickets/:id/media", async (req, res) => {
       data_url,
       file_name,
       sender_role = "NEIGHBOR",
-      sender_name = "Vecino"
+      sender_name = "Vecino",
+      client_action_id = null
     } = req.body;
+    const session = panelSessionFromRequest(req);
+    const actorIdentity = session?.sub
+      ? await pool.query(`SELECT full_name, role FROM users WHERE id = $1 LIMIT 1`, [session.sub])
+      : { rows: [] };
+    const effectiveSenderRole = actorIdentity.rows[0]?.role || sender_role;
+    const effectiveSenderName = actorIdentity.rows[0]?.full_name || sender_name;
 
     if (!["audio", "video"].includes(media_type)) {
       return res.status(400).json({
@@ -10434,14 +10455,15 @@ app.post("/tickets/:id/media", async (req, res) => {
         description,
         metadata
       )
-      VALUES ($1,NULL,$2,$3,$4,$5)
+      VALUES ($1,$2,$3,$4,$5,$6)
       RETURNING *
       `,
       [
         id,
-        sender_role,
+        session?.sub || null,
+        effectiveSenderRole,
         actionType,
-        `${sender_name} envió ${media_type === "audio" ? "un audio" : "un video"}`,
+        `${effectiveSenderName} envió ${media_type === "audio" ? "un audio" : "un video"}`,
         JSON.stringify({
           channel: media_type,
           media_type,
@@ -10449,7 +10471,8 @@ app.post("/tickets/:id/media", async (req, res) => {
           file_name: file_name || uploadName,
           mime_type: parsed.mimeType,
           size_bytes: parsed.buffer.length,
-          sender_name
+          sender_name: effectiveSenderName,
+          client_action_id: client_action_id || undefined
         })
       ]
     );
