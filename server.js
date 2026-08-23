@@ -3278,6 +3278,7 @@ async function ticketReportCount(ticketId) {
 
 async function autoAssignResolver(ticket, options = {}) {
   const force = options.force === true;
+  const operatorDispatchOverride = options.operator_dispatch_override === true;
   const excludeResolverUserIds = new Set(
     (options.excludeResolverUserIds || options.exclude_resolver_user_ids || [])
       .filter(Boolean)
@@ -3291,6 +3292,12 @@ async function autoAssignResolver(ticket, options = {}) {
 
   await ensureTicketSlaSchema();
   const assignmentSettings = await getControlCenterSettingsById(ticket.control_center_id).catch(() => null);
+  const automaticDispatchEnabled = !!assignmentSettings?.settings
+    && assignmentSettings.settings.features?.resolver_auto_assignment_enabled !== false
+    && assignmentSettings?.settings?.resolver_policy?.auto_assignment_enabled !== false;
+  if (!automaticDispatchEnabled && !operatorDispatchOverride) {
+    return null;
+  }
   const assignmentSla = effectiveTicketSla(assignmentSettings?.settings || {}, ticket);
   const acceptDueAt = assignmentSla.enabled === false
     ? null
@@ -3921,6 +3928,14 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
     return { assigned: false, reason: `RESOLVER_NOT_AVAILABLE_${resolverStatus}` };
   }
 
+  const assignmentSettings = await getControlCenterSettingsById(resolver.control_center_id).catch(() => null);
+  const automaticDispatchEnabled = !!assignmentSettings?.settings
+    && assignmentSettings.settings.features?.resolver_auto_assignment_enabled !== false
+    && assignmentSettings?.settings?.resolver_policy?.auto_assignment_enabled !== false;
+  if (!automaticDispatchEnabled) {
+    return { assigned: false, reason: 'AUTO_ASSIGNMENT_DISABLED_BY_CONTROL_CENTER' };
+  }
+
   const excludedTicketIds = (options.excludeTicketIds || options.exclude_ticket_ids || [])
     .filter(Boolean)
     .map((value) => String(value).trim())
@@ -4091,7 +4106,7 @@ async function createTicket({
     return ticket;
   });
 
-  const ccSettings = await getControlCenterSettingsById(control_center_id).catch(() => null);
+  const ccSettings = await getControlCenterSettingsById(control_center_id);
   const settings = ccSettings?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
   ticket = await applyTicketSlaSnapshot(ticket, settings).catch((error) => {
     console.warn('[CREATE TICKET SLA WARNING]', error.message);
@@ -4934,7 +4949,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v25-city-resolver-manual-pause",
+version: "2.0-v26-city-manual-dispatch-guard",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -10285,7 +10300,8 @@ app.post("/tickets/:id/auto-assign", async (req, res) => {
 
     const assignment = await autoAssignResolver(ticket, {
       force: true,
-      excludeResolverUserIds: rejectedResolverIds
+      excludeResolverUserIds: rejectedResolverIds,
+      operator_dispatch_override: true
     });
 
     if (!assignment || !assignment.ticket) {
