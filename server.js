@@ -4949,7 +4949,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v26-city-manual-dispatch-guard",
+version: "2.0-v27-city-central-triage-guard",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -14796,6 +14796,8 @@ app.get("/resolver/:user_id/state", async (req, res) => {
     const resolver = userResult.rows[0];
     const resolverSettingsRow = await getControlCenterSettingsById(resolver.control_center_id).catch(() => null);
     const resolverPlatformSettings = resolverSettingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+    const resolverAutomaticDispatchEnabled = resolverPlatformSettings.features?.resolver_auto_assignment_enabled !== false
+      && resolverPlatformSettings.resolver_policy?.auto_assignment_enabled !== false;
     await expirePendingTicketAssignments({ control_center_id: resolver.control_center_id }).catch((error) => {
       console.warn('[RESOLVER SLA RECONCILIATION WARNING]', error.message);
     });
@@ -14924,7 +14926,7 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         AND (
           t.assigned_resolver_id = $1
           OR latest_assignment.state = 'PENDING'
-          OR t.assigned_resolver_id IS NULL
+          OR ($3::boolean = true AND t.assigned_resolver_id IS NULL)
         )
       ORDER BY
         CASE
@@ -14935,7 +14937,7 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         t.priority ASC,
         t.created_at DESC
       `,
-      [user_id, resolver.control_center_id]
+      [user_id, resolver.control_center_id, resolverAutomaticDispatchEnabled]
     );
 
     const resolverVertical = String(resolverPlatformSettings.vertical || 'CITY').toUpperCase();
@@ -15063,6 +15065,19 @@ app.post("/tickets/:id/take", async (req, res) => {
       return res.status(403).json({
         status: "error",
         message: "Ticket belongs to another control center"
+      });
+    }
+
+    const settingsRow = await getControlCenterSettingsById(ticket.control_center_id).catch(() => null);
+    const settings = settingsRow?.settings || null;
+    const automaticDispatchEnabled = !!settings
+      && settings.features?.resolver_auto_assignment_enabled !== false
+      && settings.resolver_policy?.auto_assignment_enabled !== false;
+    if (!ticket.assigned_resolver_id && !automaticDispatchEnabled) {
+      return res.status(403).json({
+        status: "error",
+        code: "CENTRAL_DISPATCH_REQUIRED",
+        message: "Este Centro de Control opera con revisión manual. La Central debe asignar el caso antes de que pueda ser tomado."
       });
     }
 

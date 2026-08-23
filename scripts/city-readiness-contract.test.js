@@ -50,6 +50,16 @@ assert.match(
   /operator_dispatch_override: true/,
   'El operador debe poder ordenar una autoasignación explícita aunque el modo automático esté deshabilitado'
 );
+assert.match(
+  server,
+  /\(\$3::boolean = true AND t\.assigned_resolver_id IS NULL\)/,
+  'Los tickets en revisión manual no deben aparecer como disponibles para los resolutores'
+);
+assert.match(
+  server,
+  /code: "CENTRAL_DISPATCH_REQUIRED"/,
+  'Un resolutor no debe poder tomar directamente un ticket retenido para revisión de Central'
+);
 assert.match(server, /startTicketSlaMaintenance\(\)/, 'El mantenimiento SLA debe iniciar con la API');
 assert.match(server, /MAP SLA RECONCILIATION WARNING/, 'El mapa debe reconciliar vencimientos aunque el barrido de fondo se haya interrumpido');
 assert.match(server, /RESOLVER SLA RECONCILIATION WARNING/, 'La bandeja del resolutor debe reconciliar vencimientos al actualizarse');
