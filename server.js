@@ -9604,7 +9604,7 @@ app.post("/tickets/:id/en-route", async (req, res) => {
         updated_at = NOW()
       WHERE id = $1
         AND assigned_resolver_id = $2
-        AND state IN ('ASSIGNED','ACKNOWLEDGED','EN_ROUTE')
+        AND state IN ('ASSIGNED','ACKNOWLEDGED','ACCEPTED_BY_RESOLVER','EN_ROUTE')
       RETURNING *
       `,
       [id, resolver_user_id]
@@ -9683,7 +9683,7 @@ app.post("/tickets/:id/on-site", async (req, res) => {
         updated_at = NOW()
       WHERE id = $1
         AND assigned_resolver_id = $2
-        AND state IN ('ASSIGNED','ACKNOWLEDGED','EN_ROUTE','ON_SITE')
+        AND state IN ('ASSIGNED','ACKNOWLEDGED','ACCEPTED_BY_RESOLVER','EN_ROUTE','ON_SITE')
       RETURNING *
       `,
       [id, resolver_user_id]

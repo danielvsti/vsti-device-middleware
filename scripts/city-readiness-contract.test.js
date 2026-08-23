@@ -8,6 +8,8 @@ const migration = fs.readFileSync(path.join(root, 'db/migrations/20260822_city_s
 const offlineMigration = fs.readFileSync(path.join(root, 'db/migrations/20260822_mobile_offline_idempotency.sql'), 'utf8');
 const resolverOfflineMigration = fs.readFileSync(path.join(root, 'db/migrations/20260822_resolver_offline_actions.sql'), 'utf8');
 const cityCompliance = fs.readFileSync(path.join(root, 'city-compliance.js'), 'utf8');
+const enRouteHandler = server.match(/app\.post\("\/tickets\/:id\/en-route"[\s\S]*?app\.post\("\/tickets\/:id\/on-site"/)?.[0] || '';
+const onSiteHandler = server.match(/app\.post\("\/tickets\/:id\/on-site"[\s\S]*?app\.post\("\/tickets\/:id\/resolve"/)?.[0] || '';
 
 assert.match(server, /sla_policy:\s*\{[\s\S]*automatic_reassignment_enabled:\s*true/, 'Debe existir política SLA configurable por Centro de Control');
 assert.match(server, /by_priority/, 'SLA debe aceptar overrides por prioridad');
@@ -23,6 +25,8 @@ assert.match(server, /signProtectedMediaUrls/, 'Debe firmar URLs de evidencia so
 assert.match(server, /findMobileSosIdempotentReplay/, 'Debe reconciliar reintentos offline sin duplicar incidentes');
 assert.match(server, /resolver_action_receipts/, 'Debe reconciliar acciones offline del resolutor');
 assert.match(server, /en-route\|on-site\|resolve\|messages\|media/, 'La idempotencia debe cubrir estados, antecedentes y evidencia offline');
+assert.match(enRouteHandler, /state IN \([^)]*'ACCEPTED_BY_RESOLVER'/, 'Un caso aceptado debe poder avanzar a en camino al sincronizar');
+assert.match(onSiteHandler, /state IN \([^)]*'ACCEPTED_BY_RESOLVER'/, 'Un caso aceptado debe poder avanzar directamente a en sitio al sincronizar una cola offline');
 assert.match(server, /client_action_id:\s*client_action_id\s*\|\|\s*undefined/, 'Mensajes y medios deben conservar la clave idempotente en auditoría');
 assert.match(server, /session\?\.sub\s*\|\|\s*null/, 'La evidencia debe registrar al actor autenticado');
 assert.match(server, /WHATSAPP_OPERATOR/, 'El ingreso manual debe distinguir WhatsApp atendido por operador');
