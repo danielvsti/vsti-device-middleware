@@ -458,6 +458,7 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
   },
   sla_policy: {
     enabled: true,
+    require_central_acknowledgement: false,
     automatic_reassignment_enabled: true,
     notify_central_on_breach: true,
     acknowledgement_minutes: 5,
@@ -879,6 +880,10 @@ function normalizeControlCenterSettings(input = {}) {
   const rawSla = isPlainObject(merged.sla_policy) ? merged.sla_policy : {};
   const normalizedSla = normalizeSlaTargetSet(rawSla, defaultSla);
   normalizedSla.enabled = normalizePolicyBoolean(rawSla.enabled, true);
+  normalizedSla.require_central_acknowledgement = normalizePolicyBoolean(
+    rawSla.require_central_acknowledgement,
+    false
+  );
   normalizedSla.automatic_reassignment_enabled = normalizePolicyBoolean(rawSla.automatic_reassignment_enabled, true);
   normalizedSla.notify_central_on_breach = normalizePolicyBoolean(rawSla.notify_central_on_breach, true);
   normalizedSla.by_priority = {};
@@ -2983,6 +2988,7 @@ function effectiveTicketSla(settings, ticket = {}) {
   const target = { ...base, ...priorityOverride, ...categoryOverride };
   return {
     enabled: base.enabled !== false,
+    require_central_acknowledgement: base.require_central_acknowledgement === true,
     automatic_reassignment_enabled: base.automatic_reassignment_enabled !== false,
     notify_central_on_breach: base.notify_central_on_breach !== false,
     acknowledgement_minutes: clampPolicyNumber(target.acknowledgement_minutes, 5, 1, 10080),
@@ -3022,7 +3028,9 @@ async function applyTicketSlaSnapshot(ticket, settings) {
     [
       ticket.id,
       JSON.stringify(policy),
-      minutesAfter(base, policy.acknowledgement_minutes),
+      policy.require_central_acknowledgement === true
+        ? minutesAfter(base, policy.acknowledgement_minutes)
+        : null,
       minutesAfter(base, policy.assignment_minutes),
       minutesAfter(base, policy.resolution_minutes)
     ]
@@ -3564,6 +3572,7 @@ async function expirePendingTicketAssignments(options = {}) {
 
   const summary = { scanned: due.rows.length, expired: 0, reassigned: 0, left_unassigned: 0 };
   for (const row of due.rows) {
+    const policy = row.assignment_sla_policy || {};
     const expired = await pool.query(
       `UPDATE ticket_assignments
        SET state='EXPIRED', expired_at=NOW(), updated_at=NOW()
@@ -3594,13 +3603,15 @@ async function expirePendingTicketAssignments(options = {}) {
       [
         row.ticket_id,
         row.resolver_user_id,
-        'El resolutor no aceptó dentro del SLA. La asignación expiró y la central fue alertada.',
+        policy.notify_central_on_breach === false
+          ? 'El resolutor no aceptó dentro del SLA. La asignación expiró.'
+          : 'El resolutor no aceptó dentro del SLA. La asignación expiró y la central fue alertada.',
         JSON.stringify({
           assignment_id: row.assignment_id,
           expired_resolver_user_id: row.resolver_user_id,
           accept_due_at: row.accept_due_at,
           sla_policy: row.assignment_sla_policy || {},
-          central_alert: true
+          central_alert: policy.notify_central_on_breach !== false
         })
       ]
     );
@@ -3618,7 +3629,6 @@ async function expirePendingTicketAssignments(options = {}) {
     ).catch(() => null);
 
     if (!released.rows.length) continue;
-    const policy = row.assignment_sla_policy || {};
     if (policy.automatic_reassignment_enabled === false) {
       summary.left_unassigned += 1;
       continue;
@@ -3929,7 +3939,7 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
     FROM tickets
     WHERE control_center_id = $1
       AND assigned_resolver_id IS NULL
-      AND state = 'ACTIVE'
+      AND state IN ('ACTIVE','ACKNOWLEDGED')
       ${excludedSql}
       AND NOT EXISTS (
         SELECT 1
@@ -4922,7 +4932,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v21-city-offline-transition",
+version: "2.0-v22-city-central-ack",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -9259,25 +9269,43 @@ app.post("/tickets/:id/acknowledge", async (req, res) => {
   if (!(await checkTicketParticipantAccess(req, res, req.params.id))) return;
   try {
     const { id } = req.params;
-    const { operator_user_id } = req.body;
+    const session = req.panel_session || panelSessionFromRequest(req);
 
     const result = await pool.query(
       `
       UPDATE tickets
       SET
-        state = 'ACKNOWLEDGED',
+        state = CASE WHEN state = 'ACTIVE' THEN 'ACKNOWLEDGED' ELSE state END,
         acknowledged_at = NOW(),
         updated_at = NOW()
       WHERE id = $1
+        AND acknowledged_at IS NULL
+        AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
       RETURNING *
       `,
       [id]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({
+      const existing = await pool.query(
+        `SELECT * FROM tickets WHERE id=$1 LIMIT 1`,
+        [id]
+      );
+      if (!existing.rows.length) {
+        return res.status(404).json({ status: "error", message: "Ticket not found" });
+      }
+      if (existing.rows[0].acknowledged_at) {
+        return res.json({
+          status: "ok",
+          message: "Central ya había confirmado este ticket",
+          ticket: existing.rows[0],
+          idempotent_replay: true
+        });
+      }
+      return res.status(409).json({
         status: "error",
-        message: "Ticket not found"
+        code: "TICKET_TERMINAL",
+        message: "No se puede confirmar un ticket terminal"
       });
     }
 
@@ -9292,18 +9320,19 @@ app.post("/tickets/:id/acknowledge", async (req, res) => {
         action_type,
         description
       )
-      VALUES ($1,$2,'OPERATOR','ACKNOWLEDGED',$3)
+      VALUES ($1,$2,$3,'ACKNOWLEDGED',$4)
       `,
       [
         ticket.id,
-        operator_user_id || null,
-        "Operador tomó conocimiento del caso"
+        session?.sub || null,
+        String(session?.role || "OPERATOR").toUpperCase(),
+        `${session?.name || "Operador"} confirmó la revisión del caso desde Central`
       ]
     );
 
     res.json({
       status: "ok",
-      message: "Ticket acknowledged",
+      message: "Central confirmó la revisión del ticket",
       ticket
     });
 
@@ -12141,24 +12170,39 @@ app.get("/dashboard/analytics", async (req, res) => {
         COUNT(*) FILTER (WHERE priority <= 2)::int AS tickets_high_priority,
         COUNT(*) FILTER (WHERE COALESCE(jurisdiction_status, 'IN_JURISDICTION') = 'OUT_OF_JURISDICTION')::int AS tickets_out_of_jurisdiction,
         COUNT(*) FILTER (WHERE COALESCE(jurisdiction_status, 'IN_JURISDICTION') = 'IN_JURISDICTION_BUFFER')::int AS tickets_near_boundary,
-        ROUND(AVG(EXTRACT(EPOCH FROM (acknowledged_at - created_at)) / 60.0) FILTER (WHERE acknowledged_at IS NOT NULL)::numeric, 1) AS avg_ack_minutes,
+        ROUND(AVG(EXTRACT(EPOCH FROM (acknowledged_at - created_at)) / 60.0) FILTER (
+          WHERE acknowledged_at IS NOT NULL
+            AND COALESCE((sla_policy_snapshot->>'require_central_acknowledgement')::boolean, false) = true
+        )::numeric, 1) AS avg_ack_minutes,
         ROUND(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at)) / 60.0) FILTER (WHERE assigned_at IS NOT NULL)::numeric, 1) AS avg_assign_minutes,
         ROUND(AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 60.0) FILTER (WHERE resolved_at IS NOT NULL)::numeric, 1) AS avg_resolve_minutes,
         ROUND(AVG(EXTRACT(EPOCH FROM (closed_at - created_at)) / 60.0) FILTER (WHERE closed_at IS NOT NULL)::numeric, 1) AS avg_close_minutes,
         ROUND(MAX(EXTRACT(EPOCH FROM (NOW() - created_at)) / 60.0) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED'))::numeric, 1) AS oldest_open_minutes,
         ROUND(
-          100.0 * COUNT(*) FILTER (WHERE acknowledged_at IS NOT NULL AND acknowledged_at <= created_at + INTERVAL '5 minutes')
-          / NULLIF(COUNT(*) FILTER (WHERE acknowledged_at IS NOT NULL), 0),
+          100.0 * COUNT(*) FILTER (
+            WHERE COALESCE((sla_policy_snapshot->>'require_central_acknowledgement')::boolean, false) = true
+              AND acknowledged_at IS NOT NULL
+              AND acknowledged_at <= acknowledged_due_at
+          ) / NULLIF(COUNT(*) FILTER (
+            WHERE COALESCE((sla_policy_snapshot->>'require_central_acknowledgement')::boolean, false) = true
+              AND (acknowledged_at IS NOT NULL OR acknowledged_due_at < NOW())
+          ), 0),
           1
         ) AS sla_ack_5m_pct,
         ROUND(
-          100.0 * COUNT(*) FILTER (WHERE assigned_at IS NOT NULL AND assigned_at <= created_at + INTERVAL '15 minutes')
-          / NULLIF(COUNT(*) FILTER (WHERE assigned_at IS NOT NULL), 0),
+          100.0 * COUNT(*) FILTER (WHERE assigned_at IS NOT NULL AND assigned_at <= assigned_due_at)
+          / NULLIF(COUNT(*) FILTER (
+            WHERE assigned_due_at IS NOT NULL
+              AND (assigned_at IS NOT NULL OR assigned_due_at < NOW())
+          ), 0),
           1
         ) AS sla_assign_15m_pct,
         ROUND(
-          100.0 * COUNT(*) FILTER (WHERE resolved_at IS NOT NULL AND resolved_at <= created_at + INTERVAL '60 minutes')
-          / NULLIF(COUNT(*) FILTER (WHERE resolved_at IS NOT NULL), 0),
+          100.0 * COUNT(*) FILTER (WHERE resolved_at IS NOT NULL AND resolved_at <= resolved_due_at)
+          / NULLIF(COUNT(*) FILTER (
+            WHERE resolved_due_at IS NOT NULL
+              AND (resolved_at IS NOT NULL OR resolved_due_at < NOW())
+          ), 0),
           1
         ) AS sla_resolve_60m_pct
       FROM period_tickets
@@ -12609,7 +12653,11 @@ app.get("/dashboard/analytics", async (req, res) => {
          COALESCE(alert_type, 'SIN_TIPO') AS alert_type,
          priority,
          COUNT(*)::int AS open_tickets,
-         COUNT(*) FILTER (WHERE acknowledged_at IS NULL AND acknowledged_due_at < NOW())::int AS acknowledgement_breaches,
+         COUNT(*) FILTER (
+           WHERE COALESCE((sla_policy_snapshot->>'require_central_acknowledgement')::boolean, false) = true
+             AND acknowledged_at IS NULL
+             AND acknowledged_due_at < NOW()
+         )::int AS acknowledgement_breaches,
          COUNT(*) FILTER (WHERE assigned_at IS NULL AND assigned_due_at < NOW())::int AS assignment_breaches,
          COUNT(*) FILTER (WHERE resolved_at IS NULL AND resolved_due_at < NOW())::int AS resolution_breaches
        FROM tickets
@@ -13305,9 +13353,10 @@ function luciaBuildSafeQuery(question, ccId) {
           resolver.full_name AS resolutor,
           ROUND(EXTRACT(EPOCH FROM (NOW() - t.created_at)) / 60.0)::int AS edad_min,
           CASE
-            WHEN t.acknowledged_at IS NULL AND t.created_at < NOW() - INTERVAL '5 minutes' THEN 'ACK vencido'
-            WHEN t.assigned_at IS NULL AND t.created_at < NOW() - INTERVAL '15 minutes' THEN 'Asignación vencida'
-            WHEN t.resolved_at IS NULL AND t.created_at < NOW() - INTERVAL '60 minutes' THEN 'Resolución vencida'
+            WHEN COALESCE((t.sla_policy_snapshot->>'require_central_acknowledgement')::boolean, false) = true
+              AND t.acknowledged_at IS NULL AND t.acknowledged_due_at < NOW() THEN 'Confirmación Central vencida'
+            WHEN t.assigned_at IS NULL AND t.assigned_due_at < NOW() THEN 'Asignación vencida'
+            WHEN t.resolved_at IS NULL AND t.resolved_due_at < NOW() THEN 'Resolución vencida'
             ELSE 'En observación'
           END AS riesgo
         FROM tickets t
@@ -13316,9 +13365,10 @@ function luciaBuildSafeQuery(question, ccId) {
           AND t.created_at >= NOW() - ($2::int || ' days')::interval
           AND t.state NOT IN ('CLOSED','CANCELLED','RESOLVED')
           AND (
-            (t.acknowledged_at IS NULL AND t.created_at < NOW() - INTERVAL '5 minutes') OR
-            (t.assigned_at IS NULL AND t.created_at < NOW() - INTERVAL '15 minutes') OR
-            (t.resolved_at IS NULL AND t.created_at < NOW() - INTERVAL '60 minutes')
+            (COALESCE((t.sla_policy_snapshot->>'require_central_acknowledgement')::boolean, false) = true
+              AND t.acknowledged_at IS NULL AND t.acknowledged_due_at < NOW()) OR
+            (t.assigned_at IS NULL AND t.assigned_due_at < NOW()) OR
+            (t.resolved_at IS NULL AND t.resolved_due_at < NOW())
           )
         ORDER BY t.created_at ASC
         LIMIT $3

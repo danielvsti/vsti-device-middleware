@@ -12,6 +12,8 @@ const enRouteHandler = server.match(/app\.post\("\/tickets\/:id\/en-route"[\s\S]
 const onSiteHandler = server.match(/app\.post\("\/tickets\/:id\/on-site"[\s\S]*?app\.post\("\/tickets\/:id\/resolve"/)?.[0] || '';
 
 assert.match(server, /sla_policy:\s*\{[\s\S]*automatic_reassignment_enabled:\s*true/, 'Debe existir política SLA configurable por Centro de Control');
+assert.match(server, /require_central_acknowledgement:\s*false/, 'La confirmación humana de Central debe ser explícita y opcional');
+assert.match(server, /policy\.require_central_acknowledgement === true\s*\? minutesAfter/, 'Solo los tickets supervisados deben tener vencimiento de confirmación');
 assert.match(server, /by_priority/, 'SLA debe aceptar overrides por prioridad');
 assert.match(server, /by_category/, 'SLA debe aceptar overrides por categoría');
 assert.match(server, /function effectiveTicketSla/, 'Debe resolver la política efectiva por ticket');
@@ -19,6 +21,10 @@ assert.match(server, /SLA_ACCEPTANCE_EXPIRED/, 'Debe auditar vencimientos de ace
 assert.match(server, /expirePendingTicketAssignments/, 'Debe barrer asignaciones vencidas');
 assert.match(server, /ASSIGNMENT_NOT_PENDING_OR_EXPIRED/, 'Una aceptación tardía debe fallar cerrada');
 assert.match(server, /startTicketSlaMaintenance\(\)/, 'El mantenimiento SLA debe iniciar con la API');
+assert.match(server, /state = CASE WHEN state = 'ACTIVE' THEN 'ACKNOWLEDGED' ELSE state END/, 'Confirmar en Central no debe retroceder un ticket ya asignado');
+assert.match(server, /Central confirmó la revisión del ticket/, 'La confirmación humana debe quedar descrita de forma operacional');
+assert.match(server, /state IN \('ACTIVE','ACKNOWLEDGED'\)/, 'Confirmar en Central no debe sacar al ticket de la cola automática');
+assert.match(server, /sla_policy_snapshot->>'require_central_acknowledgement'/, 'Dashboard debe ignorar falsos vencimientos cuando Central no exige confirmación');
 assert.match(server, /mobileSosRateLimit/, 'Debe limitar ráfagas de activaciones SOS por usuario y origen');
 assert.match(server, /hasValidMediaSignature/, 'Debe proteger evidencia con enlaces firmados y vencimiento');
 assert.match(server, /signProtectedMediaUrls/, 'Debe firmar URLs de evidencia solo al responder a sesiones autorizadas');
