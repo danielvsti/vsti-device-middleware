@@ -52,6 +52,16 @@ assert.match(
 );
 assert.match(
   server,
+  /CENTRAL_ASSISTED_ASSIGNED/,
+  'La asignación asistida solicitada por Central debe distinguirse de una autoasignación autónoma'
+);
+assert.match(
+  server,
+  /CENTRAL_OPERATOR_REQUEST/,
+  'La asignación asistida debe conservar su origen humano en auditoría'
+);
+assert.match(
+  server,
   /\(\$3::boolean = true AND t\.assigned_resolver_id IS NULL\)/,
   'Los tickets en revisión manual no deben aparecer como disponibles para los resolutores'
 );
@@ -70,6 +80,8 @@ assert.match(server, /Central confirmó la revisión del ticket/, 'La confirmaci
 assert.match(server, /state IN \('ACTIVE','ACKNOWLEDGED'\)/, 'Confirmar en Central no debe sacar al ticket de la cola automática');
 assert.match(server, /sla_policy_snapshot->>'require_central_acknowledgement'/, 'Dashboard debe ignorar falsos vencimientos cuando Central no exige confirmación');
 assert.match(server, /mobileSosRateLimit/, 'Debe limitar ráfagas de activaciones SOS por usuario y origen');
+assert.match(server, /NEIGHBOR_FALSE_ALARM_CANCELLED/, 'La cancelación del vecino debe quedar explícita en la bitácora del ticket');
+assert.match(server, /reason: 'FALSE_ALARM'/, 'La cancelación debe conservar la causal de falsa alarma');
 assert.match(server, /hasValidMediaSignature/, 'Debe proteger evidencia con enlaces firmados y vencimiento');
 assert.match(server, /signProtectedMediaUrls/, 'Debe firmar URLs de evidencia solo al responder a sesiones autorizadas');
 assert.match(server, /findMobileSosIdempotentReplay/, 'Debe reconciliar reintentos offline sin duplicar incidentes');

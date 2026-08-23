@@ -3279,6 +3279,7 @@ async function ticketReportCount(ticketId) {
 async function autoAssignResolver(ticket, options = {}) {
   const force = options.force === true;
   const operatorDispatchOverride = options.operator_dispatch_override === true;
+  const operatorUserId = operatorDispatchOverride ? (options.operator_user_id || null) : null;
   const excludeResolverUserIds = new Set(
     (options.excludeResolverUserIds || options.exclude_resolver_user_ids || [])
       .filter(Boolean)
@@ -3476,11 +3477,12 @@ async function autoAssignResolver(ticket, options = {}) {
       accept_due_at,
       sla_policy_snapshot
     )
-    VALUES ($1,$2,'AUTO','PENDING',$3,NOW(),$4,$5::jsonb)
+    VALUES ($1,$2,$3,'PENDING',$4,NOW(),$5,$6::jsonb)
     `,
     [
       ticket.id,
       selected.id,
+      operatorDispatchOverride ? 'CENTRAL_ASSISTED' : 'AUTO',
       selected.distance_meters,
       acceptDueAt,
       JSON.stringify(assignmentSla)
@@ -3508,17 +3510,24 @@ async function autoAssignResolver(ticket, options = {}) {
     `
     INSERT INTO ticket_actions (
       ticket_id,
+      actor_user_id,
       actor_role,
       action_type,
       description,
       metadata
     )
-    VALUES ($1,'SYSTEM','AUTO_ASSIGNED',$2,$3)
+    VALUES ($1,$2,$3,$4,$5,$6)
     `,
     [
       ticket.id,
-      `Resolutor asignado automáticamente: ${selected.full_name}`,
+      operatorUserId,
+      operatorDispatchOverride ? 'OPERATOR' : 'SYSTEM',
+      operatorDispatchOverride ? 'CENTRAL_ASSISTED_ASSIGNED' : 'AUTO_ASSIGNED',
+      operatorDispatchOverride
+        ? `Central asignó al resolutor disponible más cercano: ${selected.full_name}`
+        : `Resolutor asignado automáticamente: ${selected.full_name}`,
       JSON.stringify({
+        assignment_origin: operatorDispatchOverride ? 'CENTRAL_OPERATOR_REQUEST' : 'AUTOMATIC_POLICY',
         resolver_user_id: selected.id,
         resolver_name: selected.full_name,
         distance_meters: Math.round(selected.distance_meters),
@@ -4949,7 +4958,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v27-city-central-triage-guard",
+version: "2.0-v28-city-audited-dispatch-cancellation",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -7151,6 +7160,7 @@ app.post("/public/mobile/cancel", async (req, res) => {
     }
 
     const event = result.rows[0];
+    const session = panelSessionFromRequest(req);
 
     if (user_id && event.user_id !== user_id) {
       return res.status(403).json({
@@ -7189,6 +7199,33 @@ app.post("/public/mobile/cancel", async (req, res) => {
     );
 
     for (const cancelledTicket of cancelledTickets.rows || []) {
+      await pool.query(
+        `
+        INSERT INTO ticket_actions (
+          ticket_id,
+          actor_user_id,
+          actor_role,
+          action_type,
+          description,
+          metadata
+        )
+        VALUES ($1,$2,$3,'NEIGHBOR_FALSE_ALARM_CANCELLED',$4,$5)
+        `,
+        [
+          cancelledTicket.id,
+          session?.sub || event.user_id || user_id || null,
+          String(session?.role || 'NEIGHBOR').toUpperCase(),
+          'El vecino canceló la alerta y la marcó como falsa alarma',
+          JSON.stringify({
+            reason: 'FALSE_ALARM',
+            source: 'MOBILE_APP',
+            mobile_event_id: event_id,
+            previous_ticket_state: event.ticket_state || null,
+            assigned_resolver_user_id: cancelledTicket.assigned_resolver_id || null
+          })
+        ]
+      );
+
       await releaseResolverFromTicket(cancelledTicket.id, "TICKET_CANCELLED_BY_NEIGHBOR").catch((error) => {
         console.warn("[RESOLVER RELEASE WARNING] mobile cancel:", error.message);
       });
@@ -10301,7 +10338,8 @@ app.post("/tickets/:id/auto-assign", async (req, res) => {
     const assignment = await autoAssignResolver(ticket, {
       force: true,
       excludeResolverUserIds: rejectedResolverIds,
-      operator_dispatch_override: true
+      operator_dispatch_override: true,
+      operator_user_id: panelSessionFromRequest(req)?.sub || null
     });
 
     if (!assignment || !assignment.ticket) {
@@ -10314,7 +10352,7 @@ app.post("/tickets/:id/auto-assign", async (req, res) => {
 
     res.json({
       status: "ok",
-      message: "Ticket asignado automáticamente",
+      message: "Central asignó el ticket al resolutor disponible más cercano",
       ticket: assignment.ticket,
       excluded_resolver_user_ids: rejectedResolverIds,
       resolver: {
