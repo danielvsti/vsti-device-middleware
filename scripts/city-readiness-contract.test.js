@@ -30,6 +30,16 @@ assert.match(
   /rejected_actions\.action_type IN \('RESOLVER_REJECTED','SLA_ACCEPTANCE_EXPIRED'\)/,
   'La auditoría de vencimiento también debe excluir al resolutor en la cola'
 );
+assert.match(
+  server,
+  /activeTickets\.length === 0 && \["EN_ROUTE", "ON_SITE"\]\.includes\(currentStatus\)/,
+  'La reconciliación no debe convertir una pausa manual BUSY en AVAILABLE'
+);
+assert.match(
+  server,
+  /\["EN_ROUTE", "ON_SITE"\]\.includes\(requestedStatus\) && activeTickets\.length === 0/,
+  'El GPS debe conservar BUSY como pausa manual cuando no hay tickets activos'
+);
 assert.match(server, /startTicketSlaMaintenance\(\)/, 'El mantenimiento SLA debe iniciar con la API');
 assert.match(server, /MAP SLA RECONCILIATION WARNING/, 'El mapa debe reconciliar vencimientos aunque el barrido de fondo se haya interrumpido');
 assert.match(server, /RESOLVER SLA RECONCILIATION WARNING/, 'La bandeja del resolutor debe reconciliar vencimientos al actualizarse');

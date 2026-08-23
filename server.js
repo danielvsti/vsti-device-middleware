@@ -4312,7 +4312,9 @@ async function reconcileResolverOperationalStatus(resolverUserId, options = {}) 
   const activeTickets = await getActiveTicketsForResolver(resolverUserId);
   const currentStatus = String(resolver.resolver_status || "OFFLINE").toUpperCase();
 
-  if (activeTickets.length === 0 && ["BUSY", "EN_ROUTE", "ON_SITE"].includes(currentStatus)) {
+  // BUSY without an active ticket is a deliberate manual pause selected in the
+  // resolver app. Only movement states can be stale without an assigned case.
+  if (activeTickets.length === 0 && ["EN_ROUTE", "ON_SITE"].includes(currentStatus)) {
     const targetStatus = options.offline === true ? "OFFLINE" : "AVAILABLE";
     const release = await releaseResolverIfNoActiveTicket(resolverUserId, {
       force: true,
@@ -4932,7 +4934,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v24-city-sla-reassignment-guard",
+version: "2.0-v25-city-resolver-manual-pause",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -12079,7 +12081,8 @@ app.get("/debug/resolver-status-summary", async (req, res) => {
           WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
-          WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+          WHEN raw_status = 'BUSY' AND active_tickets_count = 0 THEN 'PAUSED'
+          WHEN raw_status IN ('EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
           WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
           WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
           WHEN active_tickets_count > 0 THEN 'BUSY'
@@ -12137,8 +12140,9 @@ app.get("/dashboard/analytics", async (req, res) => {
     const ccId = controlCenter.id;
     const dashboardSettingsRow = await getControlCenterSettingsById(ccId);
 
-    // Before calculating dashboard KPIs, reconcile impossible resolver states:
-    // BUSY / EN_ROUTE / ON_SITE without an active assigned ticket.
+    // Before calculating dashboard KPIs, reconcile impossible movement states:
+    // EN_ROUTE / ON_SITE without an active assigned ticket. BUSY with no ticket
+    // is a valid manual pause selected by the resolver.
     // This does not touch GPS freshness timestamps.
     const resolverReconciliation = await reconcileResolverStatesForControlCenter(ccId);
     const resolverGpsMaxAccuracy = maxResolverGpsAccuracyMeters();
@@ -12261,7 +12265,8 @@ app.get("/dashboard/analytics", async (req, res) => {
             WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
             WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
             WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
-            WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+            WHEN raw_status = 'BUSY' AND active_tickets_count = 0 THEN 'PAUSED'
+            WHEN raw_status IN ('EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
             WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
             WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
             WHEN active_tickets_count > 0 THEN 'BUSY'
@@ -12284,12 +12289,13 @@ app.get("/dashboard/analytics", async (req, res) => {
         COUNT(*) FILTER (WHERE is_active IS NOT true)::int AS resolvers_inactive,
         COUNT(*) FILTER (WHERE updated_at IS NULL)::int AS resolvers_without_location,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('AVAILABLE','BUSY','EN_ROUTE','ON_SITE'))::int AS resolvers_operational,
-        COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('AVAILABLE','BUSY','EN_ROUTE','ON_SITE','BLOCKED_NO_TICKET'))::int AS resolvers_online,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('AVAILABLE','BUSY','EN_ROUTE','ON_SITE','PAUSED','BLOCKED_NO_TICKET'))::int AS resolvers_online,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'STALE_GPS')::int AS resolvers_stale,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('STALE_GPS','GPS_INVALID','OFFLINE','NO_GPS'))::int AS resolvers_unavailable_gps,
         COUNT(*) FILTER (WHERE is_active IS NOT true OR operational_state IN ('OFFLINE','NO_GPS','GPS_INVALID','STALE_GPS'))::int AS resolvers_offline,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'AVAILABLE')::int AS resolvers_available_now,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state IN ('BUSY','EN_ROUTE','ON_SITE'))::int AS resolvers_busy,
+        COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'PAUSED')::int AS resolvers_paused,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'EN_ROUTE')::int AS resolvers_en_route,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'ON_SITE')::int AS resolvers_on_site,
         COUNT(*) FILTER (WHERE is_active = true AND operational_state = 'BLOCKED_NO_TICKET')::int AS resolvers_blocked_without_ticket,
@@ -12522,7 +12528,8 @@ app.get("/dashboard/analytics", async (req, res) => {
           WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
-          WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+          WHEN raw_status = 'BUSY' AND active_tickets_count = 0 THEN 'PAUSED'
+          WHEN raw_status IN ('EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
           WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
           WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
           WHEN active_tickets_count > 0 THEN 'BUSY'
@@ -14017,7 +14024,8 @@ app.get("/dashboard/map-state", async (req, res) => {
           WHEN raw_status = 'OFFLINE' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '10 minutes' THEN 'OFFLINE'
           WHEN updated_at < NOW() - INTERVAL '3 minutes' THEN 'STALE_GPS'
-          WHEN raw_status IN ('BUSY','EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
+          WHEN raw_status = 'BUSY' AND active_tickets_count = 0 THEN 'PAUSED'
+          WHEN raw_status IN ('EN_ROUTE','ON_SITE') AND active_tickets_count = 0 THEN 'BLOCKED_NO_TICKET'
           WHEN active_tickets_count > 0 AND raw_status = 'EN_ROUTE' THEN 'EN_ROUTE'
           WHEN active_tickets_count > 0 AND raw_status = 'ON_SITE' THEN 'ON_SITE'
           WHEN active_tickets_count > 0 THEN 'BUSY'
@@ -14561,7 +14569,7 @@ app.post("/resolver/location", async (req, res) => {
       } else {
         effectiveStatus = "BUSY";
       }
-    } else if (["BUSY", "EN_ROUTE", "ON_SITE"].includes(requestedStatus) && activeTickets.length === 0) {
+    } else if (["EN_ROUTE", "ON_SITE"].includes(requestedStatus) && activeTickets.length === 0) {
       effectiveStatus = "AVAILABLE";
     }
 
