@@ -80,6 +80,13 @@ assert.match(server, /Central confirmó la revisión del ticket/, 'La confirmaci
 assert.match(server, /state IN \('ACTIVE','ACKNOWLEDGED'\)/, 'Confirmar en Central no debe sacar al ticket de la cola automática');
 assert.match(server, /sla_policy_snapshot->>'require_central_acknowledgement'/, 'Dashboard debe ignorar falsos vencimientos cuando Central no exige confirmación');
 assert.match(server, /mobileSosRateLimit/, 'Debe limitar ráfagas de activaciones SOS por usuario y origen');
+assert.match(server, /function assessNeighborAbuseRisk/, 'Debe evaluar señales históricas de reincidencia sin depender de IA opaca');
+assert.match(server, /mode: 'FLAG_ONLY'/, 'La clasificación preventiva nunca debe bloquear automáticamente una emergencia');
+assert.match(server, /RAPID_REPEATED_ACTIVATIONS/, 'Debe detectar ráfagas de activaciones repetidas');
+assert.match(server, /REPEATED_FALSE_ALARM_CANCELLATIONS/, 'Debe considerar falsas alarmas declaradas y auditadas');
+assert.match(server, /ABUSE_RISK_FLAGGED/, 'Las señales de validación deben quedar auditadas en el ticket');
+assert.match(server, /'VIF', 'VIF_SILENT_SHAKE', 'FALL_DETECTED'/, 'VIF y alertas automáticas sensibles deben excluirse de la clasificación');
+assert.match(server, /nunca bloquea automáticamente una emergencia/, 'La advertencia debe declarar expresamente su límite operacional');
 assert.match(server, /NEIGHBOR_FALSE_ALARM_CANCELLED/, 'La cancelación del vecino debe quedar explícita en la bitácora del ticket');
 assert.match(server, /reason: 'FALSE_ALARM'/, 'La cancelación debe conservar la causal de falsa alarma');
 assert.match(server, /hasValidMediaSignature/, 'Debe proteger evidencia con enlaces firmados y vencimiento');

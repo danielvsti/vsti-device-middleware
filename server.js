@@ -451,6 +451,18 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     dedup_radius_meters: 120,
     dedup_window_minutes: 120
   },
+  abuse_prevention_policy: {
+    enabled: true,
+    mode: 'FLAG_ONLY',
+    rapid_window_minutes: 10,
+    rapid_activation_threshold: 3,
+    daily_activation_threshold: 5,
+    false_alarm_window_days: 30,
+    false_alarm_threshold: 2,
+    medium_score_threshold: 30,
+    high_score_threshold: 60,
+    excluded_categories: ['VIF', 'VIF_SILENT_SHAKE', 'FALL_DETECTED']
+  },
   resolver_policy: {
     auto_assignment_enabled: true,
     max_location_age_seconds: 180,
@@ -864,6 +876,28 @@ function normalizeControlCenterSettings(input = {}) {
     1,
     1440
   );
+
+  merged.abuse_prevention_policy = merged.abuse_prevention_policy || {};
+  const abusePolicy = merged.abuse_prevention_policy;
+  abusePolicy.enabled = normalizePolicyBoolean(abusePolicy.enabled, true);
+  // FLAG_ONLY is intentionally the only supported mode: a statistical signal
+  // must never suppress or reject a municipal emergency automatically.
+  abusePolicy.mode = 'FLAG_ONLY';
+  abusePolicy.rapid_window_minutes = clampPolicyNumber(abusePolicy.rapid_window_minutes, 10, 1, 1440);
+  abusePolicy.rapid_activation_threshold = clampPolicyNumber(abusePolicy.rapid_activation_threshold, 3, 2, 50);
+  abusePolicy.daily_activation_threshold = clampPolicyNumber(abusePolicy.daily_activation_threshold, 5, 2, 100);
+  abusePolicy.false_alarm_window_days = clampPolicyNumber(abusePolicy.false_alarm_window_days, 30, 1, 365);
+  abusePolicy.false_alarm_threshold = clampPolicyNumber(abusePolicy.false_alarm_threshold, 2, 1, 50);
+  abusePolicy.medium_score_threshold = clampPolicyNumber(abusePolicy.medium_score_threshold, 30, 1, 99);
+  abusePolicy.high_score_threshold = clampPolicyNumber(
+    abusePolicy.high_score_threshold,
+    60,
+    abusePolicy.medium_score_threshold + 1,
+    100
+  );
+  abusePolicy.excluded_categories = Array.isArray(abusePolicy.excluded_categories)
+    ? [...new Set(abusePolicy.excluded_categories.map(value => String(value || '').trim().toUpperCase()).filter(Boolean))]
+    : ['VIF', 'VIF_SILENT_SHAKE', 'FALL_DETECTED'];
 
   merged.resolver_policy = merged.resolver_policy || {};
   merged.resolver_policy.auto_assignment_enabled = normalizePolicyBoolean(merged.resolver_policy.auto_assignment_enabled, true);
@@ -3276,6 +3310,160 @@ async function ticketReportCount(ticketId) {
   return Number(result.rows[0]?.report_count || 0);
 }
 
+async function assessNeighborAbuseRisk({ controlCenterId, citizenUserId, alertType, settings }) {
+  const normalized = normalizeControlCenterSettings(settings || {});
+  const policy = normalized.abuse_prevention_policy || DEFAULT_CONTROL_CENTER_SETTINGS.abuse_prevention_policy;
+  const category = String(alertType || '').trim().toUpperCase();
+  const assessedAt = new Date().toISOString();
+
+  if (policy.enabled === false || policy.excluded_categories.includes(category)) {
+    return {
+      assessed_at: assessedAt,
+      mode: 'FLAG_ONLY',
+      level: 'NOT_APPLICABLE',
+      score: 0,
+      requires_human_validation: false,
+      excluded: true,
+      excluded_reason: policy.enabled === false ? 'POLICY_DISABLED' : 'SENSITIVE_OR_AUTOMATIC_CATEGORY',
+      signals: [],
+      counters: {}
+    };
+  }
+
+  const history = await pool.query(
+    `
+    SELECT
+      COUNT(*) FILTER (
+        WHERE t.created_at >= NOW() - ($3::int * INTERVAL '1 minute')
+      )::int AS activations_rapid_window,
+      COUNT(*) FILTER (
+        WHERE t.created_at >= NOW() - INTERVAL '24 hours'
+      )::int AS activations_24h,
+      COUNT(*) FILTER (
+        WHERE t.created_at >= NOW() - ($4::int * INTERVAL '1 day')
+      )::int AS activations_history_window,
+      COUNT(*) FILTER (
+        WHERE t.created_at >= NOW() - ($4::int * INTERVAL '1 day')
+          AND EXISTS (
+            SELECT 1
+            FROM ticket_actions cancellation
+            WHERE cancellation.ticket_id = t.id
+              AND cancellation.action_type = 'NEIGHBOR_FALSE_ALARM_CANCELLED'
+          )
+      )::int AS false_alarms_history_window
+    FROM tickets t
+    WHERE t.control_center_id = $1
+      AND t.citizen_user_id = $2
+      AND t.source_type = 'MOBILE_APP'
+    `,
+    [controlCenterId, citizenUserId, policy.rapid_window_minutes, policy.false_alarm_window_days]
+  );
+
+  const row = history.rows[0] || {};
+  // The current request has not yet produced its ticket, so it is included
+  // explicitly in activation counters. False-alarm counters only use audited
+  // cancellations and never infer abuse from technical/idempotent retries.
+  const counters = {
+    activations_rapid_window: Number(row.activations_rapid_window || 0) + 1,
+    activations_24h: Number(row.activations_24h || 0) + 1,
+    activations_history_window: Number(row.activations_history_window || 0) + 1,
+    false_alarms_history_window: Number(row.false_alarms_history_window || 0),
+    rapid_window_minutes: policy.rapid_window_minutes,
+    history_window_days: policy.false_alarm_window_days
+  };
+
+  let score = 0;
+  const signals = [];
+  if (counters.activations_rapid_window >= policy.rapid_activation_threshold) {
+    score += 40;
+    signals.push({
+      code: 'RAPID_REPEATED_ACTIVATIONS',
+      label: `${counters.activations_rapid_window} activaciones en ${policy.rapid_window_minutes} min`,
+      weight: 40
+    });
+  }
+  if (counters.activations_24h >= policy.daily_activation_threshold) {
+    score += 25;
+    signals.push({
+      code: 'HIGH_DAILY_ACTIVATION_VOLUME',
+      label: `${counters.activations_24h} activaciones en 24 h`,
+      weight: 25
+    });
+  }
+  if (counters.false_alarms_history_window >= policy.false_alarm_threshold) {
+    score += 35;
+    signals.push({
+      code: 'REPEATED_FALSE_ALARM_CANCELLATIONS',
+      label: `${counters.false_alarms_history_window} falsas alarmas declaradas en ${policy.false_alarm_window_days} días`,
+      weight: 35
+    });
+  }
+
+  const falseAlarmRatio = counters.activations_history_window > 0
+    ? counters.false_alarms_history_window / counters.activations_history_window
+    : 0;
+  if (counters.false_alarms_history_window >= 2 && falseAlarmRatio >= 0.5) {
+    score += 20;
+    signals.push({
+      code: 'HIGH_FALSE_ALARM_RATIO',
+      label: `${Math.round(falseAlarmRatio * 100)}% de activaciones recientes fueron canceladas como falsa alarma`,
+      weight: 20
+    });
+  }
+
+  score = Math.min(100, score);
+  const level = score >= policy.high_score_threshold
+    ? 'HIGH'
+    : score >= policy.medium_score_threshold
+      ? 'REVIEW'
+      : 'NORMAL';
+
+  return {
+    assessed_at: assessedAt,
+    mode: 'FLAG_ONLY',
+    level,
+    score,
+    requires_human_validation: level === 'HIGH' || level === 'REVIEW',
+    excluded: false,
+    signals,
+    counters,
+    policy_snapshot: {
+      rapid_activation_threshold: policy.rapid_activation_threshold,
+      daily_activation_threshold: policy.daily_activation_threshold,
+      false_alarm_threshold: policy.false_alarm_threshold,
+      medium_score_threshold: policy.medium_score_threshold,
+      high_score_threshold: policy.high_score_threshold
+    },
+    safety_notice: 'Señal preventiva; no confirma abuso y nunca bloquea automáticamente una emergencia.'
+  };
+}
+
+async function persistAbuseRiskFlag(ticketId, risk, actionType = 'ABUSE_RISK_FLAGGED') {
+  if (!risk?.requires_human_validation) return null;
+  const levelLabel = risk.level === 'HIGH' ? 'alta' : 'moderada';
+  const result = await pool.query(
+    `
+    INSERT INTO ticket_actions (
+      ticket_id,
+      actor_user_id,
+      actor_role,
+      action_type,
+      description,
+      metadata
+    )
+    VALUES ($1,NULL,'SYSTEM',$2,$3,$4::jsonb)
+    RETURNING *
+    `,
+    [
+      ticketId,
+      actionType,
+      `Validación preventiva sugerida: se detectaron señales de reincidencia ${levelLabel}. No constituye confirmación de abuso.`,
+      JSON.stringify(risk)
+    ]
+  );
+  return result.rows[0] || null;
+}
+
 async function autoAssignResolver(ticket, options = {}) {
   const force = options.force === true;
   const operatorDispatchOverride = options.operator_dispatch_override === true;
@@ -4143,6 +4331,9 @@ async function createTicket({
       metadata
     ]
   );
+  if (isPlainObject(metadata?.abuse_risk)) {
+    await persistAbuseRiskFlag(ticket.id, metadata.abuse_risk);
+  }
   if (settings.features?.resolver_auto_assignment_enabled !== false && settings.resolver_policy?.auto_assignment_enabled !== false) {
     const assignment = await autoAssignResolver(ticket);
     return assignment?.ticket || ticket;
@@ -4958,7 +5149,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v28-city-audited-dispatch-cancellation",
+version: "2.0-v29-city-explainable-abuse-signals",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -6850,6 +7041,16 @@ app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
       });
     }
 
+    const abuseRisk = await assessNeighborAbuseRisk({
+      controlCenterId,
+      citizenUserId,
+      alertType: normalizedAlert.alert_type,
+      settings: platformSettings
+    }).catch((error) => {
+      console.warn('[ABUSE RISK ASSESSMENT WARNING]', error.message);
+      return null;
+    });
+
     await ensureMunicipalQrSchema();
     let qrAttribution = null;
     if (qr_context && typeof qr_context === 'object' && qr_context.code) {
@@ -6985,6 +7186,14 @@ app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
         ]
       );
 
+      if (abuseRisk?.requires_human_validation) {
+        await persistAbuseRiskFlag(linkedTicket.id, {
+          ...abuseRisk,
+          mobile_event_id: event.id,
+          applies_to: 'ATTACHED_REPORTER'
+        }, 'REPORTER_ABUSE_RISK_FLAGGED');
+      }
+
       await pool.query(`UPDATE tickets SET updated_at = NOW() WHERE id = $1`, [linkedTicket.id]);
       const reportCount = await ticketReportCount(linkedTicket.id);
 
@@ -7039,7 +7248,8 @@ app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
         jurisdiction_status: jurisdiction.status,
         jurisdiction_reason: jurisdiction.reason,
         jurisdiction_distance_meters: jurisdiction.distance_meters ?? null,
-        aggregation: 'PRIMARY_INCIDENT'
+        aggregation: 'PRIMARY_INCIDENT',
+        abuse_risk: abuseRisk
       }
     });
 
@@ -13985,7 +14195,8 @@ app.get("/dashboard/map-state", async (req, res) => {
         latest_assignment.rejected_at AS latest_assignment_rejected_at,
         latest_assignment.assignment_type AS latest_assignment_type,
         latest_assignment.accept_due_at AS latest_assignment_accept_due_at,
-        latest_assignment.sla_policy_snapshot AS latest_assignment_sla_policy
+        latest_assignment.sla_policy_snapshot AS latest_assignment_sla_policy,
+        abuse_risk.metadata AS abuse_risk_snapshot
       FROM tickets t
       LEFT JOIN users u ON u.id = t.citizen_user_id
       LEFT JOIN users r ON r.id = t.assigned_resolver_id
@@ -14002,6 +14213,14 @@ app.get("/dashboard/map-state", async (req, res) => {
         ORDER BY ta.created_at DESC
         LIMIT 1
       ) latest_assignment ON true
+      LEFT JOIN LATERAL (
+        SELECT flagged.metadata
+        FROM ticket_actions flagged
+        WHERE flagged.ticket_id = t.id
+          AND flagged.action_type IN ('ABUSE_RISK_FLAGGED','REPORTER_ABUSE_RISK_FLAGGED')
+        ORDER BY flagged.created_at DESC
+        LIMIT 1
+      ) abuse_risk ON true
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::int AS report_count
         FROM ticket_reports tr
@@ -14230,7 +14449,8 @@ app.get("/tickets/:id", async (req, res) => {
         latest_assignment.assignment_type AS latest_assignment_type,
         latest_assignment.accept_due_at AS latest_assignment_accept_due_at,
         latest_assignment.sla_policy_snapshot AS latest_assignment_sla_policy,
-        COALESCE(report_stats.report_count, 0)::int AS report_count
+        COALESCE(report_stats.report_count, 0)::int AS report_count,
+        abuse_risk.metadata AS abuse_risk_snapshot
 
       FROM tickets t
 
@@ -14269,6 +14489,15 @@ app.get("/tickets/:id", async (req, res) => {
         ORDER BY ta.created_at DESC
         LIMIT 1
       ) latest_assignment ON true
+
+      LEFT JOIN LATERAL (
+        SELECT flagged.metadata
+        FROM ticket_actions flagged
+        WHERE flagged.ticket_id = t.id
+          AND flagged.action_type IN ('ABUSE_RISK_FLAGGED','REPORTER_ABUSE_RISK_FLAGGED')
+        ORDER BY flagged.created_at DESC
+        LIMIT 1
+      ) abuse_risk ON true
 
       WHERE t.id = $1
       `,
