@@ -463,6 +463,17 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     high_score_threshold: 60,
     excluded_categories: ['VIF', 'VIF_SILENT_SHAKE', 'FALL_DETECTED']
   },
+  alert_credibility_policy: {
+    enabled: true,
+    mode: 'HUMAN_REVIEW_ONLY',
+    citizen_threshold: 60,
+    event_threshold: 60,
+    alert_threshold: 60,
+    corroboration_window_minutes: 120,
+    event_history_days: 30,
+    event_radius_meters: 300,
+    critical_categories: ['VIF', 'VIF_SILENT_SHAKE', 'MEDICAL', 'FIRE', 'FALL_DETECTED']
+  },
   resolver_policy: {
     auto_assignment_enabled: true,
     max_location_age_seconds: 180,
@@ -898,6 +909,20 @@ function normalizeControlCenterSettings(input = {}) {
   abusePolicy.excluded_categories = Array.isArray(abusePolicy.excluded_categories)
     ? [...new Set(abusePolicy.excluded_categories.map(value => String(value || '').trim().toUpperCase()).filter(Boolean))]
     : ['VIF', 'VIF_SILENT_SHAKE', 'FALL_DETECTED'];
+
+  merged.alert_credibility_policy = merged.alert_credibility_policy || {};
+  const trustPolicy = merged.alert_credibility_policy;
+  trustPolicy.enabled = normalizePolicyBoolean(trustPolicy.enabled, true);
+  trustPolicy.mode = 'HUMAN_REVIEW_ONLY';
+  trustPolicy.citizen_threshold = clampPolicyNumber(trustPolicy.citizen_threshold, 60, 1, 100);
+  trustPolicy.event_threshold = clampPolicyNumber(trustPolicy.event_threshold, 60, 1, 100);
+  trustPolicy.alert_threshold = clampPolicyNumber(trustPolicy.alert_threshold, 60, 1, 100);
+  trustPolicy.corroboration_window_minutes = clampPolicyNumber(trustPolicy.corroboration_window_minutes, 120, 1, 1440);
+  trustPolicy.event_history_days = clampPolicyNumber(trustPolicy.event_history_days, 30, 1, 365);
+  trustPolicy.event_radius_meters = clampPolicyNumber(trustPolicy.event_radius_meters, 300, 25, 5000);
+  trustPolicy.critical_categories = Array.isArray(trustPolicy.critical_categories)
+    ? [...new Set(trustPolicy.critical_categories.map(value => String(value || '').trim().toUpperCase()).filter(Boolean))]
+    : ['VIF', 'VIF_SILENT_SHAKE', 'MEDICAL', 'FIRE', 'FALL_DETECTED'];
 
   merged.resolver_policy = merged.resolver_policy || {};
   merged.resolver_policy.auto_assignment_enabled = normalizePolicyBoolean(merged.resolver_policy.auto_assignment_enabled, true);
@@ -3344,6 +3369,10 @@ async function assessNeighborAbuseRisk({ controlCenterId, citizenUserId, alertTy
       )::int AS activations_history_window,
       COUNT(*) FILTER (
         WHERE t.created_at >= NOW() - ($4::int * INTERVAL '1 day')
+          AND t.state IN ('RESOLVED','CLOSED')
+      )::int AS resolved_history_window,
+      COUNT(*) FILTER (
+        WHERE t.created_at >= NOW() - ($4::int * INTERVAL '1 day')
           AND EXISTS (
             SELECT 1
             FROM ticket_actions cancellation
@@ -3367,6 +3396,7 @@ async function assessNeighborAbuseRisk({ controlCenterId, citizenUserId, alertTy
     activations_rapid_window: Number(row.activations_rapid_window || 0) + 1,
     activations_24h: Number(row.activations_24h || 0) + 1,
     activations_history_window: Number(row.activations_history_window || 0) + 1,
+    resolved_history_window: Number(row.resolved_history_window || 0),
     false_alarms_history_window: Number(row.false_alarms_history_window || 0),
     rapid_window_minutes: policy.rapid_window_minutes,
     history_window_days: policy.false_alarm_window_days
@@ -3436,6 +3466,268 @@ async function assessNeighborAbuseRisk({ controlCenterId, citizenUserId, alertTy
     },
     safety_notice: 'Señal preventiva; no confirma abuso y nunca bloquea automáticamente una emergencia.'
   };
+}
+
+async function assessAlertOperationalTrust({
+  controlCenterId,
+  citizen,
+  alertType,
+  latitude,
+  longitude,
+  accuracy,
+  jurisdiction,
+  settings,
+  existingIncident = null
+}) {
+  const normalized = normalizeControlCenterSettings(settings || {});
+  const policy = normalized.alert_credibility_policy || DEFAULT_CONTROL_CENTER_SETTINGS.alert_credibility_policy;
+  const abusePolicy = normalized.abuse_prevention_policy || DEFAULT_CONTROL_CENTER_SETTINGS.abuse_prevention_policy;
+  const category = String(alertType || '').trim().toUpperCase();
+  const assessedAt = new Date().toISOString();
+
+  if (policy.enabled === false) {
+    return {
+      assessed_at: assessedAt,
+      mode: 'HUMAN_REVIEW_ONLY',
+      decision: 'POLICY_DISABLED',
+      requires_human_validation: false,
+      hold_automatic_flow: false,
+      critical_priority_exception: false
+    };
+  }
+
+  const historyRisk = await assessNeighborAbuseRisk({
+    controlCenterId,
+    citizenUserId: citizen.id,
+    alertType: category,
+    settings: normalized
+  });
+  const counters = historyRisk.counters || {};
+
+  let citizenScore = 65;
+  const citizenSignals = [{ code: 'REGISTERED_AUTHENTICATED_ACCOUNT', label: 'Cuenta registrada y autenticada', effect: 0 }];
+  if (String(citizen.validation_status || '').toUpperCase() === 'VALIDATED') {
+    citizenScore += 20;
+    citizenSignals.push({ code: 'MUNICIPAL_IDENTITY_VALIDATED', label: 'Identidad validada por el Centro de Control', effect: 20 });
+  } else if (String(citizen.validation_status || '').toUpperCase() === 'PROVISIONAL_ACTIVE') {
+    citizenScore += 10;
+    citizenSignals.push({ code: 'PROVISIONAL_ACTIVE_ACCOUNT', label: 'Cuenta provisional vigente', effect: 10 });
+  }
+
+  const resolvedHistory = Number(counters.resolved_history_window || 0);
+  if (resolvedHistory > 0) {
+    const effect = Math.min(10, resolvedHistory * 2);
+    citizenScore += effect;
+    citizenSignals.push({ code: 'PREVIOUS_OPERATIONAL_CASES', label: `${resolvedHistory} casos previos cerrados o resueltos`, effect });
+  }
+
+  const falseAlarms = Number(counters.false_alarms_history_window || 0);
+  if (falseAlarms > 0) {
+    const effect = -Math.min(45, falseAlarms * 15);
+    citizenScore += effect;
+    citizenSignals.push({ code: 'AUDITED_FALSE_ALARMS', label: `${falseAlarms} falsas alarmas declaradas y auditadas`, effect });
+  }
+  if (Number(counters.activations_rapid_window || 0) >= abusePolicy.rapid_activation_threshold) {
+    citizenScore -= 10;
+    citizenSignals.push({ code: 'RAPID_REPEATED_ACTIVATIONS', label: `${counters.activations_rapid_window} activaciones en ${abusePolicy.rapid_window_minutes} min`, effect: -10 });
+  }
+  if (Number(counters.activations_24h || 0) >= abusePolicy.daily_activation_threshold) {
+    citizenScore -= 10;
+    citizenSignals.push({ code: 'HIGH_DAILY_ACTIVATION_VOLUME', label: `${counters.activations_24h} activaciones en 24 h`, effect: -10 });
+  }
+  citizenScore = Math.max(0, Math.min(100, citizenScore));
+
+  const nearbyResult = await pool.query(
+    `
+    SELECT
+      t.id,
+      t.citizen_user_id,
+      t.created_at,
+      t.latitude,
+      t.longitude,
+      t.state,
+      COALESCE(report_stats.report_count, 0)::int AS report_count,
+      COALESCE(report_stats.distinct_reporters, 0)::int AS distinct_reporters,
+      EXISTS (
+        SELECT 1 FROM ticket_actions cancellation
+        WHERE cancellation.ticket_id = t.id
+          AND cancellation.action_type = 'NEIGHBOR_FALSE_ALARM_CANCELLED'
+      ) AS false_alarm
+    FROM tickets t
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*)::int AS report_count,
+             COUNT(DISTINCT tr.reporter_user_id)::int AS distinct_reporters
+      FROM ticket_reports tr
+      WHERE tr.ticket_id = t.id
+    ) report_stats ON true
+    WHERE t.control_center_id = $1
+      AND t.alert_type = $2
+      AND t.source_type = 'MOBILE_APP'
+      AND t.created_at >= NOW() - ($3::int * INTERVAL '1 day')
+      AND t.latitude IS NOT NULL
+      AND t.longitude IS NOT NULL
+    `,
+    [controlCenterId, category, policy.event_history_days]
+  );
+
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  const nearby = (nearbyResult.rows || []).filter(row => (
+    Number.isFinite(lat)
+    && Number.isFinite(lon)
+    && distanceMeters(lat, lon, Number(row.latitude), Number(row.longitude)) <= policy.event_radius_meters
+  ));
+  const otherCitizenNearby = nearby.filter(row => String(row.citizen_user_id || '') !== String(citizen.id));
+  const corroborationCutoff = Date.now() - policy.corroboration_window_minutes * 60000;
+  const recentIndependentNearby = otherCitizenNearby.filter(row => {
+    const createdAt = new Date(row.created_at || 0).getTime();
+    const state = String(row.state || '').toUpperCase();
+    return Number.isFinite(createdAt)
+      && createdAt >= corroborationCutoff
+      && row.false_alarm !== true
+      && !['CANCELLED', 'CLOSED'].includes(state);
+  });
+  const corroboratingNeighbors = recentIndependentNearby.reduce((total, row) => (
+    total + Math.max(1, Number(row.distinct_reporters || 0))
+  ), 0);
+  const nearbyResolved = otherCitizenNearby.filter(row => ['RESOLVED', 'CLOSED'].includes(String(row.state || '').toUpperCase())).length;
+  const nearbyFalseAlarms = otherCitizenNearby.filter(row => row.false_alarm === true).length;
+
+  let eventScore = 55;
+  const eventSignals = [{ code: 'VALID_CATEGORY', label: 'Categoría habilitada por el Centro de Control', effect: 5 }];
+  eventScore += 5;
+  if (jurisdiction?.valid === true) {
+    eventScore += 15;
+    eventSignals.push({ code: 'INSIDE_OPERATIONAL_JURISDICTION', label: 'Evento dentro del territorio operacional', effect: 15 });
+  }
+  const accuracyMeters = Number(accuracy);
+  if (Number.isFinite(accuracyMeters) && accuracyMeters <= 25) {
+    eventScore += 10;
+    eventSignals.push({ code: 'HIGH_GPS_ACCURACY', label: `GPS con precisión de ${Math.round(accuracyMeters)} m`, effect: 10 });
+  } else if (Number.isFinite(accuracyMeters) && accuracyMeters <= 100) {
+    eventScore += 5;
+    eventSignals.push({ code: 'ACCEPTABLE_GPS_ACCURACY', label: `GPS con precisión de ${Math.round(accuracyMeters)} m`, effect: 5 });
+  }
+  if (corroboratingNeighbors > 0) {
+    const effect = corroboratingNeighbors >= 2 ? 20 : 15;
+    eventScore += effect;
+    eventSignals.push({ code: 'INDEPENDENT_NEARBY_CORROBORATION', label: `${corroboratingNeighbors} reportes cercanos de otros vecinos`, effect });
+  }
+  if (nearbyResolved >= 2) {
+    eventScore += 5;
+    eventSignals.push({ code: 'CONFIRMED_HISTORICAL_PATTERN', label: `${nearbyResolved} eventos similares resueltos en el sector`, effect: 5 });
+  }
+  if (nearbyFalseAlarms >= 2) {
+    eventScore -= 15;
+    eventSignals.push({ code: 'FALSE_ALARM_PATTERN_IN_AREA', label: `${nearbyFalseAlarms} falsas alarmas similares en el radio configurado`, effect: -15 });
+  }
+  eventScore = Math.max(0, Math.min(100, eventScore));
+
+  const rawAlertScore = (citizenScore / 100) * (eventScore / 100) * 100;
+  const alertScore = Math.round(rawAlertScore);
+  const citizenPass = citizenScore >= policy.citizen_threshold;
+  const eventPass = eventScore >= policy.event_threshold;
+  const alertPass = rawAlertScore >= policy.alert_threshold;
+  const requiresReview = !(citizenPass && eventPass && alertPass);
+  const criticalException = requiresReview && policy.critical_categories.includes(category);
+
+  return {
+    assessed_at: assessedAt,
+    mode: 'HUMAN_REVIEW_ONLY',
+    formula: 'ALERT = (CITIZEN / 100) * (EVENT / 100) * 100',
+    citizen_credibility: {
+      score: Math.round(citizenScore),
+      threshold: policy.citizen_threshold,
+      pass: citizenPass,
+      signals: citizenSignals,
+      counters
+    },
+    event_credibility: {
+      score: Math.round(eventScore),
+      threshold: policy.event_threshold,
+      pass: eventPass,
+      signals: eventSignals,
+      statistics: {
+        radius_meters: policy.event_radius_meters,
+        corroboration_window_minutes: policy.corroboration_window_minutes,
+        history_days: policy.event_history_days,
+        nearby_similar_events: nearby.length,
+        corroborating_neighbor_reports: corroboratingNeighbors,
+        nearby_resolved_events: nearbyResolved,
+        nearby_false_alarms: nearbyFalseAlarms
+      }
+    },
+    alert_confidence: {
+      score: alertScore,
+      raw_score: Number(rawAlertScore.toFixed(2)),
+      threshold: policy.alert_threshold,
+      pass: alertPass
+    },
+    decision: requiresReview
+      ? (criticalException ? 'CRITICAL_CONTINUE_WITH_PRIORITY_REVIEW' : 'OPERATOR_REVIEW_REQUIRED')
+      : 'AUTOMATIC_FLOW_CONTINUES',
+    requires_human_validation: requiresReview,
+    hold_automatic_flow: requiresReview && !criticalException,
+    critical_priority_exception: criticalException,
+    safety_notice: criticalException
+      ? 'Categoría crítica: el flujo no se detiene; la Central recibe revisión prioritaria en paralelo.'
+      : 'Un ranking bajo exige revisión humana; nunca cancela ni descarta automáticamente la emergencia.'
+  };
+}
+
+async function persistAlertCredibilityDecision(ticketId, trust) {
+  if (!trust || trust.decision === 'POLICY_DISABLED') return null;
+  const requiresReview = trust.requires_human_validation === true;
+  const actionType = requiresReview ? 'ALERT_CREDIBILITY_REVIEW_REQUIRED' : 'ALERT_CREDIBILITY_AUTO_CONTINUED';
+  const description = requiresReview
+    ? (trust.critical_priority_exception
+      ? 'Ranking de alerta bajo: categoría crítica continúa y requiere revisión prioritaria de Central.'
+      : 'Ranking de alerta bajo: se requiere intervención del operador antes de la asignación.')
+    : 'Ranking de vecino y evento sobre los umbrales configurados; el flujo automático puede continuar.';
+  const result = await pool.query(
+    `INSERT INTO ticket_actions (
+       ticket_id, actor_role, action_type, description, metadata
+     ) VALUES ($1,'SYSTEM',$2,$3,$4::jsonb)
+     RETURNING *`,
+    [ticketId, actionType, description, JSON.stringify(trust)]
+  );
+  return result.rows[0] || null;
+}
+
+async function releaseAlertCredibilityHold(ticketId, actorUserId, assignmentOrigin) {
+  const holdResult = await pool.query(
+    `SELECT hold_action.id, hold_action.created_at
+     FROM ticket_actions hold_action
+     WHERE hold_action.ticket_id = $1
+       AND hold_action.action_type = 'AUTO_ASSIGNMENT_HELD_FOR_CREDIBILITY_REVIEW'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM ticket_actions release_action
+         WHERE release_action.ticket_id = hold_action.ticket_id
+           AND release_action.action_type = 'ALERT_CREDIBILITY_REVIEW_COMPLETED'
+           AND release_action.created_at >= hold_action.created_at
+       )
+     ORDER BY hold_action.created_at DESC
+     LIMIT 1`,
+    [ticketId]
+  );
+  if (!holdResult.rows.length) return false;
+
+  await pool.query(
+    `INSERT INTO ticket_actions (
+       ticket_id, actor_user_id, actor_role, action_type, description, metadata
+     ) VALUES ($1,$2,'OPERATOR','ALERT_CREDIBILITY_REVIEW_COMPLETED',$3,$4::jsonb)`,
+    [
+      ticketId,
+      actorUserId || null,
+      'Central revisó el ranking y autorizó la asignación operacional del caso.',
+      JSON.stringify({
+        assignment_origin: assignmentOrigin || 'CENTRAL_OPERATOR_ASSIGNMENT',
+        reviewed_hold_action_id: holdResult.rows[0].id
+      })
+    ]
+  );
+  return true;
 }
 
 async function persistAbuseRiskFlag(ticketId, risk, actionType = 'ABUSE_RISK_FLAGGED') {
@@ -3640,6 +3932,10 @@ async function autoAssignResolver(ticket, options = {}) {
   }
 
   const selected = eligible[0];
+
+  if (operatorDispatchOverride) {
+    await releaseAlertCredibilityHold(ticket.id, operatorUserId, 'CENTRAL_ASSISTED_ASSIGNMENT');
+  }
 
   if (force) {
     await pool.query(
@@ -3981,6 +4277,10 @@ async function assignTicketToResolverManually(ticketId, resolverUserId, options 
     throw error;
   }
 
+  if (operatorUserId) {
+    await releaseAlertCredibilityHold(ticket.id, operatorUserId, 'CENTRAL_MANUAL_ASSIGNMENT');
+  }
+
   if (ticket.assigned_resolver_id) {
     await pool.query(
       `
@@ -4153,6 +4453,18 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
       AND assigned_resolver_id IS NULL
       AND state IN ('ACTIVE','ACKNOWLEDGED')
       ${excludedSql}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ticket_actions credibility_hold
+        WHERE credibility_hold.ticket_id = tickets.id
+          AND credibility_hold.action_type = 'AUTO_ASSIGNMENT_HELD_FOR_CREDIBILITY_REVIEW'
+          AND NOT EXISTS (
+            SELECT 1 FROM ticket_actions credibility_release
+            WHERE credibility_release.ticket_id = credibility_hold.ticket_id
+              AND credibility_release.action_type = 'ALERT_CREDIBILITY_REVIEW_COMPLETED'
+              AND credibility_release.created_at >= credibility_hold.created_at
+          )
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM ticket_assignments rejected_assignments
@@ -4334,9 +4646,37 @@ async function createTicket({
   if (isPlainObject(metadata?.abuse_risk)) {
     await persistAbuseRiskFlag(ticket.id, metadata.abuse_risk);
   }
-  if (settings.features?.resolver_auto_assignment_enabled !== false && settings.resolver_policy?.auto_assignment_enabled !== false) {
+  const alertCredibility = isPlainObject(metadata?.alert_credibility) ? metadata.alert_credibility : null;
+  if (alertCredibility) {
+    await persistAlertCredibilityDecision(ticket.id, alertCredibility);
+  }
+  const automaticFlowHeld = alertCredibility?.hold_automatic_flow === true;
+  if (
+    settings.features?.resolver_auto_assignment_enabled !== false
+    && settings.resolver_policy?.auto_assignment_enabled !== false
+    && !automaticFlowHeld
+  ) {
     const assignment = await autoAssignResolver(ticket);
     return assignment?.ticket || ticket;
+  }
+
+  if (automaticFlowHeld) {
+    await pool.query(
+      `INSERT INTO ticket_actions (
+         ticket_id, actor_role, action_type, description, metadata
+       ) VALUES ($1,'SYSTEM','AUTO_ASSIGNMENT_HELD_FOR_CREDIBILITY_REVIEW',$2,$3::jsonb)`,
+      [
+        ticket.id,
+        'Asignación automática retenida: el ranking requiere validación de Central.',
+        JSON.stringify({
+          decision: alertCredibility.decision,
+          citizen_score: alertCredibility.citizen_credibility?.score ?? null,
+          event_score: alertCredibility.event_credibility?.score ?? null,
+          alert_score: alertCredibility.alert_confidence?.score ?? null
+        })
+      ]
+    );
+    return ticket;
   }
 
   await pool.query(
@@ -5149,7 +5489,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v29-city-explainable-abuse-signals",
+version: "2.0-v30-city-operational-alert-credibility",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -7041,16 +7381,6 @@ app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
       });
     }
 
-    const abuseRisk = await assessNeighborAbuseRisk({
-      controlCenterId,
-      citizenUserId,
-      alertType: normalizedAlert.alert_type,
-      settings: platformSettings
-    }).catch((error) => {
-      console.warn('[ABUSE RISK ASSESSMENT WARNING]', error.message);
-      return null;
-    });
-
     await ensureMunicipalQrSchema();
     let qrAttribution = null;
     if (qr_context && typeof qr_context === 'object' && qr_context.code) {
@@ -7142,6 +7472,21 @@ app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
           settings: platformSettings
         });
 
+    const alertCredibility = await assessAlertOperationalTrust({
+      controlCenterId,
+      citizen,
+      alertType: normalizedAlert.alert_type,
+      latitude: event.latitude,
+      longitude: event.longitude,
+      accuracy: event.accuracy,
+      jurisdiction,
+      settings: platformSettings,
+      existingIncident
+    }).catch((error) => {
+      console.warn('[ALERT CREDIBILITY ASSESSMENT WARNING]', error.message);
+      return null;
+    });
+
     if (existingIncident?.ticket) {
       const linkedTicket = existingIncident.ticket;
       const report = await insertTicketReport({
@@ -7186,12 +7531,12 @@ app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
         ]
       );
 
-      if (abuseRisk?.requires_human_validation) {
-        await persistAbuseRiskFlag(linkedTicket.id, {
-          ...abuseRisk,
+      if (alertCredibility) {
+        await persistAlertCredibilityDecision(linkedTicket.id, {
+          ...alertCredibility,
           mobile_event_id: event.id,
           applies_to: 'ATTACHED_REPORTER'
-        }, 'REPORTER_ABUSE_RISK_FLAGGED');
+        });
       }
 
       await pool.query(`UPDATE tickets SET updated_at = NOW() WHERE id = $1`, [linkedTicket.id]);
@@ -7249,7 +7594,7 @@ app.post("/public/mobile/sos", mobileSosRateLimit, async (req, res) => {
         jurisdiction_reason: jurisdiction.reason,
         jurisdiction_distance_meters: jurisdiction.distance_meters ?? null,
         aggregation: 'PRIMARY_INCIDENT',
-        abuse_risk: abuseRisk
+        alert_credibility: alertCredibility
       }
     });
 
@@ -10447,7 +10792,7 @@ app.post("/tickets/:id/manual-assign", async (req, res) => {
 
     const assignment = await assignTicketToResolverManually(id, resolver_user_id, {
       force: force === true || String(force).toLowerCase() === "true",
-      operator_user_id,
+      operator_user_id: operator_user_id || panelSessionFromRequest(req)?.sub || null,
       reason
     });
 
@@ -14196,7 +14541,8 @@ app.get("/dashboard/map-state", async (req, res) => {
         latest_assignment.assignment_type AS latest_assignment_type,
         latest_assignment.accept_due_at AS latest_assignment_accept_due_at,
         latest_assignment.sla_policy_snapshot AS latest_assignment_sla_policy,
-        abuse_risk.metadata AS abuse_risk_snapshot
+        alert_credibility.metadata AS alert_credibility_snapshot,
+        credibility_release.created_at AS alert_credibility_reviewed_at
       FROM tickets t
       LEFT JOIN users u ON u.id = t.citizen_user_id
       LEFT JOIN users r ON r.id = t.assigned_resolver_id
@@ -14217,10 +14563,18 @@ app.get("/dashboard/map-state", async (req, res) => {
         SELECT flagged.metadata
         FROM ticket_actions flagged
         WHERE flagged.ticket_id = t.id
-          AND flagged.action_type IN ('ABUSE_RISK_FLAGGED','REPORTER_ABUSE_RISK_FLAGGED')
+          AND flagged.action_type IN ('ALERT_CREDIBILITY_REVIEW_REQUIRED','ALERT_CREDIBILITY_AUTO_CONTINUED','ABUSE_RISK_FLAGGED','REPORTER_ABUSE_RISK_FLAGGED')
         ORDER BY flagged.created_at DESC
         LIMIT 1
-      ) abuse_risk ON true
+      ) alert_credibility ON true
+      LEFT JOIN LATERAL (
+        SELECT released.created_at
+        FROM ticket_actions released
+        WHERE released.ticket_id = t.id
+          AND released.action_type = 'ALERT_CREDIBILITY_REVIEW_COMPLETED'
+        ORDER BY released.created_at DESC
+        LIMIT 1
+      ) credibility_release ON true
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::int AS report_count
         FROM ticket_reports tr
@@ -14450,7 +14804,8 @@ app.get("/tickets/:id", async (req, res) => {
         latest_assignment.accept_due_at AS latest_assignment_accept_due_at,
         latest_assignment.sla_policy_snapshot AS latest_assignment_sla_policy,
         COALESCE(report_stats.report_count, 0)::int AS report_count,
-        abuse_risk.metadata AS abuse_risk_snapshot
+        alert_credibility.metadata AS alert_credibility_snapshot,
+        credibility_release.created_at AS alert_credibility_reviewed_at
 
       FROM tickets t
 
@@ -14494,10 +14849,18 @@ app.get("/tickets/:id", async (req, res) => {
         SELECT flagged.metadata
         FROM ticket_actions flagged
         WHERE flagged.ticket_id = t.id
-          AND flagged.action_type IN ('ABUSE_RISK_FLAGGED','REPORTER_ABUSE_RISK_FLAGGED')
+          AND flagged.action_type IN ('ALERT_CREDIBILITY_REVIEW_REQUIRED','ALERT_CREDIBILITY_AUTO_CONTINUED','ABUSE_RISK_FLAGGED','REPORTER_ABUSE_RISK_FLAGGED')
         ORDER BY flagged.created_at DESC
         LIMIT 1
-      ) abuse_risk ON true
+      ) alert_credibility ON true
+      LEFT JOIN LATERAL (
+        SELECT released.created_at
+        FROM ticket_actions released
+        WHERE released.ticket_id = t.id
+          AND released.action_type = 'ALERT_CREDIBILITY_REVIEW_COMPLETED'
+        ORDER BY released.created_at DESC
+        LIMIT 1
+      ) credibility_release ON true
 
       WHERE t.id = $1
       `,
@@ -15193,7 +15556,21 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         AND (
           t.assigned_resolver_id = $1
           OR latest_assignment.state = 'PENDING'
-          OR ($3::boolean = true AND t.assigned_resolver_id IS NULL)
+          OR (
+            $3::boolean = true
+            AND t.assigned_resolver_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM ticket_actions credibility_hold
+              WHERE credibility_hold.ticket_id = t.id
+                AND credibility_hold.action_type = 'AUTO_ASSIGNMENT_HELD_FOR_CREDIBILITY_REVIEW'
+                AND NOT EXISTS (
+                  SELECT 1 FROM ticket_actions credibility_release
+                  WHERE credibility_release.ticket_id = credibility_hold.ticket_id
+                    AND credibility_release.action_type = 'ALERT_CREDIBILITY_REVIEW_COMPLETED'
+                    AND credibility_release.created_at >= credibility_hold.created_at
+                )
+            )
+          )
         )
       ORDER BY
         CASE
@@ -15340,6 +15717,28 @@ app.post("/tickets/:id/take", async (req, res) => {
     const automaticDispatchEnabled = !!settings
       && settings.features?.resolver_auto_assignment_enabled !== false
       && settings.resolver_policy?.auto_assignment_enabled !== false;
+    const credibilityHoldResult = !ticket.assigned_resolver_id
+      ? await pool.query(
+          `SELECT 1 FROM ticket_actions credibility_hold
+           WHERE credibility_hold.ticket_id = $1
+             AND credibility_hold.action_type = 'AUTO_ASSIGNMENT_HELD_FOR_CREDIBILITY_REVIEW'
+             AND NOT EXISTS (
+               SELECT 1 FROM ticket_actions credibility_release
+               WHERE credibility_release.ticket_id = credibility_hold.ticket_id
+                 AND credibility_release.action_type = 'ALERT_CREDIBILITY_REVIEW_COMPLETED'
+                 AND credibility_release.created_at >= credibility_hold.created_at
+             )
+           LIMIT 1`,
+          [ticket.id]
+        )
+      : { rows: [] };
+    if (!ticket.assigned_resolver_id && credibilityHoldResult.rows.length) {
+      return res.status(403).json({
+        status: "error",
+        code: "CENTRAL_CREDIBILITY_REVIEW_REQUIRED",
+        message: "Este ticket requiere validación de credibilidad por la Central antes de ser asignado."
+      });
+    }
     if (!ticket.assigned_resolver_id && !automaticDispatchEnabled) {
       return res.status(403).json({
         status: "error",

@@ -62,7 +62,7 @@ assert.match(
 );
 assert.match(
   server,
-  /\(\$3::boolean = true AND t\.assigned_resolver_id IS NULL\)/,
+  /\$3::boolean = true[\s\S]*t\.assigned_resolver_id IS NULL[\s\S]*AUTO_ASSIGNMENT_HELD_FOR_CREDIBILITY_REVIEW/,
   'Los tickets en revisión manual no deben aparecer como disponibles para los resolutores'
 );
 assert.match(
@@ -87,6 +87,16 @@ assert.match(server, /REPEATED_FALSE_ALARM_CANCELLATIONS/, 'Debe considerar fals
 assert.match(server, /ABUSE_RISK_FLAGGED/, 'Las señales de validación deben quedar auditadas en el ticket');
 assert.match(server, /'VIF', 'VIF_SILENT_SHAKE', 'FALL_DETECTED'/, 'VIF y alertas automáticas sensibles deben excluirse de la clasificación');
 assert.match(server, /nunca bloquea automáticamente una emergencia/, 'La advertencia debe declarar expresamente su límite operacional');
+assert.match(server, /function assessAlertOperationalTrust/, 'Debe calcular separadamente la credibilidad del vecino y del evento');
+assert.match(server, /ALERT = \(CITIZEN \/ 100\) \* \(EVENT \/ 100\) \* 100/, 'F(Alerta) debe combinar ambos rankings de forma explícita');
+assert.match(server, /citizen_threshold:\s*60/, 'El umbral general de credibilidad del vecino debe ser configurable');
+assert.match(server, /event_threshold:\s*60/, 'El umbral general de credibilidad del evento debe ser configurable');
+assert.match(server, /alert_threshold:\s*60/, 'El umbral combinado F(Alerta) debe ser configurable');
+assert.match(server, /INDEPENDENT_NEARBY_CORROBORATION/, 'El evento debe considerar reportes similares de otros vecinos en radio y ventana configurados');
+assert.match(server, /AUTO_ASSIGNMENT_HELD_FOR_CREDIBILITY_REVIEW/, 'Un ranking bajo ordinario debe retener la asignación automática hasta revisión de Central');
+assert.match(server, /CENTRAL_CREDIBILITY_REVIEW_REQUIRED/, 'El resolutor no debe tomar un ticket retenido antes de la revisión central');
+assert.match(server, /CRITICAL_CONTINUE_WITH_PRIORITY_REVIEW/, 'Las categorías críticas deben continuar con revisión prioritaria en paralelo');
+assert.match(server, /ALERT_CREDIBILITY_REVIEW_COMPLETED/, 'La autorización humana debe liberar el hold y quedar auditada');
 assert.match(server, /NEIGHBOR_FALSE_ALARM_CANCELLED/, 'La cancelación del vecino debe quedar explícita en la bitácora del ticket');
 assert.match(server, /reason: 'FALSE_ALARM'/, 'La cancelación debe conservar la causal de falsa alarma');
 assert.match(server, /hasValidMediaSignature/, 'Debe proteger evidencia con enlaces firmados y vencimiento');
