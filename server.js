@@ -4922,7 +4922,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v20-central-operator-call-flow",
+version: "2.0-v21-city-offline-transition",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
