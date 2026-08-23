@@ -20,6 +20,16 @@ assert.match(server, /function effectiveTicketSla/, 'Debe resolver la política 
 assert.match(server, /SLA_ACCEPTANCE_EXPIRED/, 'Debe auditar vencimientos de aceptación');
 assert.match(server, /expirePendingTicketAssignments/, 'Debe barrer asignaciones vencidas');
 assert.match(server, /ASSIGNMENT_NOT_PENDING_OR_EXPIRED/, 'Una aceptación tardía debe fallar cerrada');
+assert.match(
+  server,
+  /UPPER\(COALESCE\(rejected_assignments\.state,''\)\) IN \('REJECTED','EXPIRED'\)/,
+  'La cola no debe devolver un ticket al mismo resolutor después de vencer su aceptación'
+);
+assert.match(
+  server,
+  /rejected_actions\.action_type IN \('RESOLVER_REJECTED','SLA_ACCEPTANCE_EXPIRED'\)/,
+  'La auditoría de vencimiento también debe excluir al resolutor en la cola'
+);
 assert.match(server, /startTicketSlaMaintenance\(\)/, 'El mantenimiento SLA debe iniciar con la API');
 assert.match(server, /MAP SLA RECONCILIATION WARNING/, 'El mapa debe reconciliar vencimientos aunque el barrido de fondo se haya interrumpido');
 assert.match(server, /RESOLVER SLA RECONCILIATION WARNING/, 'La bandeja del resolutor debe reconciliar vencimientos al actualizarse');

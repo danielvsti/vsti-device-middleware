@@ -3946,14 +3946,14 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
         FROM ticket_assignments rejected_assignments
         WHERE rejected_assignments.ticket_id = tickets.id
           AND rejected_assignments.resolver_user_id = $2
-          AND UPPER(COALESCE(rejected_assignments.state,'')) = 'REJECTED'
+          AND UPPER(COALESCE(rejected_assignments.state,'')) IN ('REJECTED','EXPIRED')
       )
       AND NOT EXISTS (
         SELECT 1
         FROM ticket_actions rejected_actions
         WHERE rejected_actions.ticket_id = tickets.id
           AND rejected_actions.actor_user_id = $2
-          AND rejected_actions.action_type = 'RESOLVER_REJECTED'
+          AND rejected_actions.action_type IN ('RESOLVER_REJECTED','SLA_ACCEPTANCE_EXPIRED')
       )
     ORDER BY created_at ASC
     LIMIT 1
@@ -3989,7 +3989,7 @@ async function assignNextQueuedTicketToResolver(resolverUserId, options = {}) {
         trigger: options.trigger || 'RESOLVER_RELEASED',
         resolver_user_id: resolver.id,
         resolver_name: resolver.full_name,
-        skipped_rejected_tickets: true
+        skipped_rejected_or_expired_tickets: true
       })
     ]
   ).catch(() => null);
@@ -4932,7 +4932,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v23-city-sla-visibility",
+version: "2.0-v24-city-sla-reassignment-guard",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
