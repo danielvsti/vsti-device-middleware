@@ -4932,7 +4932,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v22-city-central-ack",
+version: "2.0-v23-city-sla-visibility",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -13876,6 +13876,9 @@ app.get("/dashboard/map-state", async (req, res) => {
 
     await ensureVoiceSchema();
     await ensureIncidentAggregationSchema();
+    await expirePendingTicketAssignments({ control_center_id: controlCenter.id }).catch((error) => {
+      console.warn('[MAP SLA RECONCILIATION WARNING]', error.message);
+    });
 
     const ticketsResult = await pool.query(
       `
@@ -13895,11 +13898,16 @@ app.get("/dashboard/map-state", async (req, res) => {
         t.event_sector_name AS incident_sector,
         t.event_sector_method AS sector_method,
         t.event_sector_source AS sector_source,
+        t.assigned_resolver_id,
         t.created_at,
         t.acknowledged_at,
         t.assigned_at,
         t.resolved_at,
         t.closed_at,
+        t.sla_policy_snapshot,
+        t.acknowledged_due_at,
+        t.assigned_due_at,
+        t.resolved_due_at,
         u.full_name AS citizen_name,
         u.phone AS citizen_phone,
         r.full_name AS resolver_name,
@@ -13914,7 +13922,9 @@ app.get("/dashboard/map-state", async (req, res) => {
         latest_assignment.state AS latest_assignment_state,
         latest_assignment.resolver_user_id AS latest_assignment_resolver_user_id,
         latest_assignment.rejected_at AS latest_assignment_rejected_at,
-        latest_assignment.assignment_type AS latest_assignment_type
+        latest_assignment.assignment_type AS latest_assignment_type,
+        latest_assignment.accept_due_at AS latest_assignment_accept_due_at,
+        latest_assignment.sla_policy_snapshot AS latest_assignment_sla_policy
       FROM tickets t
       LEFT JOIN users u ON u.id = t.citizen_user_id
       LEFT JOIN users r ON r.id = t.assigned_resolver_id
@@ -13923,7 +13933,9 @@ app.get("/dashboard/map-state", async (req, res) => {
           ta.state,
           ta.resolver_user_id,
           ta.rejected_at,
-          ta.assignment_type
+          ta.assignment_type,
+          ta.accept_due_at,
+          ta.sla_policy_snapshot
         FROM ticket_assignments ta
         WHERE ta.ticket_id = t.id
         ORDER BY ta.created_at DESC
@@ -14154,6 +14166,8 @@ app.get("/tickets/:id", async (req, res) => {
         latest_assignment.resolver_user_id AS latest_assignment_resolver_user_id,
         latest_assignment.rejected_at AS latest_assignment_rejected_at,
         latest_assignment.assignment_type AS latest_assignment_type,
+        latest_assignment.accept_due_at AS latest_assignment_accept_due_at,
+        latest_assignment.sla_policy_snapshot AS latest_assignment_sla_policy,
         COALESCE(report_stats.report_count, 0)::int AS report_count
 
       FROM tickets t
@@ -14185,7 +14199,9 @@ app.get("/tickets/:id", async (req, res) => {
           ta.state,
           ta.resolver_user_id,
           ta.rejected_at,
-          ta.assignment_type
+          ta.assignment_type,
+          ta.accept_due_at,
+          ta.sla_policy_snapshot
         FROM ticket_assignments ta
         WHERE ta.ticket_id = t.id
         ORDER BY ta.created_at DESC
@@ -14756,6 +14772,9 @@ app.get("/resolver/:user_id/state", async (req, res) => {
     const resolver = userResult.rows[0];
     const resolverSettingsRow = await getControlCenterSettingsById(resolver.control_center_id).catch(() => null);
     const resolverPlatformSettings = resolverSettingsRow?.settings || DEFAULT_CONTROL_CENTER_SETTINGS;
+    await expirePendingTicketAssignments({ control_center_id: resolver.control_center_id }).catch((error) => {
+      console.warn('[RESOLVER SLA RECONCILIATION WARNING]', error.message);
+    });
 
     await ensureVoiceSchema();
 
@@ -14827,6 +14846,8 @@ app.get("/resolver/:user_id/state", async (req, res) => {
         latest_assignment.state AS assignment_state,
         latest_assignment.assignment_type,
         latest_assignment.distance_meters,
+        latest_assignment.accept_due_at AS assignment_accept_due_at,
+        latest_assignment.sla_policy_snapshot AS assignment_sla_policy,
         latest_voice.id AS voice_session_id,
         latest_voice.wa_center_session_id AS wa_center_session_id,
         latest_voice.status AS voice_status,
@@ -14849,6 +14870,8 @@ app.get("/resolver/:user_id/state", async (req, res) => {
           ta.state,
           ta.assignment_type,
           ta.distance_meters,
+          ta.accept_due_at,
+          ta.sla_policy_snapshot,
           ta.created_at
         FROM ticket_assignments ta
         WHERE ta.ticket_id = t.id

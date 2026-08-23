@@ -21,6 +21,10 @@ assert.match(server, /SLA_ACCEPTANCE_EXPIRED/, 'Debe auditar vencimientos de ace
 assert.match(server, /expirePendingTicketAssignments/, 'Debe barrer asignaciones vencidas');
 assert.match(server, /ASSIGNMENT_NOT_PENDING_OR_EXPIRED/, 'Una aceptación tardía debe fallar cerrada');
 assert.match(server, /startTicketSlaMaintenance\(\)/, 'El mantenimiento SLA debe iniciar con la API');
+assert.match(server, /MAP SLA RECONCILIATION WARNING/, 'El mapa debe reconciliar vencimientos aunque el barrido de fondo se haya interrumpido');
+assert.match(server, /RESOLVER SLA RECONCILIATION WARNING/, 'La bandeja del resolutor debe reconciliar vencimientos al actualizarse');
+assert.match(server, /latest_assignment_accept_due_at/, 'El mapa debe recibir la fecha límite exacta de aceptación móvil');
+assert.match(server, /assignment_accept_due_at/, 'La App Resolutor debe recibir su fecha límite de aceptación');
 assert.match(server, /state = CASE WHEN state = 'ACTIVE' THEN 'ACKNOWLEDGED' ELSE state END/, 'Confirmar en Central no debe retroceder un ticket ya asignado');
 assert.match(server, /Central confirmó la revisión del ticket/, 'La confirmación humana debe quedar descrita de forma operacional');
 assert.match(server, /state IN \('ACTIVE','ACKNOWLEDGED'\)/, 'Confirmar en Central no debe sacar al ticket de la cola automática');
