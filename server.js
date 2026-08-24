@@ -13794,6 +13794,37 @@ function luciaIntent(question) {
   return "unknown";
 }
 
+function luciaResolveContextualFollowup(question, conversation = []) {
+  const q = normalizeLuciaText(question);
+  if (!/(haz|hacer|repite|repitelo|repítelo|muestra|muestrame|muéstrame|dame|ahora).*(lo mismo|de nuevo|otra vez|para)|^(lo mismo|y para)\b/.test(q)) {
+    return question;
+  }
+
+  const previousUserTurn = [...conversation]
+    .reverse()
+    .find((turn) => turn?.role === "user" && String(turn?.content || "").trim().length >= 3);
+  if (!previousUserTurn) return question;
+
+  const previousQuestion = String(previousUserTurn.content).trim();
+  const previousIntent = luciaIntent(previousQuestion);
+  const days = luciaPeriodDays(question);
+
+  if (previousIntent === "patrol_recommendation") {
+    const units = luciaRequestedPatrolUnits(question) || luciaRequestedPatrolUnits(previousQuestion);
+    const window = luciaRequestedPatrolWindow(question);
+    const requestedType = luciaRequestedAlertType(question) || luciaRequestedAlertType(previousQuestion);
+    const windowText = window.key === "ALL" ? "" : ` ${window.label.toLowerCase()}`;
+    const typeText = requestedType ? ` para ${requestedType.label}` : "";
+    return `Sugiere un plan de patrullaje preventivo${windowText} con ${units} patrullas${typeText} usando los últimos ${days} días`;
+  }
+
+  if (previousIntent === "executive_summary") {
+    return `Dame un resumen ejecutivo de los últimos ${days} días`;
+  }
+
+  return question;
+}
+
 function luciaBuildSafeQuery(question, ccId) {
   const intent = luciaIntent(question);
   const days = luciaPeriodDays(question);
@@ -14780,16 +14811,19 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const assistantConfig = openAiLuciaConfig();
-    const deterministicIntent = luciaIntent(question);
-    let effectiveQuestion = question;
+    const contextualQuestion = luciaResolveContextualFollowup(question, conversation);
+    const contextResolved = contextualQuestion !== question;
+    const deterministicIntent = luciaIntent(contextualQuestion);
+    let effectiveQuestion = contextualQuestion;
     let interpretation = null;
+    let openAiInterpretationUsed = false;
     let interpretationClarification = "";
     let assistantLatencyMs = 0;
     let assistantFallbackReason = assistantConfig.configured ? "" : "not_configured";
 
     // OpenAI solo ayuda a comprender lenguaje natural que el catálogo determinista no reconoció.
     // La salida propuesta debe volver a pasar por el parser seguro de QUELTU; nunca genera SQL.
-    if (assistantConfig.configured && deterministicIntent === "unknown") {
+    if (assistantConfig.configured && !contextResolved && deterministicIntent === "unknown") {
       const interpreted = await interpretLuciaQuestion({ question, conversation });
       assistantLatencyMs += Number(interpreted.latency_ms || 0);
       if (interpreted.ok) {
@@ -14803,6 +14837,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
           && proposedIntent === interpretation?.intent;
         if (accepted) {
           effectiveQuestion = proposedQuestion;
+          openAiInterpretationUsed = true;
         } else if (interpretation?.needs_clarification) {
           interpretationClarification = String(interpretation.clarification_question || "").trim();
           assistantFallbackReason = "clarification_required";
@@ -14832,7 +14867,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       answerText = interpretationClarification;
     }
 
-    let assistantProvider = effectiveQuestion !== question
+    let assistantProvider = openAiInterpretationUsed
       ? "OPENAI_INTERPRETATION"
       : "QUELTU_DETERMINISTIC";
     let conversational = null;
@@ -14942,7 +14977,8 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
           configured: assistantConfig.configured,
           model: assistantConfig.configured ? assistantConfig.model : null,
           conversation_context: conversation.length,
-          interpretation_used: effectiveQuestion !== question,
+          interpretation_used: openAiInterpretationUsed,
+          context_resolved: contextResolved,
           fallback: Boolean(assistantFallbackReason),
           fallback_reason: assistantFallbackReason || null,
           latency_ms: assistantLatencyMs,

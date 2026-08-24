@@ -15,17 +15,35 @@ function sourceBetween(start, end) {
 const sandbox = {};
 vm.runInNewContext([
   sourceBetween("function normalizeLuciaText", "function luciaPeriodDays"),
+  sourceBetween("function luciaPeriodDays", "function luciaLevel2Requested"),
   sourceBetween("function luciaLevel2Requested", "const LUCIA_PDF_DIR"),
   sourceBetween("function luciaRequestedAlertType", "function luciaGuidedSuggestions"),
   sourceBetween("function luciaIntent", "function luciaBuildSafeQuery"),
   sourceBetween("function validateLuciaSql", "async function runLuciaReadOnly"),
-  "this.luciaIntent = luciaIntent; this.validateLuciaSql = validateLuciaSql;"
+  "this.luciaIntent = luciaIntent; this.luciaResolveContextualFollowup = luciaResolveContextualFollowup; this.validateLuciaSql = validateLuciaSql;"
 ].join("\n"), sandbox);
 
 assert.equal(
   sandbox.luciaIntent("Dame un resumen ejecutivo de los últimos 30 días y señala la prioridad principal."),
   "executive_summary",
   "La palabra principal no debe coincidir con la abreviatura INC"
+);
+assert.equal(
+  sandbox.luciaResolveContextualFollowup(
+    "Haz lo mismo, pero de noche y amplíalo a 90 días.",
+    [
+      { role: "user", content: "Sugiere un plan de patrullaje preventivo con 2 patrullas para los últimos 30 días." },
+      { role: "assistant", content: "Plan preventivo calculado." }
+    ]
+  ),
+  "Sugiere un plan de patrullaje preventivo noche con 2 patrullas usando los últimos 90 días"
+);
+assert.equal(
+  sandbox.luciaResolveContextualFollowup(
+    "Ahora repítelo para 90 días.",
+    [{ role: "user", content: "Dame un resumen ejecutivo de los últimos 30 días." }]
+  ),
+  "Dame un resumen ejecutivo de los últimos 90 días"
 );
 assert.equal(
   sandbox.luciaIntent("Muéstrame los tickets INC de los últimos 30 días"),
