@@ -5489,7 +5489,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v30-city-operational-alert-credibility",
+version: "2.0-v31-lucia-level-2-patrol-intelligence",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -13451,6 +13451,12 @@ async function ensureLuciaSchema() {
     CREATE INDEX IF NOT EXISTS idx_lucia_audit_cc_created
     ON lucia_query_audit(control_center_id, created_at DESC)
   `);
+  await pool.query(`
+    ALTER TABLE lucia_query_audit
+      ADD COLUMN IF NOT EXISTS analysis_level INTEGER DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS methodology_version TEXT,
+      ADD COLUMN IF NOT EXISTS result_summary JSONB DEFAULT '{}'::jsonb
+  `);
   luciaSchemaReady = true;
 }
 
@@ -13481,6 +13487,41 @@ function luciaLimit(question, fallback = 10) {
   const m = q.match(/(?:top|primeros|primeras|ultimos|ultimas|mostrar|muestrame|muéstrame)\s+(\d{1,3})/);
   if (m) return Math.max(1, Math.min(50, Number(m[1])));
   return fallback;
+}
+
+function luciaRequestedPatrolUnits(question) {
+  const q = normalizeLuciaText(question);
+  const match = q.match(/(\d{1,2})\s*(patrullas?|equipos?|moviles?|vehiculos?)/);
+  if (match) return Math.max(1, Math.min(10, Number(match[1])));
+  const words = { una: 1, uno: 1, dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6, siete: 7, ocho: 8, nueve: 9, diez: 10 };
+  const wordMatch = q.match(/\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\s+(patrullas?|equipos?|moviles?|vehiculos?)/);
+  if (wordMatch) return words[wordMatch[1]] || 2;
+  return 2;
+}
+
+function luciaRequestedPatrolWindow(question) {
+  const q = normalizeLuciaText(question);
+  if (/madrugada/.test(q)) return { key: "MADRUGADA", label: "Madrugada", hours: "00:00–05:59" };
+  if (/noche|nocturn/.test(q)) return { key: "NOCHE", label: "Noche", hours: "18:00–23:59" };
+  if (/tarde/.test(q)) return { key: "TARDE", label: "Tarde", hours: "12:00–17:59" };
+  if (/manana|mañana/.test(q)) return { key: "MANANA", label: "Mañana", hours: "06:00–11:59" };
+  if (/ahora|turno actual|este horario/.test(q)) {
+    const hour = Number(new Intl.DateTimeFormat("en-GB", {
+      timeZone: "America/Santiago",
+      hour: "2-digit",
+      hour12: false
+    }).format(new Date()));
+    if (hour < 6) return { key: "MADRUGADA", label: "Madrugada", hours: "00:00–05:59" };
+    if (hour < 12) return { key: "MANANA", label: "Mañana", hours: "06:00–11:59" };
+    if (hour < 18) return { key: "TARDE", label: "Tarde", hours: "12:00–17:59" };
+    return { key: "NOCHE", label: "Noche", hours: "18:00–23:59" };
+  }
+  return { key: "ALL", label: "Todo el día", hours: "00:00–23:59" };
+}
+
+function luciaLevel2Requested(question) {
+  const q = normalizeLuciaText(question);
+  return /(patrull|desplieg|cobertura preventiva|ruta preventiva|rutas preventivas|plan preventivo|recorrido preventivo|recorridos preventivos|donde reforzar|donde desplegar|horarios? critic|franjas? critic)/.test(q);
 }
 
 
@@ -13697,6 +13738,7 @@ function luciaIntent(question) {
   const requestedAlertType = luciaRequestedAlertType(question);
 
   if (/^(hola|buenas|ayuda|que puedes hacer|como me ayudas|opciones|menu)\b/.test(q)) return "guided_help";
+  if (luciaLevel2Requested(question)) return "patrol_recommendation";
   if (/grave|graves|complicad|critico|criticos|importante|urgente/.test(q) && !/zona|sector|barrio/.test(q)) return "ambiguous_severity";
   if (/alta prioridad|prioridad alta|prioritarios|prioritarias/.test(q) && /(ticket|tickets|caso|casos|emergencia|emergencias)/.test(q)) return "high_priority_tickets";
 
@@ -13727,6 +13769,155 @@ function luciaBuildSafeQuery(question, ccId) {
   const days = luciaPeriodDays(question);
   const limit = luciaLimit(question, 10);
   const baseParams = [ccId, days, limit];
+
+  if (intent === "patrol_recommendation") {
+    const patrolUnits = luciaRequestedPatrolUnits(question);
+    const patrolWindow = luciaRequestedPatrolWindow(question);
+    const requestedAlertType = luciaRequestedAlertType(question);
+    return {
+      intent,
+      level: 2,
+      days,
+      limit: Math.max(5, Math.min(20, limit)),
+      title: "Plan preventivo de patrullaje",
+      patrol_units: patrolUnits,
+      patrol_window: patrolWindow,
+      requested_alert_type: requestedAlertType,
+      methodology_version: "LUCIA_PATROL_V1",
+      params: [
+        ccId,
+        days,
+        Math.max(5, Math.min(20, limit)),
+        patrolWindow.key,
+        requestedAlertType?.sqlTypes || []
+      ],
+      sql: `
+        WITH source AS (
+          SELECT
+            t.id,
+            COALESCE(NULLIF(t.event_sector_name, ''),
+              CASE
+                WHEN t.latitude > -32.9800 AND t.longitude < -71.5300 THEN 'Reñaca Bajo / Jardín del Mar'
+                WHEN t.latitude > -33.0000 AND t.longitude > -71.5220 THEN 'Gómez Carreño / Reñaca Alto / Glorias Navales'
+                WHEN t.latitude > -33.0020 AND t.longitude BETWEEN -71.5320 AND -71.5050 THEN 'Santa Julia / Achupallas / Canal Beagle'
+                WHEN t.latitude BETWEEN -33.0300 AND -33.0100 AND t.longitude < -71.5400 THEN 'Plan Viña / Libertad / Población Vergara'
+                WHEN t.latitude BETWEEN -33.0300 AND -33.0050 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Miraflores / Chorrillos / Viña Oriente'
+                WHEN t.latitude < -33.0350 AND t.longitude BETWEEN -71.5400 AND -71.5150 THEN 'Forestal'
+                WHEN t.latitude < -33.0300 AND t.longitude < -71.5400 THEN 'Recreo / Nueva Aurora / Agua Santa'
+                ELSE 'Sector por determinar dentro de la comuna'
+              END
+            ) AS sector,
+            CASE WHEN NULLIF(t.event_sector_name, '') IS NOT NULL THEN true ELSE false END AS official_sector,
+            t.latitude::numeric AS latitude,
+            t.longitude::numeric AS longitude,
+            t.alert_type,
+            t.priority,
+            t.state,
+            t.citizen_user_id,
+            t.created_at,
+            EXTRACT(HOUR FROM t.created_at AT TIME ZONE 'America/Santiago')::int AS local_hour,
+            EXTRACT(ISODOW FROM t.created_at AT TIME ZONE 'America/Santiago')::int AS local_dow,
+            EXISTS (
+              SELECT 1
+              FROM ticket_actions false_alarm
+              WHERE false_alarm.ticket_id = t.id
+                AND false_alarm.action_type = 'NEIGHBOR_FALSE_ALARM_CANCELLED'
+            ) AS false_alarm
+          FROM tickets t
+          WHERE t.control_center_id = $1
+            AND t.created_at >= NOW() - ($2::int || ' days')::interval
+            AND t.latitude IS NOT NULL
+            AND t.longitude IS NOT NULL
+            AND COALESCE(t.jurisdiction_status, 'IN_JURISDICTION') <> 'OUT_OF_JURISDICTION'
+            AND (
+              $4::text = 'ALL' OR
+              ($4::text = 'MADRUGADA' AND EXTRACT(HOUR FROM t.created_at AT TIME ZONE 'America/Santiago') BETWEEN 0 AND 5) OR
+              ($4::text = 'MANANA' AND EXTRACT(HOUR FROM t.created_at AT TIME ZONE 'America/Santiago') BETWEEN 6 AND 11) OR
+              ($4::text = 'TARDE' AND EXTRACT(HOUR FROM t.created_at AT TIME ZONE 'America/Santiago') BETWEEN 12 AND 17) OR
+              ($4::text = 'NOCHE' AND EXTRACT(HOUR FROM t.created_at AT TIME ZONE 'America/Santiago') BETWEEN 18 AND 23)
+            )
+            AND (
+              COALESCE(array_length($5::text[], 1), 0) = 0 OR
+              UPPER(COALESCE(t.alert_type, '')) = ANY($5::text[])
+            )
+        ), sector_summary AS (
+          SELECT
+            sector,
+            ROUND(AVG(latitude), 6) AS latitude,
+            ROUND(AVG(longitude), 6) AS longitude,
+            COUNT(*)::int AS eventos,
+            COUNT(DISTINCT citizen_user_id) FILTER (WHERE false_alarm IS NOT TRUE)::int AS vecinos_distintos,
+            COUNT(DISTINCT (created_at AT TIME ZONE 'America/Santiago')::date)::int AS dias_con_eventos,
+            COUNT(*) FILTER (WHERE priority <= 2 AND false_alarm IS NOT TRUE)::int AS alta_prioridad,
+            COUNT(*) FILTER (WHERE state NOT IN ('CLOSED','CANCELLED','RESOLVED') AND false_alarm IS NOT TRUE)::int AS abiertos,
+            COUNT(*) FILTER (WHERE false_alarm)::int AS falsas_alarmas,
+            ROUND(100.0 * COUNT(*) FILTER (WHERE official_sector) / NULLIF(COUNT(*), 0), 1) AS sector_oficial_pct,
+            MAX(created_at) AS ultimo_evento
+          FROM source
+          GROUP BY sector
+        ), hour_counts AS (
+          SELECT sector, local_hour, COUNT(*)::int AS eventos,
+                 ROW_NUMBER() OVER (PARTITION BY sector ORDER BY COUNT(*) DESC, local_hour ASC) AS rn
+          FROM source
+          WHERE false_alarm IS NOT TRUE
+          GROUP BY sector, local_hour
+        ), peak_hours AS (
+          SELECT sector,
+                 STRING_AGG(LPAD(local_hour::text, 2, '0') || ':00 (' || eventos::text || ')', ', ' ORDER BY rn) AS horas_criticas
+          FROM hour_counts
+          WHERE rn <= 3
+          GROUP BY sector
+        ), dow_counts AS (
+          SELECT sector, local_dow, COUNT(*)::int AS eventos,
+                 ROW_NUMBER() OVER (PARTITION BY sector ORDER BY COUNT(*) DESC, local_dow ASC) AS rn
+          FROM source
+          WHERE false_alarm IS NOT TRUE
+          GROUP BY sector, local_dow
+        ), peak_days AS (
+          SELECT sector,
+                 STRING_AGG(
+                   CASE local_dow
+                     WHEN 1 THEN 'lunes' WHEN 2 THEN 'martes' WHEN 3 THEN 'miércoles'
+                     WHEN 4 THEN 'jueves' WHEN 5 THEN 'viernes' WHEN 6 THEN 'sábado' ELSE 'domingo'
+                   END || ' (' || eventos::text || ')', ', ' ORDER BY rn
+                 ) AS dias_criticos
+          FROM dow_counts
+          WHERE rn <= 2
+          GROUP BY sector
+        ), type_counts AS (
+          SELECT sector, alert_type, COUNT(*)::int AS eventos,
+                 ROW_NUMBER() OVER (PARTITION BY sector ORDER BY COUNT(*) DESC, alert_type ASC) AS rn
+          FROM source
+          WHERE false_alarm IS NOT TRUE
+          GROUP BY sector, alert_type
+        )
+        SELECT
+          summary.sector,
+          summary.latitude,
+          summary.longitude,
+          summary.eventos,
+          summary.vecinos_distintos,
+          summary.dias_con_eventos,
+          summary.alta_prioridad,
+          summary.abiertos,
+          summary.falsas_alarmas,
+          summary.sector_oficial_pct,
+          COALESCE(types.alert_type, 'SIN_TIPO') AS tipo_principal,
+          COALESCE(hours.horas_criticas, 'Sin hora dominante') AS horas_criticas,
+          COALESCE(days.dias_criticos, 'Sin día dominante') AS dias_criticos,
+          summary.ultimo_evento
+        FROM sector_summary summary
+        LEFT JOIN peak_hours hours ON hours.sector = summary.sector
+        LEFT JOIN peak_days days ON days.sector = summary.sector
+        LEFT JOIN type_counts types ON types.sector = summary.sector AND types.rn = 1
+        ORDER BY
+          (summary.eventos - summary.falsas_alarmas) DESC,
+          summary.alta_prioridad DESC,
+          summary.ultimo_evento DESC
+        LIMIT $3
+      `
+    };
+  }
 
   if (intent === "sirens_summary") {
     return {
@@ -14175,6 +14366,261 @@ async function runLuciaReadOnly(sql, params) {
   }
 }
 
+const LUCIA_LEVEL2_RESOLVERS_SQL = `
+  WITH resolver_base AS (
+    SELECT
+      u.id,
+      u.full_name,
+      rl.latitude,
+      rl.longitude,
+      rl.accuracy,
+      rl.updated_at,
+      COALESCE(UPPER(rl.status), 'SIN_UBICACION') AS status,
+      COUNT(t.id)::int AS active_tickets
+    FROM users u
+    LEFT JOIN resolver_locations rl ON rl.user_id = u.id
+    LEFT JOIN tickets t ON t.assigned_resolver_id = u.id
+      AND t.control_center_id = u.control_center_id
+      AND t.state = ANY($3::text[])
+    WHERE u.control_center_id = $1
+      AND u.role = 'RESOLVER'
+      AND u.is_active = true
+    GROUP BY u.id, u.full_name, rl.latitude, rl.longitude, rl.accuracy, rl.updated_at, rl.status
+  )
+  SELECT id, full_name, latitude, longitude, accuracy, updated_at, status, active_tickets
+  FROM resolver_base
+  WHERE status = 'AVAILABLE'
+    AND active_tickets = 0
+    AND latitude IS NOT NULL
+    AND longitude IS NOT NULL
+    AND updated_at >= NOW() - INTERVAL '10 minutes'
+    AND (accuracy IS NULL OR accuracy <= $4::numeric)
+  ORDER BY updated_at DESC, full_name ASC
+  LIMIT $2
+`;
+
+function luciaClamp(value, min, max) {
+  return Math.max(min, Math.min(max, Number(value) || 0));
+}
+
+function luciaRound(value, digits = 0) {
+  const factor = 10 ** digits;
+  return Math.round((Number(value) || 0) * factor) / factor;
+}
+
+function luciaLevel2Confidence({ effectiveEvents, uniqueCitizens, officialSectorPct }) {
+  if (effectiveEvents >= 10 && uniqueCitizens >= 3 && officialSectorPct >= 70) {
+    return { code: "HIGH", label: "Alta", note: "Muestra suficiente, múltiples vecinos y sectorización mayoritariamente oficial." };
+  }
+  if (effectiveEvents >= 4 && uniqueCitizens >= 2) {
+    return { code: "MEDIUM", label: "Media", note: "Patrón útil para apoyo operacional; conviene validarlo con el operador." };
+  }
+  return { code: "EXPLORATORY", label: "Exploratoria", note: "Muestra reducida: úsala como señal inicial, no como predicción." };
+}
+
+function luciaScorePatrolSectors(rows, days) {
+  const normalizedRows = (rows || []).map((row) => {
+    const events = Math.max(0, Number(row.eventos) || 0);
+    const falseAlarms = Math.max(0, Number(row.falsas_alarmas) || 0);
+    return {
+      ...row,
+      events,
+      falseAlarms,
+      effectiveEvents: Math.max(0, events - falseAlarms),
+      uniqueCitizens: Math.max(0, Number(row.vecinos_distintos) || 0),
+      activeDays: Math.max(0, Number(row.dias_con_eventos) || 0),
+      highPriority: Math.max(0, Number(row.alta_prioridad) || 0),
+      openEvents: Math.max(0, Number(row.abiertos) || 0),
+      officialSectorPct: luciaClamp(row.sector_oficial_pct, 0, 100)
+    };
+  });
+  const maxEvents = Math.max(1, ...normalizedRows.map((row) => row.effectiveEvents));
+  const maxActiveDays = Math.max(1, ...normalizedRows.map((row) => row.activeDays));
+
+  return normalizedRows.map((row) => {
+    const safeEvents = Math.max(1, row.events);
+    const volume = 35 * (row.effectiveEvents / maxEvents);
+    const severity = 25 * (row.highPriority / safeEvents);
+    const recurrence = 20 * (row.activeDays / maxActiveDays);
+    const corroboration = 10 * Math.min(1, row.uniqueCitizens / Math.max(1, row.effectiveEvents));
+    const operationalPressure = 10 * Math.min(1, row.openEvents / safeEvents);
+    const falseAlarmPenalty = 20 * Math.min(1, row.falseAlarms / safeEvents);
+    const score = luciaClamp(volume + severity + recurrence + corroboration + operationalPressure - falseAlarmPenalty, 0, 100);
+    const confidence = luciaLevel2Confidence(row);
+    const latitude = Number(row.latitude);
+    const longitude = Number(row.longitude);
+    const evidence = [
+      `${row.effectiveEvents} evento(s) válidos de ${row.events} observados`,
+      `${row.activeDays} día(s) con actividad en ${days} día(s) analizados`,
+      `${row.highPriority} de alta prioridad y ${row.openEvents} actualmente abiertos`,
+      `${row.uniqueCitizens} vecino(s) distinto(s); ${row.falseAlarms} falsa(s) alarma(s) descontadas`
+    ];
+    return {
+      rank: 0,
+      sector: row.sector,
+      latitude: Number.isFinite(latitude) ? latitude : null,
+      longitude: Number.isFinite(longitude) ? longitude : null,
+      score: luciaRound(score),
+      score_label: score >= 70 ? "Refuerzo prioritario" : score >= 45 ? "Cobertura recomendada" : "Observación preventiva",
+      confidence,
+      events: row.events,
+      effective_events: row.effectiveEvents,
+      unique_citizens: row.uniqueCitizens,
+      active_days: row.activeDays,
+      high_priority_events: row.highPriority,
+      open_events: row.openEvents,
+      false_alarms_discounted: row.falseAlarms,
+      official_sector_pct: row.officialSectorPct,
+      main_type: row.tipo_principal || "SIN_TIPO",
+      critical_hours: row.horas_criticas || "Sin hora dominante",
+      critical_days: row.dias_criticos || "Sin día dominante",
+      last_event_at: row.ultimo_evento || null,
+      evidence
+    };
+  }).sort((a, b) => b.score - a.score || b.effective_events - a.effective_events)
+    .map((row, index) => ({ ...row, rank: index + 1 }));
+}
+
+function luciaNavigationUrl(stops) {
+  const validStops = (stops || []).filter((stop) => Number.isFinite(stop.latitude) && Number.isFinite(stop.longitude));
+  if (!validStops.length) return null;
+  const destination = validStops[validStops.length - 1];
+  const waypoints = validStops.slice(0, -1).map((stop) => `${stop.latitude},${stop.longitude}`).join("|");
+  const params = new URLSearchParams({
+    api: "1",
+    destination: `${destination.latitude},${destination.longitude}`,
+    travelmode: "driving"
+  });
+  if (waypoints) params.set("waypoints", waypoints);
+  return `https://www.google.com/maps/dir/?${params.toString()}`;
+}
+
+function luciaBuildPatrolRoutes(recommendations, resolvers, requestedUnits) {
+  const unitCount = Math.max(1, Math.min(10, Number(requestedUnits) || 1));
+  const units = Array.from({ length: unitCount }, (_, index) => {
+    const resolver = resolvers[index] || null;
+    return {
+      unit: index + 1,
+      resolver_id: resolver?.id || null,
+      resolver_name: resolver?.full_name || `Patrulla propuesta ${index + 1}`,
+      availability: resolver ? "AVAILABLE" : "UNCONFIRMED",
+      start: resolver ? {
+        latitude: Number(resolver.latitude),
+        longitude: Number(resolver.longitude),
+        gps_updated_at: resolver.updated_at
+      } : null,
+      stops: []
+    };
+  });
+
+  const candidates = recommendations
+    .filter((item) => Number.isFinite(item.latitude) && Number.isFinite(item.longitude))
+    .slice(0, Math.max(5, unitCount * 3));
+
+  for (const candidate of candidates) {
+    let selected = units[0];
+    let bestCost = Number.POSITIVE_INFINITY;
+    for (const unit of units) {
+      if (unit.stops.length >= 3) continue;
+      const previous = unit.stops[unit.stops.length - 1] || unit.start;
+      const distanceKm = previous
+        ? distanceMeters(previous.latitude, previous.longitude, candidate.latitude, candidate.longitude) / 1000
+        : 0;
+      const balancePenalty = unit.stops.length * 4;
+      const cost = distanceKm + balancePenalty;
+      if (cost < bestCost) {
+        selected = unit;
+        bestCost = cost;
+      }
+    }
+    selected.stops.push({
+      order: selected.stops.length + 1,
+      sector: candidate.sector,
+      latitude: candidate.latitude,
+      longitude: candidate.longitude,
+      score: candidate.score,
+      critical_hours: candidate.critical_hours,
+      confidence: candidate.confidence.label
+    });
+  }
+
+  return units.map((unit) => {
+    const points = [unit.start, ...unit.stops].filter(Boolean);
+    let distanceMetersTotal = 0;
+    for (let index = 1; index < points.length; index += 1) {
+      distanceMetersTotal += distanceMeters(
+        points[index - 1].latitude,
+        points[index - 1].longitude,
+        points[index].latitude,
+        points[index].longitude
+      );
+    }
+    return {
+      ...unit,
+      estimated_straight_distance_km: luciaRound(distanceMetersTotal / 1000, 1),
+      navigation_url: luciaNavigationUrl(unit.stops),
+      route_note: "Secuencia territorial preliminar; la navegación vial y el despacho requieren validación humana."
+    };
+  });
+}
+
+async function runLuciaLevel2Plan({ queryDef, controlCenter, question }) {
+  const analysisResult = await runLuciaReadOnly(queryDef.sql, queryDef.params);
+  const resolverResult = await runLuciaReadOnly(LUCIA_LEVEL2_RESOLVERS_SQL, [
+    controlCenter.id,
+    queryDef.patrol_units,
+    ACTIVE_RESOLVER_TICKET_STATES,
+    maxResolverGpsAccuracyMeters()
+  ]);
+  analysisResult.duration_ms += resolverResult.duration_ms;
+  const recommendations = luciaScorePatrolSectors(analysisResult.rows, queryDef.days);
+  const routes = luciaBuildPatrolRoutes(recommendations, resolverResult.rows, queryDef.patrol_units);
+  const sampleEvents = recommendations.reduce((sum, item) => sum + item.events, 0);
+  const falseAlarms = recommendations.reduce((sum, item) => sum + item.false_alarms_discounted, 0);
+  const officialWeighted = recommendations.reduce((sum, item) => sum + item.official_sector_pct * item.events, 0);
+  const officialSectorPct = sampleEvents ? luciaRound(officialWeighted / sampleEvents, 1) : 0;
+  const overallConfidence = luciaLevel2Confidence({
+    effectiveEvents: Math.max(0, sampleEvents - falseAlarms),
+    uniqueCitizens: recommendations.reduce((sum, item) => sum + item.unique_citizens, 0),
+    officialSectorPct
+  });
+
+  return {
+    result: analysisResult,
+    plan: {
+      analysis_level: 2,
+      status: "ADVISORY",
+      methodology_version: queryDef.methodology_version,
+      generated_at: new Date().toISOString(),
+      title: "Plan preventivo sugerido por Lucía",
+      objective: "Priorizar cobertura territorial usando patrones históricos y el estado operacional disponible.",
+      period_days: queryDef.days,
+      time_window: queryDef.patrol_window,
+      requested_alert_type: queryDef.requested_alert_type?.label || "Todas las categorías",
+      requested_patrol_units: queryDef.patrol_units,
+      available_resolvers_used: resolverResult.rows.length,
+      sample_events: sampleEvents,
+      false_alarms_discounted: falseAlarms,
+      official_sector_pct: officialSectorPct,
+      overall_confidence: overallConfidence,
+      recommendations,
+      routes,
+      methodology: {
+        score_formula: "35% volumen + 25% prioridad + 20% recurrencia + 10% corroboración + 10% presión operativa − penalización por falsas alarmas",
+        inputs: ["Tickets históricos del CC", "Categoría y prioridad", "Sector y coordenadas", "Estado de tickets", "Falsas alarmas auditadas", "Ubicación reciente de resolutores disponibles"],
+        interpretation: "El puntaje ordena señales históricas relativas; no representa probabilidad de delito ni predicción criminológica."
+      },
+      safeguards: [
+        "Recomendación de solo lectura; no asigna ni despacha recursos.",
+        "El operador debe validar contingencias, dotación, tránsito y restricciones de terreno.",
+        "La secuencia territorial no reemplaza un motor de navegación vial.",
+        "Toda consulta queda restringida y auditada por Centro de Control."
+      ],
+      source_scope: `${controlCenter.code} · datos internos QUELTU · pregunta: ${String(question || "").slice(0, 180)}`
+    }
+  };
+}
+
 function luciaColumns(rows) {
   if (!rows || !rows.length) return [];
   return Object.keys(rows[0]);
@@ -14232,6 +14678,17 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
   return `Luc-IA procesó la consulta sobre ${controlCenterCode} y encontró ${n} filas.`;
 }
 
+function luciaLevel2Answer(plan, controlCenterCode) {
+  if (!plan?.recommendations?.length) {
+    return `No encontré una muestra georreferenciada suficiente en ${controlCenterCode} para proponer un plan preventivo en esa franja y período. Prueba ampliando el período, usando todo el día o quitando el filtro de categoría.`;
+  }
+  const first = plan.recommendations[0];
+  const availableText = plan.available_resolvers_used
+    ? `${plan.available_resolvers_used} resolutor(es) disponible(s) con GPS reciente`
+    : "sin resolutores disponibles con GPS reciente";
+  return `Analicé ${plan.sample_events} evento(s) de los últimos ${plan.period_days} días para ${plan.time_window.label.toLowerCase()} (${plan.time_window.hours}). La primera prioridad sugerida es ${first.sector}, con puntaje ${first.score}/100 y confianza ${first.confidence.label.toLowerCase()}. Preparé ${plan.routes.length} secuencia(s) territoriales usando ${availableText}. Es una recomendación de apoyo: no despacha recursos y requiere validación del operador.`;
+}
+
 function luciaSuggestionsForIntent(question, queryDef) {
   const q = normalizeLuciaText(question);
   const kind = luciaSuggestionKind(question, queryDef.intent);
@@ -14243,6 +14700,14 @@ function luciaSuggestionsForIntent(question, queryDef) {
       { label: "PDF zonas críticas", question: `Entrégame un reporte en PDF de zonas críticas de los últimos ${queryDef.days || 30} días` },
       { label: "Tickets sin asignar", question: "Qué tickets siguen sin asignar" },
       { label: "Tickets por tipo", question: "Distribución de tickets por tipo de emergencia" }
+    ];
+  }
+  if (queryDef.intent === "patrol_recommendation") {
+    return [
+      { label: "Plan nocturno", question: `Sugiere un plan de patrullaje nocturno con 2 patrullas usando los últimos ${queryDef.days || 30} días` },
+      { label: "Plan VIF", question: `Sugiere cobertura preventiva para VIF con 2 patrullas en los últimos ${queryDef.days || 30} días` },
+      { label: "Ampliar a 90 días", question: "Propón rutas preventivas con 2 patrullas usando los últimos 90 días" },
+      { label: "Ver zonas críticas", question: `Identifica zonas críticas de los últimos ${queryDef.days || 30} días` }
     ];
   }
   if (queryDef.intent === "resolver_rejections") {
@@ -14281,8 +14746,18 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
 
     const queryDef = luciaBuildSafeQuery(question, cc.rows[0].id);
     const sqlPreview = validateLuciaSql(queryDef.sql);
-    const result = await runLuciaReadOnly(queryDef.sql, queryDef.params);
-    const answerText = luciaAnswer(queryDef, result.rows, cc.rows[0].code);
+    let result;
+    let patrolPlan = null;
+    if (queryDef.level === 2 && queryDef.intent === "patrol_recommendation") {
+      const level2 = await runLuciaLevel2Plan({ queryDef, controlCenter: cc.rows[0], question });
+      result = level2.result;
+      patrolPlan = level2.plan;
+    } else {
+      result = await runLuciaReadOnly(queryDef.sql, queryDef.params);
+    }
+    const answerText = patrolPlan
+      ? luciaLevel2Answer(patrolPlan, cc.rows[0].code)
+      : luciaAnswer(queryDef, result.rows, cc.rows[0].code);
     const suggestions = luciaSuggestionsForIntent(question, queryDef);
     let report = null;
     if (luciaWantsPdf(question)) {
@@ -14300,8 +14775,9 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       `
       INSERT INTO lucia_query_audit (
         id, user_id, user_role, control_center_id, control_center_code,
-        question, intent, sql_text, row_count, duration_ms
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        question, intent, sql_text, row_count, duration_ms,
+        analysis_level, methodology_version, result_summary
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       `,
       [
         auditId,
@@ -14313,7 +14789,16 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         queryDef.intent,
         sqlPreview,
         result.row_count,
-        result.duration_ms
+        result.duration_ms,
+        queryDef.level || 1,
+        queryDef.methodology_version || null,
+        JSON.stringify(patrolPlan ? {
+          status: patrolPlan.status,
+          sample_events: patrolPlan.sample_events,
+          recommendation_count: patrolPlan.recommendations.length,
+          route_count: patrolPlan.routes.length,
+          overall_confidence: patrolPlan.overall_confidence.code
+        } : {})
       ]
     ).catch((error) => console.warn("[LUCIA AUDIT WARN]", error.message));
 
@@ -14321,6 +14806,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       status: "ok",
       lucia: {
         name: "Luc-IA",
+        analysis_level: queryDef.level || 1,
         mode: "SELECT restringido por centro de control",
         question,
         answer: answerText,
@@ -14339,9 +14825,10 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         },
         columns: luciaColumns(result.rows),
         rows: result.rows,
+        patrol_plan: patrolPlan,
         suggestions,
         clarification: ["unknown", "guided_help", "ambiguous_severity"].includes(queryDef.intent),
-        sector_method: ["critical_zones", "tickets_by_alert_type", "high_priority_tickets"].includes(queryDef.intent) ? "Zonificación oficial UV si está disponible; fallback por coordenada" : null,
+        sector_method: ["critical_zones", "tickets_by_alert_type", "high_priority_tickets", "patrol_recommendation"].includes(queryDef.intent) ? "Zonificación oficial UV si está disponible; fallback por coordenada" : null,
         report,
         sql_preview: process.env.LUCIA_SHOW_SQL === "true" ? sqlPreview : null,
         audit_id: auditId
