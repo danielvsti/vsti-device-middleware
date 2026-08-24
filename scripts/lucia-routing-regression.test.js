@@ -41,8 +41,13 @@ assert.throws(
 );
 assert.match(
   server,
-  /safeToConversationalize = !\["unknown", "guided_help", "ambiguous_severity"\]/,
+  /safeToConversationalize = !\["unknown", "guided_help", "ambiguous_severity", "executive_summary"\]/,
   "Una consulta no comprendida no debe reusar cifras del historial conversacional"
+);
+assert.match(
+  server,
+  /OPENAI_INTERPRETATION/,
+  "El uso de OpenAI para comprender un seguimiento debe distinguirse de la redacción generativa"
 );
 
 console.log("Lucía routing regression OK");

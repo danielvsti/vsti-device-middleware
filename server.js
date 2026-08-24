@@ -14832,9 +14832,11 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       answerText = interpretationClarification;
     }
 
-    let assistantProvider = "QUELTU_DETERMINISTIC";
+    let assistantProvider = effectiveQuestion !== question
+      ? "OPENAI_INTERPRETATION"
+      : "QUELTU_DETERMINISTIC";
     let conversational = null;
-    const safeToConversationalize = !["unknown", "guided_help", "ambiguous_severity"].includes(queryDef.intent);
+    const safeToConversationalize = !["unknown", "guided_help", "ambiguous_severity", "executive_summary"].includes(queryDef.intent);
     if (assistantConfig.configured && safeToConversationalize) {
       conversational = await conversationalizeLuciaAnswer({
         question,
@@ -14852,7 +14854,11 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       } else {
         assistantFallbackReason = conversational.reason || assistantFallbackReason || "generation_failed";
       }
-    } else if (assistantConfig.configured && !safeToConversationalize && !assistantFallbackReason) {
+    } else if (
+      assistantConfig.configured
+      && ["unknown", "guided_help", "ambiguous_severity"].includes(queryDef.intent)
+      && !assistantFallbackReason
+    ) {
       assistantFallbackReason = "safe_clarification_mode";
     }
 
@@ -14912,7 +14918,9 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         analysis_level: queryDef.level || 1,
         mode: assistantProvider === "OPENAI_HYBRID"
           ? "Conversación OpenAI + análisis QUELTU restringido por centro de control"
-          : "Análisis QUELTU restringido por centro de control",
+          : assistantProvider === "OPENAI_INTERPRETATION"
+            ? "Comprensión OpenAI + respuesta QUELTU determinista restringida por centro de control"
+            : "Análisis QUELTU restringido por centro de control",
         question,
         understood_question: effectiveQuestion !== question ? effectiveQuestion : null,
         answer: answerText,
