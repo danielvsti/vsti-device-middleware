@@ -13572,7 +13572,12 @@ function luciaRequestedAlertType(question) {
   ];
 
   for (const item of candidates) {
-    if (item.aliases.some(alias => q.includes(alias))) {
+    if (item.aliases.some(alias => {
+      const escapedAlias = String(alias)
+        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        .replace(/\s+/g, "\\s+");
+      return new RegExp(`(^|\\b)${escapedAlias}(?=\\b|$)`, "i").test(q);
+    })) {
       const sqlTypes = [item.key, item.label.toUpperCase(), item.label.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase()];
       if (item.key === "FIRE") sqlTypes.push("INCENDIO", "INCENDIOS", "INC");
       if (item.key === "MEDICAL") sqlTypes.push("MEDICA", "MÉDICA", "MEDICO", "SALUD");
@@ -14355,9 +14360,13 @@ function luciaBuildSafeQuery(question, ccId) {
 
 function validateLuciaSql(sql) {
   const compact = String(sql || "").replace(/\s+/g, " ").trim();
+  // Los textos SQL pueden contener signos como ";" (p. ej. una etiqueta
+  // explicativa). Para detectar sentencias múltiples y palabras mutantes se
+  // inspecciona una copia sin literales, manteniendo intacta la consulta real.
+  const structuralSql = compact.replace(/'(?:''|[^'])*'/g, "''");
   if (!/^(SELECT|WITH)\s/i.test(compact)) throw new Error("Luc-IA solo puede ejecutar SELECT/WITH.");
-  if (compact.includes(";")) throw new Error("Luc-IA no puede ejecutar múltiples sentencias.");
-  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY|CALL|DO|VACUUM|ANALYZE)\b/i.test(compact)) {
+  if (structuralSql.includes(";")) throw new Error("Luc-IA no puede ejecutar múltiples sentencias.");
+  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY|CALL|DO|VACUUM|ANALYZE)\b/i.test(structuralSql)) {
     throw new Error("Consulta bloqueada por política de solo lectura.");
   }
   const hasTenantFilter =
