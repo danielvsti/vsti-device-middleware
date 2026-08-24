@@ -72,6 +72,27 @@ global.fetch = async (_url, options) => {
   assert.equal(capturedBody.store, false);
   assert.equal(Object.hasOwn(capturedBody, "tools"), false);
 
+  global.fetch = async () => ({
+    ok: false,
+    status: 400,
+    json: async () => ({
+      error: {
+        code: "unsupported_parameter",
+        type: "invalid_request_error",
+        param: "text.format"
+      }
+    })
+  });
+  const failed = await conversationalizeLuciaAnswer({
+    question: "Resume la operación",
+    answer: "No hay tickets sin asignar.",
+    intent: "unassigned_tickets",
+    rows: []
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, "http_400_unsupported_parameter_invalid_request_error_text_format");
+  assert.equal(failed.reason.includes("test-key-not-real"), false, "El diagnóstico no debe exponer la API key");
+
   console.log("Lucía OpenAI hybrid contract OK");
 })().catch((error) => {
   console.error(error);

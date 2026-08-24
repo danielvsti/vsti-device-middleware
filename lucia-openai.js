@@ -94,6 +94,40 @@ function responseOutputText(payload) {
   return parts.join("\n").trim();
 }
 
+function safeOpenAiErrorPart(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+}
+
+async function openAiHttpFailure(response, config, startedAt) {
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    payload = null;
+  }
+  const error = payload?.error || {};
+  const details = [error.code, error.type, error.param]
+    .map(safeOpenAiErrorPart)
+    .filter(Boolean);
+  const reason = [`http_${response.status}`, ...new Set(details)].join("_");
+  console.warn("[LUCIA OPENAI FALLBACK]", {
+    status: response.status,
+    reason,
+    model: config.model
+  });
+  return {
+    ok: false,
+    reason,
+    model: config.model,
+    latency_ms: Date.now() - startedAt
+  };
+}
+
 async function callOpenAiResponses({ input, text, maxOutputTokens = 400 }) {
   const config = openAiLuciaConfig();
   if (!config.configured) return { ok: false, reason: "not_configured", model: config.model, latency_ms: 0 };
@@ -118,7 +152,7 @@ async function callOpenAiResponses({ input, text, maxOutputTokens = 400 }) {
       signal: controller.signal
     });
     if (!response.ok) {
-      return { ok: false, reason: `http_${response.status}`, model: config.model, latency_ms: Date.now() - startedAt };
+      return openAiHttpFailure(response, config, startedAt);
     }
     const payload = await response.json();
     const outputText = responseOutputText(payload);
