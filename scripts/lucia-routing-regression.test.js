@@ -39,5 +39,10 @@ assert.throws(
   () => sandbox.validateLuciaSql("SELECT 1 FROM tickets WHERE control_center_id = $1 LIMIT 1; SELECT 2"),
   /múltiples sentencias/
 );
+assert.match(
+  server,
+  /safeToConversationalize = !\["unknown", "guided_help", "ambiguous_severity"\]/,
+  "Una consulta no comprendida no debe reusar cifras del historial conversacional"
+);
 
 console.log("Lucía routing regression OK");

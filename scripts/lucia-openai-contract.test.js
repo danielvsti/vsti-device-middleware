@@ -71,6 +71,12 @@ global.fetch = async (_url, options) => {
   assert.match(conversational.text, /Claudio Alejandro/);
   assert.equal(capturedBody.store, false);
   assert.equal(Object.hasOwn(capturedBody, "tools"), false);
+  assert.match(
+    capturedBody.input[0].content,
+    /sujeto, período y denominador/,
+    "La redacción debe conservar la relación semántica de cada cifra"
+  );
+  assert.match(capturedBody.input[0].content, /No uses Markdown/, "La respuesta visible debe ser texto plano");
 
   global.fetch = async () => ({
     ok: false,

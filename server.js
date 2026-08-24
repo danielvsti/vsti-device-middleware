@@ -14834,7 +14834,8 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
 
     let assistantProvider = "QUELTU_DETERMINISTIC";
     let conversational = null;
-    if (assistantConfig.configured) {
+    const safeToConversationalize = !["unknown", "guided_help", "ambiguous_severity"].includes(queryDef.intent);
+    if (assistantConfig.configured && safeToConversationalize) {
       conversational = await conversationalizeLuciaAnswer({
         question,
         answer: answerText,
@@ -14851,6 +14852,8 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       } else {
         assistantFallbackReason = conversational.reason || assistantFallbackReason || "generation_failed";
       }
+    } else if (assistantConfig.configured && !safeToConversationalize && !assistantFallbackReason) {
+      assistantFallbackReason = "safe_clarification_mode";
     }
 
     const suggestions = luciaSuggestionsForIntent(effectiveQuestion, queryDef);
