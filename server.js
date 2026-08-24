@@ -13479,6 +13479,21 @@ function normalizeLuciaText(value) {
     .trim();
 }
 
+function luciaSafeDiagnosticCode(error) {
+  const name = String(error?.name || "error").trim().toLowerCase();
+  const code = String(error?.code || "").trim().toLowerCase();
+  const message = String(error?.message || error || "internal_error")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "email")
+    .replace(/\+?56\s*9(?:[\s.-]*\d){8}\b/g, "phone")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "uuid")
+    .replace(/\b\d{5,}\b/g, "number")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 96);
+  return ["lucia", name, code, message].filter(Boolean).join("_").slice(0, 140);
+}
+
 function luciaPeriodDays(question) {
   const q = normalizeLuciaText(question);
   const m = q.match(/(ultimos|ultimas|hace|de los|de las)\s+(\d{1,3})\s+(dias|dia)/);
@@ -14929,6 +14944,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     res.status(500).json({
       status: "error",
       message: "Tuve un problema técnico al procesar la consulta. Prueba con una sugerencia o intenta nuevamente.",
+      diagnostic_code: luciaSafeDiagnosticCode(error),
       technical_message: process.env.NODE_ENV === "development" ? (error.message || String(error)) : undefined
     });
   }
