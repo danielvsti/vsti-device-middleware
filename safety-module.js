@@ -106,7 +106,8 @@ function registerSafetyModule({
   getControlCenterSettingsById,
   syncMobileEventStateFromTicket,
   releaseResolverFromTicket,
-  storeUploadedMedia
+  storeUploadedMedia,
+  createTicket
 }) {
   let schemaPromise = null;
 
@@ -336,6 +337,11 @@ function registerSafetyModule({
         ALTER TABLE safety_incidents ADD COLUMN IF NOT EXISTS conclusion TEXT;
         ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS linked_ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
         ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS accuracy DOUBLE PRECISION;
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS source_vertical VARCHAR(24);
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS alert_requested BOOLEAN NOT NULL DEFAULT false;
         ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS control_type VARCHAR(32);
         ALTER TABLE safety_critical_controls ADD COLUMN IF NOT EXISTS work_area VARCHAR(180);
         ALTER TABLE safety_control_verifications ADD COLUMN IF NOT EXISTS ticket_id UUID REFERENCES tickets(id) ON DELETE SET NULL;
@@ -511,6 +517,38 @@ function registerSafetyModule({
       return null;
     }
     return { session, settings: settingsRow.settings };
+  }
+
+  async function mobileFieldInspectionContext(req, res) {
+    if (!checkRoleAccess(req, res, ["RESOLVER"], "Sesión de resolutor requerida")) return null;
+    await ensureSchema();
+    const session = req.panel_session;
+    const settingsRow = await getControlCenterSettingsById(session.control_center_id);
+    const settings = settingsRow?.settings || {};
+    if (settings.features?.resolver_app_enabled === false || settings.resolver_inspection_policy?.enabled === false) {
+      res.status(403).json({
+        status: "error",
+        code: "FIELD_INSPECTIONS_NOT_AVAILABLE",
+        message: "Las inspecciones de terreno no están habilitadas para este Centro de Control"
+      });
+      return null;
+    }
+    return { session, settings };
+  }
+
+  function resolverInspectionCategories(settings = {}) {
+    const configured = Array.isArray(settings.resolver_inspection_policy?.category_types)
+      ? settings.resolver_inspection_policy.category_types.map(value => text(value, 80).toUpperCase()).filter(Boolean)
+      : [];
+    const configuredSet = new Set(configured);
+    const catalog = Array.isArray(settings.neighbor_app?.emergency_categories)
+      ? settings.neighbor_app.emergency_categories
+      : [];
+    return catalog.filter(category => {
+      const type = text(category?.type, 80).toUpperCase();
+      if (!type) return false;
+      return configuredSet.size ? configuredSet.has(type) : category.enabled !== false;
+    });
   }
 
   async function professionalTicketContext(req, res, ticketId) {
@@ -1024,6 +1062,263 @@ function registerSafetyModule({
     } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
   });
 
+  app.get("/resolver/field-inspections", async (req, res) => {
+    try {
+      const context = await mobileFieldInspectionContext(req, res); if (!context) return;
+      const limit = Math.max(1, Math.min(30, Number(req.query.limit) || 10));
+      const categories = resolverInspectionCategories(context.settings).map(category => ({
+        type: text(category.type, 80).toUpperCase(),
+        title: text(category.title_override || category.title || category.type, 80),
+        icon: text(category.icon || "📝", 12),
+        color: text(category.color || "#2563eb", 24),
+        priority: numberOrNull(category.priority, 1, 5) || 3,
+        visible_to_neighbor: category.enabled !== false
+      }));
+      const result = await pool.query(
+        `SELECT i.id,i.title,i.inspection_type,i.area,i.completed_at,i.status,i.result,i.score,
+                i.notes,i.evidence,i.latitude,i.longitude,i.accuracy,i.source_vertical,
+                i.alert_requested,i.linked_ticket_id,i.created_at,i.updated_at,
+                t.state AS ticket_state,t.alert_type,t.title AS ticket_title
+         FROM safety_inspections i
+         LEFT JOIN tickets t ON t.id=i.linked_ticket_id AND t.control_center_id=i.control_center_id
+         WHERE i.control_center_id=$1 AND i.inspector_user_id=$2
+           AND (i.linked_ticket_id IS NOT NULL OR i.source_vertical IS NOT NULL)
+         ORDER BY COALESCE(i.completed_at, i.created_at) DESC
+         LIMIT $3`,
+        [context.session.control_center_id, context.session.sub, limit]
+      );
+      res.json({
+        status: "ok",
+        inspections: result.rows,
+        categories,
+        policy: {
+          enabled: context.settings.resolver_inspection_policy?.enabled !== false,
+          allow_alert_creation: context.settings.resolver_inspection_policy?.allow_alert_creation !== false
+        }
+      });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/field-inspections", async (req, res) => {
+    try {
+      const context = await mobileFieldInspectionContext(req, res); if (!context) return;
+      const body = req.body || {};
+      const latitude = Number(body.latitude);
+      const longitude = Number(body.longitude);
+      const accuracy = body.accuracy == null || body.accuracy === "" ? null : Number(body.accuracy);
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+        return res.status(400).json({ status: "error", message: "La inspección requiere coordenadas GPS válidas" });
+      }
+      if (accuracy != null && (!Number.isFinite(accuracy) || accuracy < 0 || accuracy > 5000)) {
+        return res.status(400).json({ status: "error", message: "La precisión GPS de la inspección no es válida" });
+      }
+
+      const createAlert = body.create_alert === true;
+      if (createAlert && context.settings.resolver_inspection_policy?.allow_alert_creation === false) {
+        return res.status(403).json({ status: "error", message: "Este Centro de Control no permite crear alertas desde inspecciones" });
+      }
+      const allowedCategories = resolverInspectionCategories(context.settings);
+      const alertType = text(body.alert_type, 80).toUpperCase();
+      const category = allowedCategories.find(item => text(item.type, 80).toUpperCase() === alertType);
+      if (createAlert && !category) {
+        return res.status(400).json({ status: "error", message: "Selecciona una categoría de inspección autorizada por el Centro de Control" });
+      }
+
+      const title = required(body.title, "Título de inspección", 180);
+      const notes = text(body.notes, 5000) || null;
+      const resultValue = enumValue(body.result, SAFETY_STATUSES.inspectionResult, "NOT_EVALUATED");
+      const textEvidence = jsonArray(body.text_evidence, 30, 100_000)
+        .map(item => ({
+          media_type: "text",
+          text: text(item?.text, 3000),
+          created_at: dateOrNull(item?.created_at) || new Date().toISOString(),
+          created_by: actorId(req)
+        }))
+        .filter(item => item.text);
+      const vertical = text(context.settings.vertical || "CITY", 24).toUpperCase();
+      const inspectionResult = await pool.query(
+        `INSERT INTO safety_inspections(
+           control_center_id,title,inspection_type,area,completed_at,status,result,score,
+           responses,findings,evidence,notes,inspector_user_id,created_by,
+           latitude,longitude,accuracy,source_vertical,alert_requested
+         ) VALUES($1,$2,$3,$4,NOW(),'COMPLETED',$5,$6,'[]'::jsonb,'[]'::jsonb,$7::jsonb,$8,$9,$9,$10,$11,$12,$13,$14)
+         RETURNING *`,
+        [
+          context.session.control_center_id,
+          title,
+          text(body.inspection_type || "FIELD_INSPECTION", 80).toUpperCase(),
+          text(body.area, 180) || null,
+          resultValue,
+          numberOrNull(body.score, 0, 100),
+          JSON.stringify(textEvidence),
+          notes,
+          actorId(req),
+          latitude,
+          longitude,
+          accuracy,
+          vertical,
+          createAlert
+        ]
+      );
+      let inspection = inspectionResult.rows[0];
+      let ticket = null;
+
+      if (createAlert) {
+        if (typeof createTicket !== "function") throw new Error("Creación de tickets desde inspección no disponible");
+        const categoryTitle = text(category.title_override || category.title || category.type, 80);
+        const alertTitle = text(body.alert_title, 180) || `Hallazgo de terreno · ${categoryTitle}`;
+        const alertDescription = text(body.alert_description, 3000) || notes || `Hallazgo detectado durante la inspección: ${title}`;
+        ticket = await createTicket({
+          control_center_id: context.session.control_center_id,
+          created_by_user_id: actorId(req),
+          created_by_role: "RESOLVER",
+          creation_description: "Ticket creado por hallazgo en inspección de terreno del resolutor",
+          source_type: "RESOLVER_INSPECTION",
+          source_event_id: inspection.id,
+          alert_type: text(category.type, 80).toUpperCase(),
+          title: alertTitle,
+          description: alertDescription,
+          latitude,
+          longitude,
+          accuracy,
+          priority: numberOrNull(category.priority, 1, 5) || 3,
+          metadata: {
+            inspection_id: inspection.id,
+            inspection_title: title,
+            inspection_result: resultValue,
+            inspector_user_id: actorId(req),
+            inspector_name: text(context.session.full_name || context.session.name, 180) || null,
+            source_vertical: vertical
+          }
+        });
+        const linked = await pool.query(
+          `UPDATE safety_inspections SET linked_ticket_id=$2,updated_at=NOW() WHERE id=$1 RETURNING *`,
+          [inspection.id, ticket.id]
+        );
+        inspection = linked.rows[0] || inspection;
+        await pool.query(
+          `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+           VALUES($1,$2,'RESOLVER','FIELD_INSPECTION_ALERT_CREATED',$3,$4::jsonb)`,
+          [
+            ticket.id,
+            actorId(req),
+            "Resolutor generó una alerta desde una inspección de terreno",
+            JSON.stringify({ inspection_id: inspection.id, inspection_result: resultValue })
+          ]
+        );
+      }
+
+      res.status(201).json({
+        status: "ok",
+        message: ticket ? "Inspección registrada y alerta creada en el mapa" : "Inspección registrada sin alerta",
+        inspection,
+        ticket
+      });
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.post("/resolver/field-inspections/:inspectionId/evidence", async (req, res) => {
+    try {
+      const context = await mobileFieldInspectionContext(req, res); if (!context) return;
+      if (typeof storeUploadedMedia !== "function") throw new Error("Almacenamiento de evidencia no configurado");
+      const inspection = await pool.query(
+        `SELECT id,linked_ticket_id FROM safety_inspections
+         WHERE id=$1 AND control_center_id=$2 AND inspector_user_id=$3 AND source_vertical IS NOT NULL
+         LIMIT 1`,
+        [req.params.inspectionId, context.session.control_center_id, context.session.sub]
+      );
+      if (!inspection.rows.length) return res.status(404).json({ status: "error", message: "Inspección no encontrada" });
+      const mediaType = text(req.body?.media_type, 20).toLowerCase();
+      if (!["audio", "image", "video"].includes(mediaType)) throw new Error("La evidencia debe ser audio, foto o video");
+      const uploaded = storeUploadedMedia(req, {
+        scopeId: req.params.inspectionId,
+        mediaType,
+        dataUrl: req.body?.data_url,
+        fileName: text(req.body?.file_name, 255) || null,
+        prefix: "field-inspection"
+      });
+      const stored = await pool.query(
+        `INSERT INTO safety_inspection_evidence(
+           inspection_id,control_center_id,media_type,file_name,mime_type,size_bytes,content,created_by
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+         RETURNING id,media_type,file_name,mime_type,size_bytes,created_at`,
+        [
+          req.params.inspectionId,
+          context.session.control_center_id,
+          uploaded.media_type,
+          uploaded.file_name,
+          uploaded.mime_type,
+          uploaded.size_bytes,
+          uploaded.content_buffer,
+          actorId(req)
+        ]
+      );
+      const evidence = {
+        ...stored.rows[0],
+        media_url: `/field-inspections/${encodeURIComponent(req.params.inspectionId)}/evidence/${encodeURIComponent(stored.rows[0].id)}/content`
+      };
+      await pool.query(
+        `UPDATE safety_inspections SET evidence=COALESCE(evidence,'[]'::jsonb) || $2::jsonb,updated_at=NOW() WHERE id=$1`,
+        [req.params.inspectionId, JSON.stringify([evidence])]
+      );
+      if (inspection.rows[0].linked_ticket_id) {
+        await pool.query(
+          `INSERT INTO ticket_actions(ticket_id,actor_user_id,actor_role,action_type,description,metadata)
+           VALUES($1,$2,'RESOLVER','FIELD_INSPECTION_EVIDENCE',$3,$4::jsonb)`,
+          [
+            inspection.rows[0].linked_ticket_id,
+            actorId(req),
+            `Resolutor adjuntó evidencia ${uploaded.media_type} desde la inspección de terreno`,
+            JSON.stringify({ inspection_id: req.params.inspectionId, ...evidence })
+          ]
+        );
+      }
+      res.status(201).json({ status: "ok", evidence });
+    } catch (error) {
+      res.status(Number(error.statusCode) || 400).json({ status: "error", message: error.message });
+    }
+  });
+
+  app.get("/field-inspections/:inspectionId/evidence/:evidenceId/content", async (req, res) => {
+    try {
+      if (!checkRoleAccess(req, res, ["RESOLVER", "OPERATOR", "ADMIN", "SUPER_ADMIN"], "Sesión autorizada requerida")) return;
+      await ensureSchema();
+      const session = req.panel_session;
+      const resolverSession = String(session.role || "").toUpperCase() === "RESOLVER";
+      const result = await pool.query(
+        `SELECT e.mime_type,e.file_name,e.content
+         FROM safety_inspection_evidence e
+         JOIN safety_inspections i ON i.id=e.inspection_id
+         WHERE e.id=$1 AND e.inspection_id=$2 AND e.control_center_id=$3
+           AND (i.inspector_user_id=$4 OR ($5::boolean = false AND i.linked_ticket_id IS NOT NULL))
+         LIMIT 1`,
+        [req.params.evidenceId, req.params.inspectionId, session.control_center_id, session.sub, resolverSession]
+      );
+      if (!result.rows.length || !result.rows[0].content) return res.status(404).end();
+      res.setHeader("Content-Type", result.rows[0].mime_type || "application/octet-stream");
+      res.setHeader("Content-Disposition", `inline; filename=\"${text(result.rows[0].file_name || "evidencia", 255).replace(/[\"\\]/g, "_")}\"`);
+      res.send(result.rows[0].content);
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
+  app.get("/resolver/field-inspections/:inspectionId/evidence/:evidenceId/content", async (req, res) => {
+    try {
+      const context = await mobileFieldInspectionContext(req, res); if (!context) return;
+      const result = await pool.query(
+        `SELECT e.mime_type,e.file_name,e.content
+         FROM safety_inspection_evidence e
+         JOIN safety_inspections i ON i.id=e.inspection_id
+         WHERE e.id=$1 AND e.inspection_id=$2 AND e.control_center_id=$3 AND i.inspector_user_id=$4
+         LIMIT 1`,
+        [req.params.evidenceId, req.params.inspectionId, context.session.control_center_id, context.session.sub]
+      );
+      if (!result.rows.length || !result.rows[0].content) return res.status(404).end();
+      res.setHeader("Content-Type", result.rows[0].mime_type || "application/octet-stream");
+      res.setHeader("Content-Disposition", `inline; filename=\"${text(result.rows[0].file_name || "evidencia", 255).replace(/[\"\\]/g, "_")}\"`);
+      res.send(result.rows[0].content);
+    } catch (error) { res.status(400).json({ status: "error", message: error.message }); }
+  });
+
   app.get("/resolver/safety/inspections", async (req, res) => {
     try {
       const context = await mobileSafetyContext(req, res, ["RESOLVER"]); if (!context) return;
@@ -1031,7 +1326,7 @@ function registerSafetyModule({
       const result = await pool.query(
         `SELECT id,title,inspection_type,area,completed_at,status,result,score,notes,evidence,created_at,updated_at
          FROM safety_inspections
-         WHERE control_center_id=$1 AND inspector_user_id=$2 AND linked_ticket_id IS NULL
+         WHERE control_center_id=$1 AND inspector_user_id=$2 AND linked_ticket_id IS NULL AND source_vertical IS NULL
          ORDER BY COALESCE(completed_at, created_at) DESC
          LIMIT $3`,
         [context.session.control_center_id, context.session.sub, limit]
@@ -1080,7 +1375,7 @@ function registerSafetyModule({
       if (typeof storeUploadedMedia !== "function") throw new Error("Almacenamiento de evidencia no configurado");
       const inspection = await pool.query(
         `SELECT id FROM safety_inspections
-         WHERE id=$1 AND control_center_id=$2 AND inspector_user_id=$3 AND linked_ticket_id IS NULL
+         WHERE id=$1 AND control_center_id=$2 AND inspector_user_id=$3 AND linked_ticket_id IS NULL AND source_vertical IS NULL
          LIMIT 1`,
         [req.params.inspectionId, context.session.control_center_id, context.session.sub]
       );
@@ -1136,7 +1431,7 @@ function registerSafetyModule({
         `SELECT e.content,e.mime_type,e.file_name,e.size_bytes,i.inspector_user_id
          FROM safety_inspection_evidence e
          JOIN safety_inspections i ON i.id=e.inspection_id
-         WHERE e.id=$1 AND e.inspection_id=$2 AND e.control_center_id=$3
+         WHERE e.id=$1 AND e.inspection_id=$2 AND e.control_center_id=$3 AND i.source_vertical IS NULL
          LIMIT 1`,
         [req.params.evidenceId, req.params.inspectionId, context.session.control_center_id]
       );

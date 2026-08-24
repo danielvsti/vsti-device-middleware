@@ -4,11 +4,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/security-contract.test.js && node scripts/platform-contract.test.js && node scripts/safety-contract.test.js && node scripts/city-readiness-contract.test.js && node scripts/lucia-level2-contract.test.js && node scripts/lucia-openai-contract.test.js && node scripts/lucia-routing-regression.test.js",
+    "test": "node scripts/security-contract.test.js && node scripts/platform-contract.test.js && node scripts/safety-contract.test.js && node scripts/city-readiness-contract.test.js && node scripts/field-inspections-contract.test.js && node scripts/lucia-level2-contract.test.js && node scripts/lucia-openai-contract.test.js && node scripts/lucia-routing-regression.test.js",
     "test:security": "node scripts/security-contract.test.js",
     "test:platform": "node scripts/platform-contract.test.js",
     "test:safety": "node scripts/safety-contract.test.js",
     "test:city-readiness": "node scripts/city-readiness-contract.test.js",
+    "test:field-inspections": "node scripts/field-inspections-contract.test.js",
     "test:lucia-level2": "node scripts/lucia-level2-contract.test.js",
     "test:lucia-openai": "node scripts/lucia-openai-contract.test.js",
     "test:lucia-routing": "node scripts/lucia-routing-regression.test.js",

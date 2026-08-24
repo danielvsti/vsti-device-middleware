@@ -486,6 +486,11 @@ const DEFAULT_CONTROL_CENTER_SETTINGS = Object.freeze({
     max_location_age_seconds: 180,
     max_active_tickets: 1
   },
+  resolver_inspection_policy: {
+    enabled: true,
+    allow_alert_creation: true,
+    category_types: []
+  },
   sla_policy: {
     enabled: true,
     require_central_acknowledgement: false,
@@ -936,6 +941,23 @@ function normalizeControlCenterSettings(input = {}) {
   merged.resolver_policy.max_location_age_seconds = clampPolicyNumber(merged.resolver_policy.max_location_age_seconds, 180, 30, 86400);
   merged.resolver_policy.max_active_tickets = clampPolicyNumber(merged.resolver_policy.max_active_tickets, 1, 1, 20);
 
+  merged.resolver_inspection_policy = merged.resolver_inspection_policy || {};
+  merged.resolver_inspection_policy.enabled = normalizePolicyBoolean(merged.resolver_inspection_policy.enabled, true);
+  merged.resolver_inspection_policy.allow_alert_creation = normalizePolicyBoolean(
+    merged.resolver_inspection_policy.allow_alert_creation,
+    true
+  );
+  const verticalCategoryTypes = new Set(
+    normalizeEmergencyCategoryCatalog(currentEmergencyCategoryCatalog())
+      .filter(category => category.enabled !== false && category.verticals.includes(vertical))
+      .map(category => category.type)
+  );
+  merged.resolver_inspection_policy.category_types = Array.isArray(merged.resolver_inspection_policy.category_types)
+    ? [...new Set(merged.resolver_inspection_policy.category_types
+      .map(value => String(value || '').trim().toUpperCase())
+      .filter(value => verticalCategoryTypes.has(value)))]
+    : [];
+
   const normalizeSlaTargetSet = (raw = {}, fallback = {}) => ({
     acknowledgement_minutes: clampPolicyNumber(raw.acknowledgement_minutes, fallback.acknowledgement_minutes ?? 5, 1, 10080),
     assignment_minutes: clampPolicyNumber(raw.assignment_minutes, fallback.assignment_minutes ?? 15, 1, 10080),
@@ -1118,6 +1140,7 @@ function publicSettingsPayload(settings) {
     safety_modules: normalized.safety_modules,
     incident_policy: normalized.incident_policy,
     resolver_policy: normalized.resolver_policy,
+    resolver_inspection_policy: normalized.resolver_inspection_policy,
     sla_policy: normalized.sla_policy,
     operator_tools: normalized.operator_tools,
     neighbor_app: {
@@ -19350,7 +19373,8 @@ registerSafetyModule({
   getControlCenterSettingsById,
   syncMobileEventStateFromTicket,
   releaseResolverFromTicket,
-  storeUploadedMedia
+  storeUploadedMedia,
+  createTicket
 });
 
 registerCityCompliance({
