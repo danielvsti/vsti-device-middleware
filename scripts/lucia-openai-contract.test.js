@@ -7,13 +7,27 @@ process.env.OPENAI_TIMEOUT_MS = "3000";
 const {
   redactLuciaText,
   sanitizeConversation,
+  sanitizeDialogueState,
   interpretLuciaQuestion,
   conversationalizeLuciaAnswer
 } = require("../lucia-openai");
 
 assert.equal(redactLuciaText("Llame al +56912345678"), "Llame al [TELEFONO_PROTEGIDO]");
 assert.equal(redactLuciaText("ID 43627a79-bddb-4ed6-87ef-335dc7c26424"), "ID [ID_PROTEGIDO]");
-assert.equal(sanitizeConversation(new Array(9).fill({ role: "user", content: "consulta" })).length, 6);
+assert.equal(sanitizeConversation(new Array(15).fill({ role: "user", content: "consulta" })).length, 12);
+assert.deepEqual(
+  sanitizeDialogueState({ intent: "patrol_recommendation", period_days: 90, patrol_units: 2, time_window: "NOCHE", alert_type: "VIF" }),
+  {
+    version: 1,
+    intent: "patrol_recommendation",
+    canonical_question: "",
+    period_days: 90,
+    patrol_units: 2,
+    time_window: "NOCHE",
+    alert_type: "VIF",
+    requested_detail: "answer"
+  }
+);
 
 let capturedBody = null;
 global.fetch = async (_url, options) => {
@@ -29,7 +43,13 @@ global.fetch = async (_url, options) => {
             canonical_question: "Sugiere un plan de patrullaje nocturno con 2 patrullas usando los últimos 90 días",
             confidence: 0.96,
             needs_clarification: false,
-            clarification_question: ""
+            clarification_question: "",
+            period_days: 90,
+            patrol_units: 2,
+            time_window: "NOCHE",
+            alert_type: null,
+            requested_detail: "plan",
+            followup: true
           })
         }]
       }]
@@ -40,13 +60,15 @@ global.fetch = async (_url, options) => {
 (async () => {
   const interpreted = await interpretLuciaQuestion({
     question: "Haz lo mismo pero para la noche y 90 días",
-    conversation: [{ role: "user", content: "Dame un plan con dos patrullas" }]
+    conversation: [{ role: "user", content: "Dame un plan con dos patrullas" }],
+    dialogueState: { intent: "patrol_recommendation", period_days: 30, patrol_units: 2, time_window: "ALL" }
   });
   assert.equal(interpreted.ok, true);
   assert.equal(interpreted.interpretation.intent, "patrol_recommendation");
   assert.equal(capturedBody.store, false, "Las respuestas no deben persistirse como estado de aplicación");
   assert.equal(capturedBody.model, "gpt-5.6-luna");
   assert.equal(capturedBody.text.format.type, "json_schema");
+  assert.match(JSON.stringify(capturedBody.input), /Estado estructurado anterior/);
   assert.equal(Object.hasOwn(capturedBody, "tools"), false, "OpenAI no debe recibir herramientas ni acceso SQL");
 
   global.fetch = async (_url, options) => {

@@ -50,6 +50,11 @@ assert.equal(
   "tickets_by_alert_type",
   "La abreviatura INC aislada debe seguir siendo compatible"
 );
+assert.equal(
+  sandbox.luciaIntent("Compáralo con el período anterior"),
+  "period_comparison",
+  "Lucía debe reconocer comparaciones conversacionales como una consulta segura"
+);
 assert.doesNotThrow(() => sandbox.validateLuciaSql(
   "SELECT 'Zonificación oficial; fallback por coordenada' AS metodo FROM tickets WHERE control_center_id = $1 LIMIT 1"
 ));
@@ -62,6 +67,8 @@ assert.match(
   /safeToConversationalize = !\["unknown", "guided_help", "ambiguous_severity", "executive_summary"\]/,
   "Una consulta no comprendida no debe reusar cifras del historial conversacional"
 );
+assert.match(server, /dialogue_state: nextDialogueState/, "El backend debe devolver memoria conversacional estructurada");
+assert.match(server, /structured_context: Boolean\(dialogueState\)/, "El backend debe auditar el uso de contexto estructurado");
 assert.match(
   server,
   /OPENAI_INTERPRETATION/,

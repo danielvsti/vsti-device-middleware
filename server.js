@@ -34,6 +34,7 @@ const { registerCityCompliance } = require("./city-compliance");
 const {
   openAiLuciaConfig,
   sanitizeConversation,
+  sanitizeDialogueState,
   interpretLuciaQuestion,
   conversationalizeLuciaAnswer
 } = require("./lucia-openai");
@@ -13769,6 +13770,7 @@ function luciaIntent(question) {
 
   if (/^(hola|buenas|ayuda|que puedes hacer|como me ayudas|opciones|menu)\b/.test(q)) return "guided_help";
   if (luciaLevel2Requested(question)) return "patrol_recommendation";
+  if (/compar|versus|\bvs\b|periodo anterior|semana anterior|mes anterior/.test(q)) return "period_comparison";
   if (/grave|graves|complicad|critico|criticos|importante|urgente/.test(q) && !/zona|sector|barrio/.test(q)) return "ambiguous_severity";
   if (/alta prioridad|prioridad alta|prioritarios|prioritarias/.test(q) && /(ticket|tickets|caso|casos|emergencia|emergencias)/.test(q)) return "high_priority_tickets";
 
@@ -13823,6 +13825,20 @@ function luciaResolveContextualFollowup(question, conversation = []) {
   }
 
   return question;
+}
+
+function luciaDialogueStateFromQuery(queryDef, canonicalQuestion, interpretation = null) {
+  const requestedAlertType = queryDef.requested_alert_type || luciaRequestedAlertType(canonicalQuestion);
+  return {
+    version: 1,
+    intent: queryDef.intent,
+    canonical_question: String(canonicalQuestion || "").slice(0, 500),
+    period_days: Math.max(1, Math.min(365, Number(queryDef.days || interpretation?.period_days || 30))),
+    patrol_units: queryDef.patrol_units || interpretation?.patrol_units || null,
+    time_window: queryDef.patrol_window?.key || interpretation?.time_window || "ALL",
+    alert_type: requestedAlertType?.key || interpretation?.alert_type || null,
+    requested_detail: interpretation?.requested_detail || (queryDef.intent === "patrol_recommendation" ? "plan" : "answer")
+  };
 }
 
 function luciaBuildSafeQuery(question, ccId) {
@@ -14016,6 +14032,61 @@ function luciaBuildSafeQuery(question, ccId) {
           (SELECT COUNT(*)::int FROM tickets WHERE control_center_id = $1 AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')) AS tickets_abiertos
         FROM control_centers cc
         WHERE cc.id = $1
+        LIMIT 1
+      `
+    };
+  }
+
+  if (intent === "period_comparison") {
+    const requested = luciaRequestedAlertType(question);
+    return {
+      intent,
+      days,
+      limit: 1,
+      title: requested ? `Comparación de tickets de ${requested.label}` : "Comparación operacional por período",
+      requested_alert_type: requested,
+      params: [ccId, days, requested?.sqlTypes || []],
+      sql: `
+        SELECT
+          COUNT(*) FILTER (WHERE created_at >= NOW() - ($2::int || ' days')::interval)::int AS tickets_actual,
+          COUNT(*) FILTER (
+            WHERE created_at >= NOW() - (($2::int * 2) || ' days')::interval
+              AND created_at < NOW() - ($2::int || ' days')::interval
+          )::int AS tickets_anterior,
+          COUNT(*) FILTER (
+            WHERE created_at >= NOW() - ($2::int || ' days')::interval
+              AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+          )::int AS abiertos_actual,
+          COUNT(*) FILTER (
+            WHERE created_at >= NOW() - (($2::int * 2) || ' days')::interval
+              AND created_at < NOW() - ($2::int || ' days')::interval
+              AND state NOT IN ('CLOSED','CANCELLED','RESOLVED')
+          )::int AS abiertos_anterior,
+          COUNT(*) FILTER (
+            WHERE created_at >= NOW() - ($2::int || ' days')::interval AND priority <= 2
+          )::int AS alta_prioridad_actual,
+          COUNT(*) FILTER (
+            WHERE created_at >= NOW() - (($2::int * 2) || ' days')::interval
+              AND created_at < NOW() - ($2::int || ' days')::interval
+              AND priority <= 2
+          )::int AS alta_prioridad_anterior,
+          ROUND(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at)) / 60.0)
+            FILTER (WHERE created_at >= NOW() - ($2::int || ' days')::interval AND assigned_at IS NOT NULL)::numeric, 1
+          ) AS min_asignacion_actual,
+          ROUND(AVG(EXTRACT(EPOCH FROM (assigned_at - created_at)) / 60.0)
+            FILTER (
+              WHERE created_at >= NOW() - (($2::int * 2) || ' days')::interval
+                AND created_at < NOW() - ($2::int || ' days')::interval
+                AND assigned_at IS NOT NULL
+            )::numeric, 1
+          ) AS min_asignacion_anterior
+        FROM tickets
+        WHERE control_center_id = $1
+          AND created_at >= NOW() - (($2::int * 2) || ' days')::interval
+          AND (
+            COALESCE(array_length($3::text[], 1), 0) = 0 OR
+            UPPER(COALESCE(alert_type, '')) = ANY($3::text[])
+          )
         LIMIT 1
       `
     };
@@ -14725,6 +14796,19 @@ function luciaAnswer(queryDef, rows, controlCenterCode) {
     const r = rows[0] || {};
     return `Resumen de ${controlCenterCode} para los últimos ${days} días: ${r.tickets_periodo || 0} tickets, ${r.tickets_abiertos || 0} abiertos, ${r.tickets_24h || 0} en las últimas 24 horas y ${r.alta_prioridad || 0} de alta prioridad. Tiempo promedio de asignación: ${r.min_promedio_asignacion ?? '—'} min. Tiempo promedio de resolución: ${r.min_promedio_resolucion ?? '—'} min.`;
   }
+  if (queryDef.intent === "period_comparison") {
+    const r = rows[0] || {};
+    const current = Number(r.tickets_actual || 0);
+    const previous = Number(r.tickets_anterior || 0);
+    const difference = current - previous;
+    const direction = difference > 0
+      ? `${difference} más`
+      : difference < 0
+        ? `${Math.abs(difference)} menos`
+        : "la misma cantidad";
+    const scope = queryDef.requested_alert_type?.label ? ` de ${queryDef.requested_alert_type.label}` : "";
+    return `Comparé los últimos ${days} días con los ${days} días inmediatamente anteriores en ${controlCenterCode}${scope}. El período actual registra ${current} tickets y el anterior ${previous}: ${direction}. Los abiertos pasaron de ${r.abiertos_anterior || 0} a ${r.abiertos_actual || 0}, y los de alta prioridad de ${r.alta_prioridad_anterior || 0} a ${r.alta_prioridad_actual || 0}. El tiempo promedio de asignación pasó de ${r.min_asignacion_anterior ?? '—'} a ${r.min_asignacion_actual ?? '—'} minutos.`;
+  }
   if (queryDef.intent === "resolver_performance") {
     if (!n) return "No encontré actividad de resolutores para ese período.";
     const top = rows[0] || {};
@@ -14785,6 +14869,13 @@ function luciaSuggestionsForIntent(question, queryDef) {
       { label: "Tickets por tipo", question: "Distribución de tickets por tipo de emergencia" }
     ];
   }
+  if (queryDef.intent === "period_comparison") {
+    return [
+      { label: "Comparar 7 días", question: "Compara los últimos 7 días con los 7 días anteriores" },
+      { label: "Comparar 30 días", question: "Compara los últimos 30 días con los 30 días anteriores" },
+      { label: "Ver resumen actual", question: `Dame el resumen ejecutivo de los últimos ${queryDef.days || 30} días` }
+    ];
+  }
   if (queryDef.intent === "patrol_recommendation") {
     return [
       { label: "Plan nocturno", question: `Sugiere un plan de patrullaje nocturno con 2 patrullas usando los últimos ${queryDef.days || 30} días` },
@@ -14817,6 +14908,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     await ensureLuciaSchema();
     const question = String(req.body?.question || "").trim();
     const conversation = sanitizeConversation(req.body?.conversation);
+    const dialogueState = sanitizeDialogueState(req.body?.dialogue_state);
     if (!question || question.length < 3) {
       return res.status(400).json({ status: "error", message: "Escribe una pregunta para Luc-IA." });
     }
@@ -14839,10 +14931,11 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     let assistantLatencyMs = 0;
     let assistantFallbackReason = assistantConfig.configured ? "" : "not_configured";
 
-    // OpenAI solo ayuda a comprender lenguaje natural que el catálogo determinista no reconoció.
-    // La salida propuesta debe volver a pasar por el parser seguro de QUELTU; nunca genera SQL.
-    if (assistantConfig.configured && !contextResolved && deterministicIntent === "unknown") {
-      const interpreted = await interpretLuciaQuestion({ question, conversation });
+    // OpenAI comprende cada turno y su contexto, pero solo propone una pregunta
+    // canónica. QUELTU vuelve a clasificarla y ejecuta exclusivamente consultas
+    // predefinidas: el modelo nunca recibe herramientas ni genera SQL.
+    if (assistantConfig.configured) {
+      const interpreted = await interpretLuciaQuestion({ question, conversation, dialogueState });
       assistantLatencyMs += Number(interpreted.latency_ms || 0);
       if (interpreted.ok) {
         interpretation = interpreted.interpretation;
@@ -14856,10 +14949,10 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         if (accepted) {
           effectiveQuestion = proposedQuestion;
           openAiInterpretationUsed = true;
-        } else if (interpretation?.needs_clarification) {
+        } else if (interpretation?.needs_clarification && deterministicIntent === "unknown") {
           interpretationClarification = String(interpretation.clarification_question || "").trim();
           assistantFallbackReason = "clarification_required";
-        } else {
+        } else if (deterministicIntent === "unknown") {
           assistantFallbackReason = "interpretation_rejected";
         }
       } else {
@@ -14897,7 +14990,8 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         intent: queryDef.intent,
         rows: result.rows,
         patrolPlan,
-        conversation
+        conversation,
+        requestedDetail: interpretation?.requested_detail || "answer"
       });
       assistantLatencyMs += Number(conversational.latency_ms || 0);
       if (conversational.ok) {
@@ -14916,6 +15010,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     }
 
     const suggestions = luciaSuggestionsForIntent(effectiveQuestion, queryDef);
+    const nextDialogueState = luciaDialogueStateFromQuery(queryDef, effectiveQuestion, interpretation);
     let report = null;
     if (luciaWantsPdf(question)) {
       report = await createLuciaPdfReport({
@@ -14977,6 +15072,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
         question,
         understood_question: effectiveQuestion !== question ? effectiveQuestion : null,
         answer: answerText,
+        dialogue_state: nextDialogueState,
         intent: queryDef.intent,
         title: queryDef.title,
         period_days: queryDef.days,
@@ -14995,6 +15091,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
           configured: assistantConfig.configured,
           model: assistantConfig.configured ? assistantConfig.model : null,
           conversation_context: conversation.length,
+          structured_context: Boolean(dialogueState),
           interpretation_used: openAiInterpretationUsed,
           context_resolved: contextResolved,
           fallback: Boolean(assistantFallbackReason),

@@ -7,6 +7,7 @@ const DEFAULT_TIMEOUT_MS = 12000;
 const SUPPORTED_INTENTS = Object.freeze([
   "guided_help",
   "patrol_recommendation",
+  "period_comparison",
   "ambiguous_severity",
   "high_priority_tickets",
   "sirens_summary",
@@ -45,12 +46,37 @@ function redactLuciaText(value) {
 function sanitizeConversation(conversation) {
   if (!Array.isArray(conversation)) return [];
   return conversation
-    .slice(-6)
+    .slice(-12)
     .map((turn) => ({
       role: turn?.role === "assistant" ? "assistant" : "user",
       content: redactLuciaText(turn?.content).slice(0, 600)
     }))
     .filter((turn) => turn.content.length >= 2);
+}
+
+const LUCIA_TIME_WINDOWS = Object.freeze(["ALL", "MADRUGADA", "MANANA", "TARDE", "NOCHE"]);
+const LUCIA_ALERT_TYPES = Object.freeze(["FIRE", "MEDICAL", "VIF", "SECURITY", "FALL_DETECTED", "SOS_MANUAL", "RISK", "OTHER"]);
+
+function sanitizeDialogueState(state) {
+  if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+  const intent = SUPPORTED_INTENTS.includes(state.intent) ? state.intent : null;
+  if (!intent || intent === "unknown") return null;
+  const periodDays = state.period_days == null || state.period_days === "" ? NaN : Number(state.period_days);
+  const patrolUnits = state.patrol_units == null || state.patrol_units === "" ? NaN : Number(state.patrol_units);
+  const timeWindow = LUCIA_TIME_WINDOWS.includes(state.time_window) ? state.time_window : "ALL";
+  const alertType = LUCIA_ALERT_TYPES.includes(state.alert_type) ? state.alert_type : null;
+  return {
+    version: 1,
+    intent,
+    canonical_question: redactLuciaText(state.canonical_question).slice(0, 500),
+    period_days: Number.isFinite(periodDays) ? Math.max(1, Math.min(365, Math.round(periodDays))) : 30,
+    patrol_units: Number.isFinite(patrolUnits) ? Math.max(1, Math.min(10, Math.round(patrolUnits))) : null,
+    time_window: timeWindow,
+    alert_type: alertType,
+    requested_detail: ["answer", "explain", "compare", "list", "plan"].includes(state.requested_detail)
+      ? state.requested_detail
+      : "answer"
+  };
 }
 
 function replaceAllLiteral(text, search, replacement) {
@@ -180,15 +206,25 @@ const INTERPRETATION_SCHEMA = Object.freeze({
     canonical_question: { type: "string" },
     confidence: { type: "number", minimum: 0, maximum: 1 },
     needs_clarification: { type: "boolean" },
-    clarification_question: { type: "string" }
+    clarification_question: { type: "string" },
+    period_days: { type: ["integer", "null"], minimum: 1, maximum: 365 },
+    patrol_units: { type: ["integer", "null"], minimum: 1, maximum: 10 },
+    time_window: { type: ["string", "null"], enum: [...LUCIA_TIME_WINDOWS, null] },
+    alert_type: { type: ["string", "null"], enum: [...LUCIA_ALERT_TYPES, null] },
+    requested_detail: { type: "string", enum: ["answer", "explain", "compare", "list", "plan"] },
+    followup: { type: "boolean" }
   },
-  required: ["intent", "canonical_question", "confidence", "needs_clarification", "clarification_question"],
+  required: [
+    "intent", "canonical_question", "confidence", "needs_clarification", "clarification_question",
+    "period_days", "patrol_units", "time_window", "alert_type", "requested_detail", "followup"
+  ],
   additionalProperties: false
 });
 
-async function interpretLuciaQuestion({ question, conversation = [] }) {
+async function interpretLuciaQuestion({ question, conversation = [], dialogueState = null }) {
   const safeQuestion = redactLuciaText(question);
   const safeConversation = sanitizeConversation(conversation);
+  const safeDialogueState = sanitizeDialogueState(dialogueState);
   const result = await callOpenAiResponses({
     input: [
       {
@@ -197,9 +233,13 @@ async function interpretLuciaQuestion({ question, conversation = [] }) {
           "Eres la capa de comprensión de Lucía, copiloto municipal de QUELTU Ciudad.",
           "No consultas bases de datos, no inventas cifras, no generas SQL y no ejecutas acciones.",
           `Solo puedes clasificar en estas intenciones: ${SUPPORTED_INTENTS.join(", ")}.`,
-          "Reescribe la solicitud como una pregunta operacional autosuficiente en español, conservando período, categoría, horario y cantidad de patrullas.",
-          "Usa el contexto previo solo para resolver referencias como 'ahora', 'lo mismo' o 'y para 90 días'.",
-          "Si falta un dato indispensable o la solicitud no corresponde al catálogo, marca needs_clarification=true."
+          "Interpreta lenguaje natural, abreviaciones, elipsis y referencias conversacionales como 'eso', 'lo mismo', 'compáralo', 'por qué' o 'y de noche'.",
+          "Reescribe siempre la solicitud como una pregunta operacional autosuficiente en español, conservando o heredando período, categoría, horario y cantidad de patrullas.",
+          "Para comparar el período consultado con el período inmediatamente anterior usa period_comparison.",
+          "requested_detail=explain significa explicar el resultado con evidencia; compare significa comparar; list significa listar registros; plan significa proponer cobertura preventiva.",
+          "Usa el estado estructurado y el historial solo para resolver el contexto; nunca copies cifras de respuestas previas como hechos nuevos.",
+          "Pregunta una aclaración solamente cuando sea imprescindible para seleccionar una consulta segura; no pidas datos que ya estén en el estado.",
+          `Estado estructurado anterior: ${JSON.stringify(safeDialogueState || {})}`
         ].join("\n")
       },
       ...safeConversation,
@@ -249,7 +289,7 @@ function safePatrolEvidence(plan) {
   };
 }
 
-async function conversationalizeLuciaAnswer({ question, answer, intent, rows = [], patrolPlan = null, conversation = [] }) {
+async function conversationalizeLuciaAnswer({ question, answer, intent, rows = [], patrolPlan = null, conversation = [], requestedDetail = "answer" }) {
   const vault = buildPiiVault(rows);
   const safeQuestion = protectWithVault(question, vault);
   const safeAnswer = protectWithVault(answer, vault);
@@ -259,6 +299,7 @@ async function conversationalizeLuciaAnswer({ question, answer, intent, rows = [
   }));
   const evidence = {
     intent,
+    requested_detail: requestedDetail,
     deterministic_answer: safeAnswer,
     row_count: Array.isArray(rows) ? rows.length : 0,
     patrol_plan: safePatrolEvidence(patrolPlan)
@@ -276,7 +317,9 @@ async function conversationalizeLuciaAnswer({ question, answer, intent, rows = [
           "No hagas predicción criminológica, no presentes correlaciones como causalidad y no prometas despacho automático.",
           "No reveles ni modifiques marcadores [DATO_PROTEGIDO_N].",
           "Si hay un plan preventivo, recalca que es una recomendación explicable sujeta a validación del operador.",
-          "No menciones OpenAI ni detalles técnicos salvo que el usuario lo pregunte."
+          "No menciones OpenAI ni detalles técnicos salvo que el usuario lo pregunte.",
+          "Responde directamente a la pregunta actual y reconoce el hilo anterior cuando sea un seguimiento.",
+          "Cuando sea útil, termina con una invitación breve y contextual para profundizar, comparar o cambiar el período; no repitas una pregunta ya respondida."
         ].join("\n")
       },
       ...safeConversation,
@@ -296,6 +339,7 @@ module.exports = {
   openAiLuciaConfig,
   redactLuciaText,
   sanitizeConversation,
+  sanitizeDialogueState,
   interpretLuciaQuestion,
   conversationalizeLuciaAnswer,
   responseOutputText
