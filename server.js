@@ -31,6 +31,12 @@ const crypto = require("crypto");
 const http2 = require("http2");
 const { registerSafetyModule } = require("./safety-module");
 const { registerCityCompliance } = require("./city-compliance");
+const {
+  openAiLuciaConfig,
+  sanitizeConversation,
+  interpretLuciaQuestion,
+  conversationalizeLuciaAnswer
+} = require("./lucia-openai");
 
 console.log(
   "DATABASE_URL configurada:",
@@ -5489,7 +5495,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v31-lucia-level-2-patrol-intelligence",
+version: "2.0-v32-lucia-openai-hybrid",
 endpoints: [
 "POST /endpoint",
 "GET /devices",
@@ -13455,7 +13461,11 @@ async function ensureLuciaSchema() {
     ALTER TABLE lucia_query_audit
       ADD COLUMN IF NOT EXISTS analysis_level INTEGER DEFAULT 1,
       ADD COLUMN IF NOT EXISTS methodology_version TEXT,
-      ADD COLUMN IF NOT EXISTS result_summary JSONB DEFAULT '{}'::jsonb
+      ADD COLUMN IF NOT EXISTS result_summary JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS assistant_provider TEXT DEFAULT 'QUELTU_DETERMINISTIC',
+      ADD COLUMN IF NOT EXISTS assistant_model TEXT,
+      ADD COLUMN IF NOT EXISTS assistant_fallback_reason TEXT,
+      ADD COLUMN IF NOT EXISTS assistant_latency_ms INTEGER DEFAULT 0
   `);
   luciaSchemaReady = true;
 }
@@ -14733,6 +14743,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
   try {
     await ensureLuciaSchema();
     const question = String(req.body?.question || "").trim();
+    const conversation = sanitizeConversation(req.body?.conversation);
     if (!question || question.length < 3) {
       return res.status(400).json({ status: "error", message: "Escribe una pregunta para Luc-IA." });
     }
@@ -14744,21 +14755,81 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     const cc = await pool.query("SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1", [controlCenterCode]);
     if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
-    const queryDef = luciaBuildSafeQuery(question, cc.rows[0].id);
+    const assistantConfig = openAiLuciaConfig();
+    const deterministicIntent = luciaIntent(question);
+    let effectiveQuestion = question;
+    let interpretation = null;
+    let interpretationClarification = "";
+    let assistantLatencyMs = 0;
+    let assistantFallbackReason = assistantConfig.configured ? "" : "not_configured";
+
+    // OpenAI solo ayuda a comprender lenguaje natural que el catálogo determinista no reconoció.
+    // La salida propuesta debe volver a pasar por el parser seguro de QUELTU; nunca genera SQL.
+    if (assistantConfig.configured && deterministicIntent === "unknown") {
+      const interpreted = await interpretLuciaQuestion({ question, conversation });
+      assistantLatencyMs += Number(interpreted.latency_ms || 0);
+      if (interpreted.ok) {
+        interpretation = interpreted.interpretation;
+        const proposedQuestion = String(interpretation?.canonical_question || "").trim();
+        const proposedIntent = luciaIntent(proposedQuestion);
+        const accepted = Number(interpretation?.confidence || 0) >= 0.65
+          && !interpretation?.needs_clarification
+          && proposedQuestion.length >= 3
+          && proposedIntent !== "unknown"
+          && proposedIntent === interpretation?.intent;
+        if (accepted) {
+          effectiveQuestion = proposedQuestion;
+        } else if (interpretation?.needs_clarification) {
+          interpretationClarification = String(interpretation.clarification_question || "").trim();
+          assistantFallbackReason = "clarification_required";
+        } else {
+          assistantFallbackReason = "interpretation_rejected";
+        }
+      } else {
+        assistantFallbackReason = interpreted.reason || "interpretation_failed";
+      }
+    }
+
+    const queryDef = luciaBuildSafeQuery(effectiveQuestion, cc.rows[0].id);
     const sqlPreview = validateLuciaSql(queryDef.sql);
     let result;
     let patrolPlan = null;
     if (queryDef.level === 2 && queryDef.intent === "patrol_recommendation") {
-      const level2 = await runLuciaLevel2Plan({ queryDef, controlCenter: cc.rows[0], question });
+      const level2 = await runLuciaLevel2Plan({ queryDef, controlCenter: cc.rows[0], question: effectiveQuestion });
       result = level2.result;
       patrolPlan = level2.plan;
     } else {
       result = await runLuciaReadOnly(queryDef.sql, queryDef.params);
     }
-    const answerText = patrolPlan
+    let answerText = patrolPlan
       ? luciaLevel2Answer(patrolPlan, cc.rows[0].code)
       : luciaAnswer(queryDef, result.rows, cc.rows[0].code);
-    const suggestions = luciaSuggestionsForIntent(question, queryDef);
+    if (interpretationClarification && queryDef.intent === "unknown") {
+      answerText = interpretationClarification;
+    }
+
+    let assistantProvider = "QUELTU_DETERMINISTIC";
+    let conversational = null;
+    if (assistantConfig.configured) {
+      conversational = await conversationalizeLuciaAnswer({
+        question,
+        answer: answerText,
+        intent: queryDef.intent,
+        rows: result.rows,
+        patrolPlan,
+        conversation
+      });
+      assistantLatencyMs += Number(conversational.latency_ms || 0);
+      if (conversational.ok) {
+        answerText = conversational.text;
+        assistantProvider = "OPENAI_HYBRID";
+        if (!assistantFallbackReason || assistantFallbackReason === "clarification_required") assistantFallbackReason = "";
+      } else {
+        assistantFallbackReason = conversational.reason || assistantFallbackReason || "generation_failed";
+      }
+    }
+
+    const suggestions = luciaSuggestionsForIntent(effectiveQuestion, queryDef);
     let report = null;
     if (luciaWantsPdf(question)) {
       report = await createLuciaPdfReport({
@@ -14776,8 +14847,9 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       INSERT INTO lucia_query_audit (
         id, user_id, user_role, control_center_id, control_center_code,
         question, intent, sql_text, row_count, duration_ms,
-        analysis_level, methodology_version, result_summary
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        analysis_level, methodology_version, result_summary,
+        assistant_provider, assistant_model, assistant_fallback_reason, assistant_latency_ms
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       `,
       [
         auditId,
@@ -14798,7 +14870,11 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
           recommendation_count: patrolPlan.recommendations.length,
           route_count: patrolPlan.routes.length,
           overall_confidence: patrolPlan.overall_confidence.code
-        } : {})
+        } : {}),
+        assistantProvider,
+        assistantConfig.configured ? assistantConfig.model : null,
+        assistantFallbackReason || null,
+        assistantLatencyMs
       ]
     ).catch((error) => console.warn("[LUCIA AUDIT WARN]", error.message));
 
@@ -14807,8 +14883,11 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
       lucia: {
         name: "Luc-IA",
         analysis_level: queryDef.level || 1,
-        mode: "SELECT restringido por centro de control",
+        mode: assistantProvider === "OPENAI_HYBRID"
+          ? "Conversación OpenAI + análisis QUELTU restringido por centro de control"
+          : "Análisis QUELTU restringido por centro de control",
         question,
+        understood_question: effectiveQuestion !== question ? effectiveQuestion : null,
         answer: answerText,
         intent: queryDef.intent,
         title: queryDef.title,
@@ -14822,6 +14901,17 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
           max_rows: queryDef.limit || result.row_count,
           arbitrary_sql: false,
           pii_minimized: true
+        },
+        assistant: {
+          provider: assistantProvider,
+          configured: assistantConfig.configured,
+          model: assistantConfig.configured ? assistantConfig.model : null,
+          conversation_context: conversation.length,
+          interpretation_used: effectiveQuestion !== question,
+          fallback: Boolean(assistantFallbackReason),
+          fallback_reason: assistantFallbackReason || null,
+          latency_ms: assistantLatencyMs,
+          data_policy: "Sin filas de tickets ni acceso SQL; store=false; datos personales minimizados"
         },
         columns: luciaColumns(result.rows),
         rows: result.rows,
