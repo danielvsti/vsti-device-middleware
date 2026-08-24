@@ -5495,7 +5495,7 @@ app.get("/", (req, res) => {
 		res.json({
 status: "ok",
 service: "VS&TI Device Middleware",
-version: "2.0-v32-lucia-openai-hybrid",
+version: "2.0-v33-lucia-openai-compatible",
 endpoints: [
 "POST /endpoint",
 "GET /devices",

@@ -1,4 +1,7 @@
-const DEFAULT_MODEL = "gpt-5.6-luna";
+// Lucía usa OpenAI solo para comprensión y redacción conversacional. El análisis,
+// las cifras y los planes continúan en el motor determinista QUELTU. Este modelo
+// tiene amplia disponibilidad y soporta Responses + Structured Outputs.
+const DEFAULT_MODEL = "gpt-4o-mini";
 const DEFAULT_TIMEOUT_MS = 12000;
 
 const SUPPORTED_INTENTS = Object.freeze([
