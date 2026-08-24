@@ -17,5 +17,7 @@ assert.match(server, /no representa probabilidad de delito ni predicción crimin
 assert.match(server, /analysis_level, methodology_version, result_summary/, 'La auditoría debe registrar nivel, metodología y resumen');
 assert.match(server, /Recomendación de solo lectura; no asigna ni despacha recursos/, 'Debe exigir validación humana');
 assert.match(server, /control_center_id = \$1/, 'Toda consulta de Nivel 2 debe estar aislada por Centro de Control');
+assert.match(server, /pointInGeoJson\(longitude, latitude, operationalBoundary\)/, 'Las rutas deben respetar el polígono operacional del Centro de Control');
+assert.match(server, /excluded_outside_operational_boundary/, 'El plan debe auditar agrupaciones excluidas por georreferencia');
 
 console.log('Lucía Level 2 contract OK');

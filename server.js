@@ -14638,7 +14638,21 @@ async function runLuciaLevel2Plan({ queryDef, controlCenter, question }) {
     maxResolverGpsAccuracyMeters()
   ]);
   analysisResult.duration_ms += resolverResult.duration_ms;
-  const recommendations = luciaScorePatrolSectors(analysisResult.rows, queryDef.days);
+  const operationalBoundary = normalizeGeoJsonGeometry(controlCenter.boundary_geojson);
+  const sourceRows = analysisResult.rows;
+  const eligibleRows = operationalBoundary
+    ? sourceRows.filter((row) => {
+        const latitude = Number(row.latitude);
+        const longitude = Number(row.longitude);
+        return Number.isFinite(latitude)
+          && Number.isFinite(longitude)
+          && pointInGeoJson(longitude, latitude, operationalBoundary);
+      })
+    : sourceRows;
+  const excludedOutsideBoundary = sourceRows.length - eligibleRows.length;
+  analysisResult.rows = eligibleRows;
+  analysisResult.row_count = eligibleRows.length;
+  const recommendations = luciaScorePatrolSectors(eligibleRows, queryDef.days);
   const routes = luciaBuildPatrolRoutes(recommendations, resolverResult.rows, queryDef.patrol_units);
   const sampleEvents = recommendations.reduce((sum, item) => sum + item.events, 0);
   const falseAlarms = recommendations.reduce((sum, item) => sum + item.false_alarms_discounted, 0);
@@ -14666,6 +14680,7 @@ async function runLuciaLevel2Plan({ queryDef, controlCenter, question }) {
       available_resolvers_used: resolverResult.rows.length,
       sample_events: sampleEvents,
       false_alarms_discounted: falseAlarms,
+      excluded_outside_operational_boundary: excludedOutsideBoundary,
       official_sector_pct: officialSectorPct,
       overall_confidence: overallConfidence,
       recommendations,
@@ -14679,6 +14694,9 @@ async function runLuciaLevel2Plan({ queryDef, controlCenter, question }) {
         "Recomendación de solo lectura; no asigna ni despacha recursos.",
         "El operador debe validar contingencias, dotación, tránsito y restricciones de terreno.",
         "La secuencia territorial no reemplaza un motor de navegación vial.",
+        excludedOutsideBoundary
+          ? `${excludedOutsideBoundary} agrupación(es) con coordenadas fuera del límite operacional fueron excluidas de las rutas.`
+          : "Todas las agrupaciones usadas en las rutas están dentro del límite operacional cargado.",
         "Toda consulta queda restringida y auditada por Centro de Control."
       ],
       source_scope: `${controlCenter.code} · datos internos QUELTU · pregunta: ${String(question || "").slice(0, 180)}`
@@ -14807,7 +14825,7 @@ app.post("/dashboard/lucia/ask", async (req, res) => {
     }
 
     const controlCenterCode = dashboardAuthorizedControlCenterCode(req);
-    const cc = await pool.query("SELECT id, code, name FROM control_centers WHERE code = $1 LIMIT 1", [controlCenterCode]);
+    const cc = await pool.query("SELECT id, code, name, boundary_geojson FROM control_centers WHERE code = $1 LIMIT 1", [controlCenterCode]);
     if (!cc.rows.length) return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
 
     const assistantConfig = openAiLuciaConfig();
