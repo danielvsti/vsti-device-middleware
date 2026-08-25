@@ -174,6 +174,7 @@ function registerSafetyModule({
           template_id UUID REFERENCES safety_inspection_templates(id) ON DELETE SET NULL,
           title VARCHAR(180) NOT NULL,
           inspection_type VARCHAR(80) NOT NULL,
+          category_type VARCHAR(80),
           area VARCHAR(180),
           scheduled_at TIMESTAMP,
           completed_at TIMESTAMP,
@@ -189,6 +190,7 @@ function registerSafetyModule({
           created_at TIMESTAMP NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
+        ALTER TABLE safety_inspections ADD COLUMN IF NOT EXISTS category_type VARCHAR(80);
         CREATE INDEX IF NOT EXISTS idx_safety_inspections_cc_date ON safety_inspections(control_center_id, COALESCE(scheduled_at, created_at) DESC);
 
         CREATE TABLE IF NOT EXISTS safety_inspection_evidence (
@@ -1075,7 +1077,7 @@ function registerSafetyModule({
         visible_to_neighbor: category.enabled !== false
       }));
       const result = await pool.query(
-        `SELECT i.id,i.title,i.inspection_type,i.area,i.completed_at,i.status,i.result,i.score,
+        `SELECT i.id,i.title,i.inspection_type,i.category_type,i.area,i.completed_at,i.status,i.result,i.score,
                 i.notes,i.evidence,i.latitude,i.longitude,i.accuracy,i.source_vertical,
                 i.alert_requested,i.linked_ticket_id,i.created_at,i.updated_at,
                 t.state AS ticket_state,t.alert_type,t.title AS ticket_title
@@ -1118,6 +1120,11 @@ function registerSafetyModule({
         return res.status(403).json({ status: "error", message: "Este Centro de Control no permite crear alertas desde inspecciones" });
       }
       const allowedCategories = resolverInspectionCategories(context.settings);
+      const categoryType = text(body.category_type || body.alert_type, 80).toUpperCase();
+      const inspectionCategory = allowedCategories.find(item => text(item.type, 80).toUpperCase() === categoryType);
+      if (!inspectionCategory) {
+        return res.status(400).json({ status: "error", message: "Selecciona una categoría de inspección autorizada por el Centro de Control" });
+      }
       const alertType = text(body.alert_type, 80).toUpperCase();
       const category = allowedCategories.find(item => text(item.type, 80).toUpperCase() === alertType);
       if (createAlert && !category) {
@@ -1138,15 +1145,16 @@ function registerSafetyModule({
       const vertical = text(context.settings.vertical || "CITY", 24).toUpperCase();
       const inspectionResult = await pool.query(
         `INSERT INTO safety_inspections(
-           control_center_id,title,inspection_type,area,completed_at,status,result,score,
+           control_center_id,title,inspection_type,category_type,area,completed_at,status,result,score,
            responses,findings,evidence,notes,inspector_user_id,created_by,
            latitude,longitude,accuracy,source_vertical,alert_requested
-         ) VALUES($1,$2,$3,$4,NOW(),'COMPLETED',$5,$6,'[]'::jsonb,'[]'::jsonb,$7::jsonb,$8,$9,$9,$10,$11,$12,$13,$14)
+         ) VALUES($1,$2,$3,$4,$5,NOW(),'COMPLETED',$6,$7,'[]'::jsonb,'[]'::jsonb,$8::jsonb,$9,$10,$10,$11,$12,$13,$14,$15)
          RETURNING *`,
         [
           context.session.control_center_id,
           title,
           text(body.inspection_type || "FIELD_INSPECTION", 80).toUpperCase(),
+          categoryType,
           text(body.area, 180) || null,
           resultValue,
           numberOrNull(body.score, 0, 100),
