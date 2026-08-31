@@ -17038,6 +17038,239 @@ function deterministicDemoUuid(seed) {
   return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
 }
 
+app.post("/admin/control-centers/:code/demo/predictive-cases", async (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+
+  const requestedCode = String(req.params.code || "").trim().toUpperCase();
+  const effectiveCode = requestedControlCenterForSession(req, requestedCode, "CC-VINA");
+  if (requestedCode !== "CC-VINA" || effectiveCode !== requestedCode) {
+    return res.status(403).json({
+      status: "error",
+      message: "Esta carga demo predictiva sólo está permitida para CC-VINA"
+    });
+  }
+  if (String(req.body?.confirm || "") !== "SEED_CC_VINA_PREDICTIVE_V1") {
+    return res.status(400).json({ status: "error", message: "Confirmación de carga demo inválida" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const ccResult = await client.query(
+      `SELECT id, code, name, boundary_geojson FROM control_centers WHERE code = $1 LIMIT 1`,
+      [requestedCode]
+    );
+    if (!ccResult.rows.length) {
+      return res.status(404).json({ status: "error", message: "Centro de control no encontrado" });
+    }
+    const controlCenter = ccResult.rows[0];
+    const boundary = normalizeGeoJsonGeometry(controlCenter.boundary_geojson);
+    const actorId = req.panel_session?.sub || null;
+    const actorRole = String(req.panel_session?.role || "ADMIN").toUpperCase();
+
+    const demoCitizens = [
+      {
+        id: deterministicDemoUuid("CC-VINA:PREDICTIVE-V1:CITIZEN:1"),
+        name: "Vecina Demo Plan Viña"
+      },
+      {
+        id: deterministicDemoUuid("CC-VINA:PREDICTIVE-V1:CITIZEN:2"),
+        name: "Vecino Demo Centro Viña"
+      }
+    ];
+    const cases = [
+      {
+        daysAgo: 12, hour: 21, minute: 10, alertType: "SECURITY", priority: 2,
+        title: "[DEMO PREDICTIVA] Incivilidad nocturna en Plaza Sucre",
+        description: "Caso sintético para demostrar recurrencia territorial y horaria en Lucía Nivel 2.",
+        latitude: -33.0248, longitude: -71.5524, place: "Plaza Sucre"
+      },
+      {
+        daysAgo: 9, hour: 22, minute: 5, alertType: "SECURITY", priority: 2,
+        title: "[DEMO PREDICTIVA] Merodeo preventivo en acceso Quinta Vergara",
+        description: "Caso sintético para demostrar recurrencia territorial y horaria en Lucía Nivel 2.",
+        latitude: -33.0292, longitude: -71.5513, place: "Acceso Quinta Vergara"
+      },
+      {
+        daysAgo: 7, hour: 21, minute: 35, alertType: "SECURITY", priority: 1,
+        title: "[DEMO PREDICTIVA] Concentración nocturna en Avenida Valparaíso",
+        description: "Caso sintético para demostrar recurrencia territorial y horaria en Lucía Nivel 2.",
+        latitude: -33.0242, longitude: -71.5534, place: "Avenida Valparaíso"
+      },
+      {
+        daysAgo: 5, hour: 22, minute: 20, alertType: "URBAN_RISK", priority: 2,
+        title: "[DEMO PREDICTIVA] Obstáculo peligroso en corredor céntrico",
+        description: "Caso sintético para demostrar recurrencia territorial y horaria en Lucía Nivel 2.",
+        latitude: -33.0232, longitude: -71.5515, place: "Plaza Vergara"
+      },
+      {
+        daysAgo: 2, hour: 21, minute: 50, alertType: "SECURITY", priority: 2,
+        title: "[DEMO PREDICTIVA] Solicitud de cobertura preventiva en Plan de Viña",
+        description: "Caso sintético para demostrar recurrencia territorial y horaria en Lucía Nivel 2.",
+        latitude: -33.0246, longitude: -71.5417, place: "Corredor Plan de Viña"
+      }
+    ];
+
+    const outside = boundary
+      ? cases.filter((item) => !pointInGeoJson(item.longitude, item.latitude, boundary))
+      : [];
+    if (outside.length) {
+      return res.status(409).json({
+        status: "error",
+        message: "La carga fue cancelada: existen casos demo fuera del límite operacional",
+        outside: outside.map(({ place, latitude, longitude }) => ({ place, latitude, longitude }))
+      });
+    }
+
+    await client.query("BEGIN");
+    for (const citizen of demoCitizens) {
+      await client.query(
+        `INSERT INTO users (
+           id, control_center_id, role, validation_status, full_name, is_active, created_at, updated_at
+         ) VALUES ($1,$2,'NEIGHBOR','DEMO',$3,false,NOW(),NOW())
+         ON CONFLICT (id) DO UPDATE SET
+           control_center_id = EXCLUDED.control_center_id,
+           role = EXCLUDED.role,
+           validation_status = EXCLUDED.validation_status,
+           full_name = EXCLUDED.full_name,
+           is_active = false,
+           updated_at = NOW()`,
+        [citizen.id, controlCenter.id, citizen.name]
+      );
+    }
+
+    const seeded = [];
+    for (let index = 0; index < cases.length; index += 1) {
+      const item = cases[index];
+      const citizen = demoCitizens[index % demoCitizens.length];
+      const ticketId = deterministicDemoUuid(`CC-VINA:PREDICTIVE-V1:TICKET:${index + 1}`);
+      const createdAtResult = await client.query(
+        `SELECT (
+           date_trunc('day', NOW() AT TIME ZONE 'America/Santiago')
+           - ($1::int * INTERVAL '1 day')
+           + ($2::int * INTERVAL '1 hour')
+           + ($3::int * INTERVAL '1 minute')
+         ) AT TIME ZONE 'America/Santiago' AS created_at`,
+        [item.daysAgo, item.hour, item.minute]
+      );
+      const createdAt = createdAtResult.rows[0].created_at;
+      const resolvedAt = new Date(new Date(createdAt).getTime() + 42 * 60 * 1000);
+      const closedAt = new Date(new Date(createdAt).getTime() + 55 * 60 * 1000);
+
+      await client.query(
+        `INSERT INTO tickets (
+           id, control_center_id, citizen_user_id, source_type, source_event_id,
+           alert_type, title, description, state, priority, latitude, longitude, accuracy,
+           created_at, resolved_at, closed_at, updated_at,
+           jurisdiction_status, jurisdiction_reason,
+           event_sector_code, event_sector_name, event_sector_method,
+           event_sector_source, event_sector_updated_at
+         ) VALUES (
+           $1,$2,$3,'DEMO_PREDICTIVE_SEED',$4,$5,$6,$7,'CLOSED',$8,$9,$10,8,
+           $11,$12,$13,$13,'IN_JURISDICTION',$14,
+           'DEMO-PLAN-VINA','Plan Viña / Libertad / Población Vergara',
+           'DEMO_PREDICTIVE_SEED','CC_VINA_PREDICTIVE_V1',$13
+         )
+         ON CONFLICT (id) DO UPDATE SET
+           control_center_id = EXCLUDED.control_center_id,
+           citizen_user_id = EXCLUDED.citizen_user_id,
+           source_type = EXCLUDED.source_type,
+           source_event_id = EXCLUDED.source_event_id,
+           alert_type = EXCLUDED.alert_type,
+           title = EXCLUDED.title,
+           description = EXCLUDED.description,
+           state = EXCLUDED.state,
+           priority = EXCLUDED.priority,
+           latitude = EXCLUDED.latitude,
+           longitude = EXCLUDED.longitude,
+           accuracy = EXCLUDED.accuracy,
+           created_at = EXCLUDED.created_at,
+           resolved_at = EXCLUDED.resolved_at,
+           closed_at = EXCLUDED.closed_at,
+           updated_at = EXCLUDED.updated_at,
+           jurisdiction_status = EXCLUDED.jurisdiction_status,
+           jurisdiction_reason = EXCLUDED.jurisdiction_reason,
+           event_sector_code = EXCLUDED.event_sector_code,
+           event_sector_name = EXCLUDED.event_sector_name,
+           event_sector_method = EXCLUDED.event_sector_method,
+           event_sector_source = EXCLUDED.event_sector_source,
+           event_sector_updated_at = EXCLUDED.event_sector_updated_at`,
+        [
+          ticketId,
+          controlCenter.id,
+          citizen.id,
+          `CC-VINA-PREDICTIVE-V1-${index + 1}`,
+          item.alertType,
+          item.title,
+          `${item.description} Lugar público de referencia: ${item.place}.`,
+          item.priority,
+          item.latitude,
+          item.longitude,
+          createdAt,
+          resolvedAt,
+          closedAt,
+          `Coordenada demo validada para ${controlCenter.name}`
+        ]
+      );
+
+      await client.query(`DELETE FROM ticket_actions WHERE ticket_id = $1`, [ticketId]);
+      const actionDefinitions = [
+        ["TICKET_CREATED", "Caso sintético creado para demostración de Lucía Nivel 2", createdAt],
+        ["TICKET_RESOLVED", "Caso demo resuelto sin despacho ni asignación operacional", resolvedAt],
+        ["TICKET_CLOSED", "Caso demo cerrado para análisis histórico", closedAt]
+      ];
+      for (let actionIndex = 0; actionIndex < actionDefinitions.length; actionIndex += 1) {
+        const [actionType, description, actionCreatedAt] = actionDefinitions[actionIndex];
+        await client.query(
+          `INSERT INTO ticket_actions (
+             id, ticket_id, actor_user_id, actor_role, action_type, description, metadata, created_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)`,
+          [
+            deterministicDemoUuid(`CC-VINA:PREDICTIVE-V1:ACTION:${index + 1}:${actionIndex + 1}`),
+            ticketId,
+            actorId,
+            actorRole,
+            actionType,
+            description,
+            JSON.stringify({ demo: true, dataset: "CC_VINA_PREDICTIVE_V1", place: item.place }),
+            actionCreatedAt
+          ]
+        );
+      }
+      seeded.push({
+        id: ticketId,
+        state: "CLOSED",
+        alert_type: item.alertType,
+        created_at: createdAt,
+        place: item.place,
+        sector: "Plan Viña / Libertad / Población Vergara"
+      });
+    }
+    await client.query("COMMIT");
+
+    res.json({
+      status: "ok",
+      message: "Casos demo predictivos creados/actualizados sin despacho",
+      control_center_code: requestedCode,
+      total: seeded.length,
+      closed: seeded.length,
+      assigned: 0,
+      dataset: "CC_VINA_PREDICTIVE_V1",
+      expected_pattern: {
+        sector: "Plan Viña / Libertad / Población Vergara",
+        hours: ["21:00", "22:00"],
+        confidence: "Media"
+      },
+      cases: seeded
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    console.error("[CC-VINA PREDICTIVE DEMO CASES ERROR]", error);
+    res.status(500).json({ status: "error", message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/admin/control-centers/:code/demo/historical-cases", async (req, res) => {
   if (!checkAdminToken(req, res)) return;
 
